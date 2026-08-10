@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snail-solver"
+description = "SNAIL-coupler gate simulation, calibration and frequency-allocation sweeps"
+readme = "README.md"
+version = "0.1.0"
+authors = [{ name = "Warren Alphonso" }]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "qutip",
+    "qutip-qip",
+    "tqdm",
+    "matplotlib",
+    "scienceplots",
+    "lovelyplots",
+    "joblib>=1.5.3",
+    "jax>=0.4.30",
+    "qutip-qoc>=0.2.0",
+    "qutip-jax>=0.0.1",
+    "scipy",
+    "diffrax>=0.6",
+]
+
+[project.optional-dependencies]
+gpu = ["jax[cuda12]>=0.4.30"]
+dev = ["ipykernel", "pre-commit", "pylatexenc", "ipywidgets", "ipympl"]
+format = [
+    "pre-commit",
+    "black[jupyter]",
+    "isort",
+    "tomli",
+    "pydocstyle",
+    "ruff",
+    "docformatter[tomli]",
+]
+test = ["pytest"]
+
+# Installed by a bare `uv sync`, so `uv run pytest` works out of the box. The
+# `test` extra above is kept for plain-pip installs.
+[dependency-groups]
+dev = ["pytest"]
+
+# There are no console scripts on purpose: every tool is a module with a
+# __main__ block, invoked one canonical way as
+#   python -m snail_solver.<tool>
+# which is what the docs and the SLURM scripts use.
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+fix = true
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
