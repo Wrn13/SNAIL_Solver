@@ -80,7 +80,7 @@ def build_with_spectators(config: Dict[str, Any], w_specs_GHz: Sequence[float],
     (ZhouCoupler, float, list of int)
         Coupler, peak |eta|, and the spectator mode indices.
     """
-    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, make_chirp
     wa, wb = (float(f) for f in config["qubit_freqs_GHz"])
     ws = float(config["coupler_freq_GHz"])
     specs = [float(w) for w in w_specs_GHz]
@@ -101,9 +101,14 @@ def build_with_spectators(config: Dict[str, Any], w_specs_GHz: Sequence[float],
                       participations=part, nonlinearities=nonlin,
                       levels=[q_lv, q_lv, c_lv] + [s_lv] * len(specs),
                       anharmonicities_GHz=anh)
+    # the GATE pump, so it carries the device's chirp; make_chirp -> None when unset,
+    # leaving the un-chirped audit byte-identical
     cpl.set_pump(PumpTone(w_p_GHz=abs(wb - wa),
                           envelope=RaisedCosine(amp=1.0, t_g=float(t_g_ns)),
-                          is_eta=True), normalize_iswap=(A, B))
+                          is_eta=True,
+                          chirp=make_chirp(config.get("chirp_coeffs_GHz") or None,
+                                           float(t_g_ns))),
+                 normalize_iswap=(A, B))
     return cpl, float(cpl.peak_eta()), idxs
 
 
@@ -149,7 +154,7 @@ def build_with_spectator(config: Dict[str, Any], w_spec_GHz: float, t_g_ns: floa
     (ZhouCoupler, float)
         The coupler and its peak |eta|.
     """
-    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, make_chirp
     wa, wb = (float(f) for f in config["qubit_freqs_GHz"])
     ws = float(config["coupler_freq_GHz"])
     q_lv = int(config.get("qubit_levels", 3))
@@ -166,9 +171,14 @@ def build_with_spectator(config: Dict[str, Any], w_spec_GHz: float, t_g_ns: floa
         nonlinearities=nonlin, levels=[q_lv, q_lv, c_lv, s_lv],
         anharmonicities_GHz={A: aq, B: aq,
                              SPEC: float(config.get("anharm_spec_GHz", 0.0))})
+    # the GATE pump, so it carries the device's chirp; make_chirp -> None when unset,
+    # leaving the un-chirped audit byte-identical
     cpl.set_pump(PumpTone(w_p_GHz=abs(wb - wa),
                           envelope=RaisedCosine(amp=1.0, t_g=float(t_g_ns)),
-                          is_eta=True), normalize_iswap=(A, B))
+                          is_eta=True,
+                          chirp=make_chirp(config.get("chirp_coeffs_GHz") or None,
+                                           float(t_g_ns))),
+                 normalize_iswap=(A, B))
     return cpl, float(cpl.peak_eta())
 
 

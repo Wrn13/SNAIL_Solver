@@ -29,6 +29,41 @@ def _drag_skip_GHz(config: Dict[str, Any]) -> float:
     of it. Configurable via ``drag_skip_below_MHz`` (default 5 MHz)."""
     return max(float(config.get("drag_skip_below_MHz", 5.0)) / 1e3, _DELTA_EPS_GHz)
 
+
+#: Pump quanta carried by each collision channel, i.e. the k in this module's beat
+#: convention ``beat = separation - k w_p``. A CHIRP moves the pump during the pulse,
+#: so the beat DRAG divides by becomes ``Delta(t) = beat - k delta(t)`` -- see
+#: ``envelope.PumpTone.drag_detuning``. The "static" channel is pump-independent
+#: (k = 0) and a chirp must not move it; that distinction is the whole reason this
+#: map exists rather than a hardcoded 1.
+_PUMP_QUANTA = {"onepump": 1, "static": 0, "subharm": 2, "none": 1}
+
+
+def _pump_quanta_of(kind: str) -> int:
+    """k for a collision kind as labelled by :func:`_nearest_collision`."""
+    return _PUMP_QUANTA.get(str(kind), 1)
+
+
+def _drag_ok_with_chirp(config: Dict[str, Any], beat_GHz: float, n_pump: int,
+                        chirp_coeffs_GHz: Optional[Sequence[float]],
+                        t_g: float) -> bool:
+    """Is DRAG safe for this (beat, k, chirp) combination over the whole pulse?
+
+    The static test ``|beat| >= skip`` is not sufficient once a chirp is present: the
+    beat is swept during the gate, so it can start comfortably large and pass through
+    zero mid-pulse. Sweeps call this and DISABLE DRAG when it fails (rather than
+    raising, as the single-point path does) so one bad point cannot kill a scan.
+    """
+    skip = _drag_skip_GHz(config)
+    if abs(float(beat_GHz)) < skip:
+        return False
+    if not chirp_coeffs_GHz or not n_pump:
+        return True
+    from snail_solver.envelope import Chirp
+    ts = np.linspace(0.0, float(t_g), 257)
+    delta = np.asarray(Chirp(chirp_coeffs_GHz, float(t_g)).detuning(ts, np)) / TWO_PI
+    return bool(np.min(np.abs(float(beat_GHz) - int(n_pump) * delta)) >= skip)
+
 DEFAULT_CONFIG = {
     # target qubits a, b
     "qubit_freqs_GHz": [5.00, 4.60],
@@ -228,7 +263,8 @@ def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
 def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                       t_g: float, amp_scale: float, solver: Dict[str, Any],
                       spec_abs_GHz: Optional[float] = None,
-                      drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
+                      drag_beat_GHz: Optional[float] = None,
+                      drag_n_pump: int = 1) -> Dict[str, Any]:
     """Per-point AC-Stark-shifted iSWAP resonance offset (GHz) for the pump.
 
     Runs the chevron of find_stark_resonance.py at this point's (w_a, w_b) and
@@ -280,12 +316,25 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     window = float(config.get("stark_window_factor", 2.0)) * float(t_g)
     n_time = int(config.get("stark_time_points", 120))
     shaped = bool(config.get("stark_match_pulse", False))
+    # Probe the chirp the GATE runs with, so what comes back is the RESIDUAL offset on
+    # top of it. Omitting it would measure the un-chirped resonance, which the caller
+    # then writes into wp_offset_GHz while the gate ALSO applies the chirp's mean
+    # component c0 -- i.e. c0 counted twice. Only the shaped probe can carry a chirp
+    # (a chirp is defined on the gate's normalized time), so warn rather than
+    # silently mis-locate when a chirped device is probed with the constant pulse.
+    chirp = config.get("chirp_coeffs_GHz") or None
+    if chirp is not None and not shaped:
+        print("WARNING: device carries a chirp but stark_match_pulse is off; the "
+              "constant probe locates the UN-chirped resonance, so the chirp's mean "
+              "component is double-counted. Set stark_match_pulse=true.")
     return FS.scan(sub, float(t_g), float(amp_scale), offsets, window, n_time,
                    solver, n_jobs=int(config.get("stark_jobs", 1)),
                    spec_abs_GHz=(None if spec_abs_GHz is None else float(spec_abs_GHz)),
                    shape=("raised_cosine" if shaped else "constant"),
                    drag_beat_GHz=(float(drag_beat_GHz) if (shaped and drag_beat_GHz is not None)
-                                  else None))
+                                  else None),
+                   chirp_coeffs_GHz=(chirp if shaped else None),
+                   drag_n_pump=int(drag_n_pump))
 
 def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                        ws_GHz: float, wspec_GHz: float, w_p_GHz: float):

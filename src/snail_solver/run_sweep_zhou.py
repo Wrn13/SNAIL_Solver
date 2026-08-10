@@ -340,11 +340,18 @@ def main() -> None:
         print(f"operating point '{args.operating_point}': amp_scale={config['amp_scale']}, "
               f"wp_offset={config['wp_offset_GHz']} GHz, t_g={config['t_g_ns']:.3f} ns"
               + ("  (t_g from CLI)" if _explicit_tg else ""))
+    # AFTER the operating point, so an explicit --chirp-GHz wins. Report the override
+    # unconditionally: `--chirp-GHz ""` is a legitimate way to disable a chirp, but it
+    # used to cancel a saved point's calibrated chirp SILENTLY, because the
+    # confirmation print was guarded on the list being non-empty.
     if getattr(args, "chirp_GHz", None) is not None:
-        config["chirp_coeffs_GHz"] = [float(x) for x in args.chirp_GHz.split(",") if x.strip()]
-        if config["chirp_coeffs_GHz"]:
-            print(f"chirp: delta(t)/2pi = {config['chirp_coeffs_GHz']} GHz "
-                  f"(Legendre in u = 2t/t_g - 1)")
+        from snail_solver.device_utils import describe_chirp, parse_chirp_arg
+        previous = list(config.get("chirp_coeffs_GHz") or [])
+        config["chirp_coeffs_GHz"] = parse_chirp_arg(args.chirp_GHz)
+        print(f"chirp (--chirp-GHz): {describe_chirp(config['chirp_coeffs_GHz'])}"
+              f"  (Legendre in u = 2t/t_g - 1)")
+        if previous and not config["chirp_coeffs_GHz"]:
+            print(f"  NOTE: this OVERRIDES a configured chirp {previous} with no chirp")
     if args.no_integrate:
         config["integrate"] = False
     if args.stark:

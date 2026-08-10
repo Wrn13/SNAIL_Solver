@@ -48,7 +48,7 @@ CLI
 from __future__ import annotations
 
 import argparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.linalg import expm
@@ -82,6 +82,54 @@ def _prepare(cpl, a: int, b: int, cutoff_GHz: float):
     return terms, H_anh, idx, max_Omega
 
 
+def _chirp_pad_rad(chirp, terms) -> float:
+    """Extra carrier bandwidth (rad/ns) a chirp adds, for sizing the fine step.
+
+    A term carrying k = n_pos - n_neg net pump quanta picks up ``e^{-i k Phi(t)}``,
+    i.e. an instantaneous carrier displaced by ``k delta(t)``. The fine sub-step is
+    chosen from the largest carrier kept, so it should account for that displacement
+    -- the same reason ``calibration_map.scan`` pads its step count with the
+    pump-offset span.
+
+    In practice this is cheap insurance rather than a live constraint: at a realistic
+    chirp (|c_k| ~ 0.02 GHz, so ~0.4 rad/ns against a max_Omega of several rad/ns)
+    the measured convergence of ``_propagate`` is indistinguishable chirped vs
+    un-chirped. It binds only for a pathologically large chirp. What DOES matter for
+    accuracy is evaluating Phi at the fine step rather than per control slice -- see
+    `_propagate`.
+
+    Returns 0.0 for an absent chirp, so every ``n_sub`` expression that adds this is
+    unchanged on the un-chirped path.
+    """
+    if chirp is None:
+        return 0.0
+    k_max = max((abs(n_pos - n_neg) for _Om, n_pos, n_neg, _O in terms), default=0)
+    ts = np.linspace(0.0, chirp.t_g, 257)
+    return float(k_max) * float(np.max(np.abs(chirp.detuning(ts, np))))
+
+
+def _tone_chirp(cpl):
+    """The chirp on the coupler's pump tone, or None.
+
+    Read off the coupler rather than passed in, so a caller cannot forget it and
+    silently score an un-chirped gate. The reduced model is single-tone by
+    construction (`_H` takes one scalar eta), so there is exactly one to read.
+    """
+    tones = getattr(cpl, "_pump_tones", None)
+    return tones[0].chirp if tones else None
+
+
+def _tone_n_pump(cpl) -> int:
+    """Pump quanta of the process DRAG suppresses on this coupler's tone.
+
+    Companion to `_tone_chirp`: read off the coupler for the same reason, so a
+    baseline pulse cannot be built with a different DRAG denominator than the one
+    the solver applies.
+    """
+    tones = getattr(cpl, "_pump_tones", None)
+    return int(getattr(tones[0], "drag_n_pump", 1)) if tones else 1
+
+
 def _H(t: float, eta: complex,
 
  terms, H_anh: np.ndarray,
@@ -103,25 +151,52 @@ def _H(t: float, eta: complex,
 
 
 def _propagate(eta_ctrl: np.ndarray, t_g: float, terms, H_anh, idx,
-               n_sub: int, offset_rad: float = 0.0) -> np.ndarray:
+               n_sub: int, offset_rad: float = 0.0, *,
+               chirp=None) -> np.ndarray:
     """Propagate the 4 computational states; return the 4x4 projected propagator.
 
     Parameters
     ----------
     eta_ctrl : ndarray (complex)
-        N piecewise-constant control amplitudes.
+        N piecewise-constant control amplitudes. These carry the pulse SHAPE only;
+        pass any chirp through `chirp` rather than pre-multiplying it in here (see
+        below).
     t_g : float
         Gate duration (ns).
     terms, H_anh, idx : see _prepare
     n_sub : int
-        Fine sub-steps per control slice (resolves the kept carriers).
+        Fine sub-steps per control slice (resolves the kept carriers). Size it with
+        ``max_Omega + _chirp_pad_rad(chirp, terms)``, not ``max_Omega`` alone.
     offset_rad : float
-        Pump-frequency offset (rad/ns) applied to the carriers.
+        CONSTANT pump-frequency offset (rad/ns) applied to the carriers. Kept
+        separate from `chirp` although a constant chirp c0 is exactly equivalent
+        (offset_rad = 2 pi c0): shifting the precomputed carriers costs nothing,
+        which is what lets a calibration scan sweep the offset over a whole grid on
+        one ``_prepare``. The two compose additively.
+    chirp : envelope.Chirp, optional
+        Time-dependent pump-frequency offset delta(t). Applied as the phase
+        ``eta -> eta e^{-i Phi(t)}``, exactly as ``ZhouCoupler._eta_at`` does. Since
+        `_H` forms ``eta^n_pos conj(eta)^n_neg``, a term carrying k = n_pos - n_neg
+        net pump quanta then picks up ``e^{-i k Phi(t)}`` automatically -- which is
+        precisely the k-quanta chirp phase, so `_H` needs no chirp awareness.
+
+        The phase is evaluated at the FINE step, not per control slice: at a
+        realistic t_g = 92.6 ns / n_ctrl = 32, a c1 = 0.05 GHz chirp moves Phi by
+        ~0.9 rad across one slice (x k, so ~1.4 rad in the coefficient), against
+        ~0.015 rad across a fine step. Holding it per slice is not accurate enough.
+        None (default) leaves this path byte-identical to the un-chirped one.
     """
     N = len(eta_ctrl)
     dt_ctrl = t_g / N
     dt_fine = dt_ctrl / n_sub
     dim = H_anh.shape[0]
+    phase = None
+    if chirp is not None:
+        # one vectorized evaluation on the fine grid this function already owns --
+        # keeping the grid in here makes a caller/callee mismatch unrepresentable
+        steps = np.arange(N * n_sub)
+        t_all = (steps // n_sub) * dt_ctrl + ((steps % n_sub) + 0.5) * dt_fine
+        phase = np.exp(-1j * np.asarray(chirp.phase(t_all, np)))
     Psi = np.zeros((dim, 4), dtype=complex)
     for col, s in enumerate(idx):
         Psi[s, col] = 1.0
@@ -130,7 +205,8 @@ def _propagate(eta_ctrl: np.ndarray, t_g: float, terms, H_anh, idx,
         t0 = j * dt_ctrl
         for m in range(n_sub):
             t = t0 + (m + 0.5) * dt_fine
-            Ustep = expm(-1j * _H(t, eta, terms, H_anh, offset_rad) * dt_fine)
+            eta_t = eta if phase is None else eta * phase[j * n_sub + m]
+            Ustep = expm(-1j * _H(t, eta_t, terms, H_anh, offset_rad) * dt_fine)
             Psi = Ustep @ Psi
     return Psi[np.ix_(idx, range(4))]
 
@@ -142,14 +218,28 @@ def _score(U: np.ndarray, cpl) -> Tuple[float, float]:
 
 
 def _raised_cosine_eta(t_g: float, peak: float, n_ctrl: int,
-                       drag_beat_GHz: Optional[float]) -> np.ndarray:
-    """DRAG-shaped raised-cosine envelope sampled at control-slice midpoints."""
+                       drag_beat_GHz: Optional[float], chirp=None,
+                       drag_n_pump: int = 1) -> np.ndarray:
+    """DRAG-shaped raised-cosine envelope sampled at control-slice midpoints.
+
+    This builds the BASELINE pulse -- the gate every reported ``dF_grape`` is measured
+    against -- so its DRAG must match what the solver actually applies. On a chirped
+    tone the beat is swept by the pump, ``Delta(t) = Delta_0 - k delta(t)``
+    (see ``envelope.PumpTone.drag_detuning``); dividing by the static beat here would
+    quietly score the optimizer against a baseline the coupler would never produce.
+
+    The returned samples carry the AMPLITUDE only -- no chirp phase. `_propagate`
+    applies that on its fine grid, so pass the same `chirp` to both.
+    """
     ts = (np.arange(n_ctrl) + 0.5) * (t_g / n_ctrl)
     rc = 0.5 * (1.0 - np.cos(2.0 * np.pi * ts / t_g))
     eta = peak * rc.astype(complex)
     if drag_beat_GHz:                       # add the first-order DRAG quadrature
         drc = (np.pi / t_g) * np.sin(2.0 * np.pi * ts / t_g)
-        eta = eta - 1j * peak * drc / (2.0 * np.pi * drag_beat_GHz)
+        detuning = 2.0 * np.pi * float(drag_beat_GHz)
+        if chirp is not None and drag_n_pump:
+            detuning = detuning - drag_n_pump * np.asarray(chirp.detuning(ts, np))
+        eta = eta - 1j * peak * drc / detuning
     return eta
 
 
@@ -186,7 +276,14 @@ def _drag_seed_params(t_g: float, peak: float, n_basis: int,
                       warmstart_beat_GHz: Optional[float]) -> np.ndarray:
     """Initial ansatz parameters. Zeros -> plain raised cosine; a DRAG warm start
     loads the k=2 quadrature (sin(2 pi t/t_g) ~ the raised-cosine derivative) with
-    the first-order Motzoi weight for the given beat."""
+    the first-order Motzoi weight for the given beat.
+
+    Deliberately uses the STATIC beat even on a chirped tone, unlike
+    `_raised_cosine_eta`. A time-swept beat cannot be represented by one Fourier
+    coefficient anyway, and this is only a starting point: every seed is scored
+    before the optimizer runs, so an imperfect one can be ignored but never adopted.
+    The BASELINE is the number that must be exact, and that is built elsewhere.
+    """
     p0 = np.zeros(2 * n_basis)
     if warmstart_beat_GHz:                       # DRAG: Q ~ -eta'(t) / (2 pi beat)
         # env'(t) = (pi/t_g) sin(2 pi t/t_g) = (pi/t_g) s_2(t); Q amplitude coeff on s_2
@@ -322,12 +419,17 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     # propagator/scoring path downstream is plain numpy/scipy.
     eta_np = _iq_ansatz(t_g, peak, n_basis, xp=np)
     dt_ctrl = t_g / max(int(n_time), 1)
-    n_sub = max(1, int(np.ceil(max_Omega * dt_ctrl / 0.3)))
+    chirp = _tone_chirp(cpl)
+    n_sub = max(1, int(np.ceil((max_Omega + _chirp_pad_rad(chirp, terms))
+                               * dt_ctrl / 0.3)))
     ts = (np.arange(n_time) + 0.5) * (t_g / n_time)
     eta_opt = np.array([eta_np(t, p_star) for t in ts], dtype=complex)
-    eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz)
-    Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub), cpl)
-    F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub), cpl)
+    eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz, chirp,
+                              _tone_n_pump(cpl))
+    Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub,
+                                 chirp=chirp), cpl)
+    F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub,
+                                  chirp=chirp), cpl)
 
     return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
                 eta_opt=eta_opt, F_grape=Fg, leak_grape=leakg,
@@ -341,7 +443,8 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
 
 
 def _jax_pipeline_infidelity(terms, H_anh, idx, t_g: float, n_sub: int,
-                             n_ctrl: int, eta_max: float, z_grid: int = 1024):
+                             n_ctrl: int, eta_max: float, z_grid: int = 1024,
+                             chirp=None):
     """Build a JAX-traceable ``eta_ctrl -> 1 - F`` on the SWEEP's own metric.
 
     This exists because qutip-qoc cannot express the metric the rest of the
@@ -379,7 +482,12 @@ def _jax_pipeline_infidelity(terms, H_anh, idx, t_g: float, n_sub: int,
     eta_max : float
         Largest |eta| the caller can present. Only used to bound ||H|| when
         choosing the propagator's squaring count (see below); pass the optimizer's
-        own amplitude ceiling, not the nominal peak.
+        own amplitude ceiling, not the nominal peak. A chirp cannot affect it: a
+        pure phase leaves |eta| -- and therefore ||H|| -- unchanged.
+    chirp : envelope.Chirp, optional
+        Fixed device chirp to apply, as ``eta -> eta e^{-i Phi(t)}`` on the fine-step
+        grid. Baked in as a constant, so the gradient in ``eta_ctrl`` is unaffected.
+        None (default) leaves the objective byte-identical to the un-chirped one.
 
     Returns
     -------
@@ -450,9 +558,24 @@ def _jax_pipeline_infidelity(terms, H_anh, idx, t_g: float, n_sub: int,
     t_all = jnp.asarray(((np.arange(n_steps) % n_sub) + 0.5) * dt_fine
                         + (np.arange(n_steps) // n_sub) * dt_ctrl)
     slice_of = jnp.asarray(np.repeat(np.arange(n_ctrl), n_sub))
+    # Fixed device chirp, baked in as a traced CONSTANT on the same fine grid (see
+    # `chirp` in the signature). |eta| is untouched by a phase, so `eta_max` and the
+    # squaring count above stay valid.
+    chirp_phase = (None if chirp is None
+                   else jnp.asarray(np.exp(-1j * np.asarray(
+                       chirp.phase(np.asarray(t_all), np)))))
 
-    def infid(eta_ctrl):
+    def infid(eta_ctrl, chirp_coeffs=None):
         eta_steps = eta_ctrl[slice_of]                            # (n_steps,)
+        if chirp_coeffs is not None:
+            # The optimizer OWNS the chirp: traced coefficients supersede any baked-in
+            # device chirp (which is already in `chirp_phase`), so the two can never
+            # be applied twice. t_all is the fine-step grid, aligned 1:1 with
+            # eta_steps, so this is fine-step-exact and differentiable through scan.
+            eta_steps = eta_steps * jnp.exp(
+                -1j * _chirp_phase_jax(chirp_coeffs, t_all, t_g, jnp))
+        elif chirp_phase is not None:
+            eta_steps = eta_steps * chirp_phase
 
         def step(Psi, xs):
             t, eta = xs
@@ -477,6 +600,30 @@ def _jax_pipeline_infidelity(terms, H_anh, idx, t_g: float, n_sub: int,
     return infid
 
 
+def _chirp_phase_jax(coeffs, t, t_g: float, xp):
+    """Accumulated chirp phase Phi(t) with TRACED coefficients.
+
+    ``envelope.Chirp.phase`` reads a concrete numpy array, so it can only contribute a
+    constant. This transcription takes the coefficients as an argument, which is what
+    lets ``jax.grad`` differentiate through them. The loop bound is
+    ``coeffs.shape[0]``, a compile-time constant, so it traces cleanly.
+
+    Mirrors ``jax_engine._chirp_phase`` and ``envelope.Chirp.phase``; the three are
+    pinned together by a test.
+    """
+    n = coeffs.shape[0]
+    if n == 0:
+        return 0.0 * xp.asarray(t)
+    u = xp.clip(2.0 * xp.asarray(t) / t_g - 1.0, -1.0, 1.0)
+    P = [xp.ones_like(u), u]
+    for k in range(1, n):
+        P.append(((2 * k + 1) * u * P[k] - k * P[k - 1]) / (k + 1))
+    total = coeffs[0] * (u + 1.0)
+    for k in range(1, n):
+        total = total + coeffs[k] * (P[k + 1] - P[k - 1]) / (2 * k + 1)
+    return np.pi * t_g * total
+
+
 def _ideal_iswap_np() -> np.ndarray:
     """Local copy of the 4x4 target (avoids importing zhou_coupler at module import)."""
     U = np.eye(4, dtype=complex)
@@ -487,7 +634,10 @@ def _ideal_iswap_np() -> np.ndarray:
 
 def _optimize_jax(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: float,
                   drag_beat_GHz: Optional[float], warmstart_beat_GHz: Optional[float],
-                  maxiter: int, n_time: int, verbose: bool) -> Dict[str, Any]:
+                  maxiter: int, n_time: int, chirp_degree: int = 0,
+                  chirp_seed_GHz: Optional[Sequence[float]] = None,
+                  chirp_bound_GHz: float = 0.02,
+                  verbose: bool = False) -> Dict[str, Any]:
     """JAX-autodiff gradient optimizer over the pipeline's OWN fidelity metric.
 
     Same analytic I/Q ansatz as before (``_iq_ansatz``), but the objective is
@@ -517,7 +667,9 @@ def _optimize_jax(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     terms, H_anh, idx, max_Omega = _prepare(cpl, a, b, cutoff_GHz)
     peak = float(cpl.peak_eta())
     dt_ctrl = t_g / max(int(n_time), 1)
-    n_sub = max(1, int(np.ceil(max_Omega * dt_ctrl / 0.3)))
+    chirp = _tone_chirp(cpl)
+    n_sub = max(1, int(np.ceil((max_Omega + _chirp_pad_rad(chirp, terms))
+                               * dt_ctrl / 0.3)))
 
     eta_fn = _iq_ansatz(t_g, peak, n_basis, xp=jnp)
     ts = (np.arange(n_time) + 0.5) * (t_g / n_time)
@@ -526,11 +678,21 @@ def _optimize_jax(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     # optimizer can never present more than 2*peak; that is the bound the
     # propagator sizes its scaling-and-squaring against.
     infid_eta = _jax_pipeline_infidelity(terms, H_anh, idx, t_g, n_sub, n_time,
-                                         eta_max=2.0 * peak)
+                                         eta_max=2.0 * peak, chirp=chirp)
 
-    def objective(p):
+    # x = [pI(n_basis) | pQ(n_basis) | y_1 .. y_D], with the chirp tail carried scaled
+    # (y_k = c_k / chirp_bound_GHz) so every parameter is O(1) for the line search.
+    n_chirp = max(int(chirp_degree), 0)
+
+    def objective(x):
+        p = x[:2 * n_basis]
         eta_ctrl = jnp.stack([eta_fn(t, p) for t in ts_j])
-        return infid_eta(eta_ctrl)
+        if not n_chirp:
+            return infid_eta(eta_ctrl)
+        # c_0 pinned to zero INSIDE the trace: it is degenerate with wp_offset_GHz
+        cc = jnp.concatenate([jnp.zeros(1),
+                              x[2 * n_basis:] * chirp_bound_GHz])
+        return infid_eta(eta_ctrl, cc)
 
     obj_and_grad = jax.jit(jax.value_and_grad(objective))
 
@@ -541,27 +703,57 @@ def _optimize_jax(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     p0 = _drag_seed_params(t_g, peak, n_basis, warmstart_beat_GHz)
     # keep |eta| <= 2 * peak: amp_I = 1 + sum_k p_k s_k with |s_k| <= 1
     bound = 1.0 / float(n_basis)
+    bounds = [(-bound, bound)] * (2 * n_basis)
+    if n_chirp:
+        y0 = np.zeros(n_chirp)
+        if chirp_seed_GHz is not None:
+            tail = np.asarray(chirp_seed_GHz, dtype=float).ravel()[1:n_chirp + 1]
+            y0[:tail.size] = tail / chirp_bound_GHz
+        y0 = np.clip(y0, -1.0, 1.0)
+        p0 = np.concatenate([p0, y0])
+        bounds = bounds + [(-1.0, 1.0)] * n_chirp
     res = minimize(scipy_obj, p0, method="L-BFGS-B", jac=True,
-                   bounds=[(-bound, bound)] * (2 * n_basis),
+                   bounds=bounds,
                    options=dict(maxiter=maxiter, ftol=1e-12, disp=verbose))
-    p_star = np.asarray(res.x, dtype=float)
+    x_star = np.asarray(res.x, dtype=float)
+    p_star = x_star[:2 * n_basis]
+    chirp_opt = None
+    if n_chirp:
+        from snail_solver.envelope import Chirp
+        chirp_opt = Chirp(np.concatenate([[0.0], x_star[2 * n_basis:] * chirp_bound_GHz]),
+                          t_g)
 
     # reconstruct + score in numpy on the identical model (agreement is a check,
     # not a re-score: the optimizer minimized exactly this quantity)
     eta_np = _iq_ansatz(t_g, peak, n_basis, xp=np)
     eta_opt = np.array([eta_np(t, p_star) for t in ts], dtype=complex)
-    eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz)
-    Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub), cpl)
-    F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub), cpl)
+    eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz, chirp,
+                              _tone_n_pump(cpl))
+    # the optimized chirp supersedes the device one; the BASELINE keeps the device
+    # chirp, since that is the gate the improvement is measured against
+    chirp_star = chirp_opt if n_chirp else chirp
+    Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub,
+                                  chirp=chirp_star), cpl)
+    F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub,
+                                  chirp=chirp), cpl)
 
-    return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
-                eta_opt=eta_opt, F_grape=Fg, leak_grape=leakg,
-                n_ctrl=n_time, n_sub=n_sub, cutoff_GHz=cutoff_GHz,
-                nfev=int(res.nfev),
-                warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
-                                    else float(warmstart_beat_GHz)),
-                backend="qutip", alg="JOPT", n_basis=n_basis,
-                qoc_fid_err=float(res.fun))
+    out = dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
+               eta_opt=eta_opt, F_grape=Fg, leak_grape=leakg,
+               n_ctrl=n_time, n_sub=n_sub, cutoff_GHz=cutoff_GHz,
+               nfev=int(res.nfev),
+               warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
+                                   else float(warmstart_beat_GHz)),
+               backend="qutip", alg="JOPT", n_basis=n_basis,
+               qoc_fid_err=float(res.fun))
+    if n_chirp:
+        # same envelope, chirp switched off -- isolates what the chirp alone bought
+        F_off, _ = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub), cpl)
+        out.update(chirp_coeffs_GHz=[float(c) for c in chirp_opt.coeffs_GHz],
+                   chirp_degree=n_chirp, chirp_bound_GHz=float(chirp_bound_GHz),
+                   chirp_seed_GHz=(None if chirp_seed_GHz is None
+                                   else [float(c) for c in chirp_seed_GHz]),
+                   F_chirp_off=float(F_off), dF_chirp=float(Fg - F_off))
+    return out
 
 
 def _crab_frequencies(n_basis: int, t_g: float, rng, jitter: float = 0.5) -> np.ndarray:
@@ -597,7 +789,10 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
                    warmstart_beat_GHz: Optional[float], maxiter: int,
                    restarts: int, seed: Optional[int], score: str, method: str,
                    atol: float, rtol: float, nsteps: int,
-                   verbose: bool) -> Dict[str, Any]:
+                   chirp_degree: int = 0,
+                   chirp_seed_GHz: Optional[Sequence[float]] = None,
+                   chirp_bound_GHz: float = 0.02,
+                   verbose: bool = False) -> Dict[str, Any]:
     """Optimize the pump envelope with CRAB (Chopped RAndom Basis).
 
     CRAB expands the pulse in a truncated, RANDOMIZED Fourier basis on top of a
@@ -629,19 +824,42 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
     by ``4 * n_basis`` each time, and Nelder-Mead degrades in high dimension --
     prefer a few harmonics and a couple of restarts.
 
+    Chirp
+    -----
+    With ``chirp_degree > 0`` the pump CHIRP is optimized alongside the envelope: the
+    parameter vector grows a tail ``y_1 .. y_D`` carrying the Legendre coefficients
+    ``c_1 .. c_D`` of delta(t). Two deliberate choices:
+
+    * ``c_0`` is PINNED to zero. A constant chirp is exactly a retuned carrier, so
+      c_0 and ``wp_offset_GHz`` are degenerate; leaving both free gives the optimizer
+      a flat direction and makes the saved operating point ambiguous. Pinned, the
+      chirp carries pure structure about a separately calibrated carrier.
+    * The tail is stored SCALED, ``y_k = c_k / chirp_bound_GHz``, so every parameter
+      is O(1). Nelder-Mead builds one simplex over the whole vector; raw c_k ~ 5e-3
+      against O(1) Fourier coefficients would leave the chirp effectively frozen.
+
+    The chirp object is installed on the tone, so BOTH ``score='qutip'`` and
+    ``score='reduced'`` pick it up through ``cpl._eta`` -- the optimizer needs no
+    special-casing per backend.
+
     Returns
     -------
     dict
         Same keys as :func:`optimize_pulse` plus ``crab_freqs`` / ``crab_params``
-        (the basis and coefficients, so the pulse is exactly reproducible).
+        (the basis and coefficients, so the pulse is exactly reproducible), and --
+        when a chirp was optimized -- ``chirp_coeffs_GHz``, ``chirp_degree``,
+        ``chirp_seed_GHz`` and ``F_chirp_off`` (the winning envelope re-scored with
+        the chirp removed, which isolates what the chirp alone bought).
     """
     from snail_solver.zhou_coupler import ZhouCoupler
-    from snail_solver.envelope import IQFourierEnvelope
+    from snail_solver.envelope import Chirp, IQFourierEnvelope
 
     rng = np.random.default_rng(seed)
     tone = cpl._pump_tones[0]
-    env_saved, drag_saved = tone.envelope, tone.drag
+    env_saved, drag_saved, chirp_saved = tone.envelope, tone.drag, tone.chirp
     amp = float(env_saved.amp)
+    n_chirp = max(int(chirp_degree), 0)          # free coefficients: c_1 .. c_D
+    chirp_bound_GHz = float(chirp_bound_GHz)
     n_samples = max(int(4 * n_basis * max(restarts, 1)), 32)   # for stored eta_opt
 
     # reduced-model scaffolding (used by score='reduced', and cheap to build)
@@ -656,9 +874,21 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
         # NOTE: read the pump through cpl._eta, NOT envelope.value -- _eta is what
         # applies the DRAG quadrature, the is_eta prefactor and the pump phase, so
         # sampling the raw envelope would silently drop the DRAG baseline.
-        eta = np.array([complex(cpl._eta(tone, float(t)))
-                        for t in (np.arange(n_samples) + 0.5) * (t_g / n_samples)])
-        return _score(_propagate(eta, t_g, terms, H_anh, idx, n_sub_red), cpl)
+        ts = (np.arange(n_samples) + 0.5) * (t_g / n_samples)
+        eta = np.array([complex(cpl._eta(tone, float(t))) for t in ts])
+        # Take the chirp back OUT of these samples and let _propagate re-apply it on
+        # its fine grid. `_eta` applies the chirp last, so dividing e^{-i Phi} out is
+        # exact -- and it has to come out: these are SLICE-midpoint samples, across
+        # which Phi moves by O(1) rad at realistic chirp rates, which is far too
+        # coarse to hold constant. Read `tone.chirp` per call, since an optimizer
+        # varying the chirp mutates it in place.
+        chirp = tone.chirp
+        if chirp is not None:
+            eta = eta * np.exp(1j * np.asarray(chirp.phase(ts, np)))
+        n_sub = max(n_sub_red,
+                    int(np.ceil((max_Omega + _chirp_pad_rad(chirp, terms))
+                                * (t_g / n_samples) / 0.3)))
+        return _score(_propagate(eta, t_g, terms, H_anh, idx, n_sub, chirp=chirp), cpl)
 
     try:
         # (1) baseline: the gate actually applied at this point (DRAG or raised cosine)
@@ -674,34 +904,78 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
         freqs = _crab_frequencies(n_basis, t_g, rng)
         env = IQFourierEnvelope(amp, t_g, freqs=freqs)
         tone.envelope, tone.drag = env, False   # ansatz carries its own quadrature
+        # The optimizer's own chirp object, mutated in place by `_apply`. Installing it
+        # on the tone is what makes both scoring backends see it.
+        opt_chirp = Chirp(np.zeros(n_chirp + 1), t_g) if n_chirp else None
+        if n_chirp:
+            tone.chirp = opt_chirp
+
+        bound = 2.0                            # |IQ coefficient| bound (dimensionless)
+
+        def _clip(p: np.ndarray) -> np.ndarray:
+            """Box the IQ block and the (scaled) chirp tail separately."""
+            q = np.asarray(p, dtype=float).copy()
+            if n_chirp:
+                q[:-n_chirp] = np.clip(q[:-n_chirp], -bound, bound)
+                q[-n_chirp:] = np.clip(q[-n_chirp:], -1.0, 1.0)   # |c_k| <= the bound
+            else:
+                q = np.clip(q, -bound, bound)
+            return q
+
+        def _apply(p: np.ndarray) -> np.ndarray:
+            """Install a full parameter vector (IQ block + chirp tail) on the tone."""
+            q = _clip(p)
+            if n_chirp:
+                env.set_params(q[:-n_chirp])
+                opt_chirp.set_params(np.concatenate(
+                    [[0.0], q[-n_chirp:] * chirp_bound_GHz]))       # c_0 pinned
+            else:
+                env.set_params(q)
+            return q
+
+        def _pack(p_iq, coeffs=None) -> np.ndarray:
+            """Full vector from an IQ block plus optional chirp coefficients (GHz)."""
+            p_iq = np.asarray(p_iq, dtype=float)
+            if not n_chirp:
+                return p_iq
+            y = np.zeros(n_chirp)
+            if coeffs is not None:
+                tail = np.asarray(coeffs, dtype=float).ravel()[1:n_chirp + 1]  # skip c_0
+                y[:tail.size] = tail / chirp_bound_GHz
+            return np.concatenate([p_iq, y])
 
         # Candidate starts, all scored before optimizing. Zero coefficients ARE the
         # plain raised cosine, and the DRAG seed reproduces the DRAG baseline to
         # first order, so taking the best of these guarantees the optimizer starts
         # at or above the applied gate -- dF_grape can then never come out negative
         # just because a warm start happened to be a bad pulse.
-        seeds = [("raised-cosine", np.zeros(4 * int(n_basis)))]
+        n_iq = 4 * int(n_basis)
+        seeds = [("raised-cosine", _pack(np.zeros(n_iq)))]
         if drag_beat_GHz:
-            seeds.append(("drag-baseline", _drag_seed_crab(t_g, freqs, drag_beat_GHz)))
+            seeds.append(("drag-baseline",
+                          _pack(_drag_seed_crab(t_g, freqs, drag_beat_GHz))))
         if warmstart_beat_GHz:
-            seeds.append(("warmstart", _drag_seed_crab(t_g, freqs, warmstart_beat_GHz)))
+            seeds.append(("warmstart",
+                          _pack(_drag_seed_crab(t_g, freqs, warmstart_beat_GHz))))
+        if n_chirp and chirp_seed_GHz is not None:
+            # the physics-derived Stark-tracking start (see stark_chirp); scored like
+            # any other candidate, so a bad seed can only be ignored, never adopted
+            seeds.append(("stark-chirp", _pack(np.zeros(n_iq), chirp_seed_GHz)))
         F_best, leak_best, p_best, seed_used = -1.0, 1.0, seeds[0][1], seeds[0][0]
         nfev_total = 0
         for name, p in seeds:
-            env.set_params(p)
+            _apply(p)
             F_s, leak_s = score_current()
             nfev_total += 1
             if F_s > F_best:
                 F_best, leak_best, p_best, seed_used = F_s, leak_s, p, name
         if verbose:
             print(f"  CRAB start: {seed_used} (F = {F_best:.6f}) "
-                  f"of {len(seeds)} candidate seed(s)")
-
-        bound = 2.0                            # |coefficient| bound (dimensionless)
+                  f"of {len(seeds)} candidate seed(s)"
+                  + (f", chirp degree {n_chirp}" if n_chirp else ""))
 
         def infid(p: np.ndarray) -> float:
-            q = np.clip(np.asarray(p, dtype=float), -bound, bound)
-            env.set_params(q)
+            _apply(p)
             F, _ = score_current()
             return 1.0 - F
 
@@ -711,48 +985,67 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
                 # previous optimum (zeros on the new coefficients) as the start.
                 new = _crab_frequencies(n_basis, t_g, rng)
                 freqs = np.concatenate([freqs, new])
-                k = p_best.size // 4
-                sI, sQ, cI, cQ = (p_best[:k], p_best[k:2 * k],
-                                  p_best[2 * k:3 * k], p_best[3 * k:])
+                # Split the chirp tail off BEFORE re-blocking the IQ coefficients: the
+                # vector is [sI|sQ|cI|cQ|y], so a bare `size // 4` would mis-slice all
+                # four Fourier blocks once a chirp tail is present.
+                tail = p_best[-n_chirp:] if n_chirp else np.zeros(0)
+                iq = p_best[:-n_chirp] if n_chirp else p_best
+                k = iq.size // 4
+                sI, sQ, cI, cQ = (iq[:k], iq[k:2 * k], iq[2 * k:3 * k], iq[3 * k:])
                 z = np.zeros(new.size)
-                p_best = np.concatenate([sI, z, sQ, z, cI, z, cQ, z])
+                p_best = np.concatenate([sI, z, sQ, z, cI, z, cQ, z, tail])
                 env = IQFourierEnvelope(amp, t_g, freqs=freqs)
-                env.set_params(p_best)
                 tone.envelope = env
+                _apply(p_best)
             res = minimize(infid, p_best, method=method,
                            options=dict(maxiter=int(maxiter), xatol=1e-6,
                                         fatol=1e-9, disp=verbose)
                            if method == "Nelder-Mead"
                            else dict(maxiter=int(maxiter), disp=verbose))
             nfev_total += int(res.nfev)
-            p_try = np.clip(np.asarray(res.x, dtype=float), -bound, bound)
-            env.set_params(p_try)
+            p_try = _apply(res.x)
             F_try, leak_try = score_current()
             if F_try >= F_best:                # monotone: keep only improvements
                 F_best, leak_best, p_best = F_try, leak_try, p_try
             else:
-                env.set_params(p_best)
+                _apply(p_best)
             if verbose:
                 print(f"  CRAB super-iteration {sup + 1}/{restarts}: "
                       f"{freqs.size} harmonics, {p_best.size} params, F = {F_best:.6f}")
 
-        env.set_params(p_best)
+        _apply(p_best)
         eta_opt = env.samples(n_samples)
-        return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
-                    eta_opt=eta_opt, F_grape=F_best, leak_grape=leak_best,
-                    n_ctrl=n_samples, n_sub=n_sub_red, cutoff_GHz=cutoff_GHz,
-                    nfev=nfev_total,
-                    warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
-                                        else float(warmstart_beat_GHz)),
-                    backend="qutip", alg="CRAB", n_basis=int(n_basis),
-                    crab_freqs=np.asarray(freqs, dtype=float),
-                    crab_params=np.asarray(p_best, dtype=float),
-                    crab_score=score, crab_restarts=int(restarts),
-                    crab_seed_used=seed_used,
-                    qoc_fid_err=float(1.0 - F_best))
+        out = dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
+                   eta_opt=eta_opt, F_grape=F_best, leak_grape=leak_best,
+                   n_ctrl=n_samples, n_sub=n_sub_red, cutoff_GHz=cutoff_GHz,
+                   nfev=nfev_total,
+                   warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
+                                       else float(warmstart_beat_GHz)),
+                   backend="qutip", alg="CRAB", n_basis=int(n_basis),
+                   crab_freqs=np.asarray(freqs, dtype=float),
+                   crab_params=np.asarray(p_best, dtype=float),
+                   crab_score=score, crab_restarts=int(restarts),
+                   crab_seed_used=seed_used,
+                   qoc_fid_err=float(1.0 - F_best))
+        if n_chirp:
+            coeffs = [float(c) for c in opt_chirp.coeffs_GHz]
+            # Re-score the WINNING envelope with the chirp switched off. This is the
+            # honest attribution: F_grape - F_baseline mixes the envelope and the
+            # chirp, whereas F_grape - F_chirp_off is what the chirp alone bought on
+            # top of the same pulse shape.
+            opt_chirp.set_params(np.zeros(n_chirp + 1))
+            F_off, _leak_off = score_current()
+            opt_chirp.set_params(np.asarray(coeffs, dtype=float))
+            out.update(chirp_coeffs_GHz=coeffs, chirp_degree=n_chirp,
+                       chirp_bound_GHz=chirp_bound_GHz,
+                       chirp_seed_GHz=(None if chirp_seed_GHz is None
+                                       else [float(c) for c in chirp_seed_GHz]),
+                       F_chirp_off=float(F_off),
+                       dF_chirp=float(F_best - F_off))
+        return out
     finally:
-        # never leave the caller's coupler holding the optimizer's pulse
-        tone.envelope, tone.drag = env_saved, drag_saved
+        # never leave the caller's coupler holding the optimizer's pulse OR its chirp
+        tone.envelope, tone.drag, tone.chirp = env_saved, drag_saved, chirp_saved
 
 
 def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
@@ -763,6 +1056,9 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
                    crab_restarts: int = 1, crab_seed: Optional[int] = None,
                    crab_score: str = "qutip", crab_method: str = "Nelder-Mead",
                    atol: float = 1e-10, rtol: float = 1e-8, nsteps: int = 500000,
+                   chirp_degree: int = 0,
+                   chirp_seed_GHz: Optional[Sequence[float]] = None,
+                   chirp_bound_GHz: float = 0.02,
                    verbose: bool = False) -> Dict[str, Any]:
     """Optimize the pump envelope and compare to the DRAG raised-cosine baseline.
 
@@ -817,6 +1113,26 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
         Max Omega*dt_fine (rad) -- sets fine sub-steps per control slice.
     atol, rtol, nsteps
         QuTiP ODE controls for the exact objective (CRAB with crab_score='qutip').
+    chirp_degree : int, default 0
+        Optimize the pump CHIRP alongside the envelope, over Legendre coefficients
+        ``c_1 .. c_chirp_degree`` of delta(t). 0 (default) leaves the chirp exactly as
+        the coupler carries it, so every existing call is unchanged. ``c_0`` is always
+        pinned to zero -- it is degenerate with ``wp_offset_GHz`` (a constant chirp IS
+        a retuned carrier), and leaving both free gives a flat direction.
+
+        Note the shape being tracked, ``|eta(t)|^2 ~ cos^4(pi u / 2)``, is EVEN in the
+        normalized gate time, so the useful coefficients are the even ones: degree 2
+        buys ``c_2``, degree 4 adds ``c_4``. A purely linear (odd) chirp is the wrong
+        first guess. See ``stark_chirp``.
+    chirp_seed_GHz : sequence of float, optional
+        Extra scored start for the chirp, e.g. ``stark_chirp.seed_from_calibration_map``.
+        Added as one more candidate seed, so a bad seed can be ignored but never
+        adopted -- the monotone-start guarantee is preserved.
+    chirp_bound_GHz : float, default 0.02
+        Box on each ``|c_k|``. 20 MHz is ~5x the tracking amplitude for a few-MHz
+        Stark shift, stays ~1% of a ~2 GHz qubit-qubit detuning (so the term expansion
+        is unchanged), and stays well below the nearest collision/anharmonicity scale
+        (~200-300 MHz), so a chirp cannot sweep the pump INTO another resonance.
 
     Returns
     -------
@@ -834,30 +1150,40 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
                               warmstart_beat_GHz=warmstart_beat_GHz,
                               maxiter=maxiter, restarts=crab_restarts,
                               seed=crab_seed, score=crab_score, method=crab_method,
-                              atol=atol, rtol=rtol, nsteps=nsteps, verbose=verbose)
+                              atol=atol, rtol=rtol, nsteps=nsteps,
+                              chirp_degree=chirp_degree,
+                              chirp_seed_GHz=chirp_seed_GHz,
+                              chirp_bound_GHz=chirp_bound_GHz, verbose=verbose)
     if backend == "qutip":
         return _optimize_jax(cpl, a, b, t_g, n_basis=n_basis, cutoff_GHz=cutoff_GHz,
                              drag_beat_GHz=drag_beat_GHz,
                              warmstart_beat_GHz=warmstart_beat_GHz,
-                             maxiter=maxiter, n_time=n_ctrl, verbose=verbose)
+                             maxiter=maxiter, n_time=n_ctrl,
+                             chirp_degree=chirp_degree,
+                             chirp_seed_GHz=chirp_seed_GHz,
+                             chirp_bound_GHz=chirp_bound_GHz, verbose=verbose)
     terms, H_anh, idx, max_Omega = _prepare(cpl, a, b, cutoff_GHz)
     dt_ctrl = t_g / n_ctrl
-    n_sub = max(1, int(np.ceil(max_Omega * dt_ctrl / carrier_resolution)))
+    chirp = _tone_chirp(cpl)
+    n_sub = max(1, int(np.ceil((max_Omega + _chirp_pad_rad(chirp, terms))
+                               * dt_ctrl / carrier_resolution)))
 
     peak = float(cpl.peak_eta())
-    eta0 = _raised_cosine_eta(t_g, peak, n_ctrl, drag_beat_GHz)
-    U0 = _propagate(eta0, t_g, terms, H_anh, idx, n_sub)
+    eta0 = _raised_cosine_eta(t_g, peak, n_ctrl, drag_beat_GHz, chirp,
+                            _tone_n_pump(cpl))
+    U0 = _propagate(eta0, t_g, terms, H_anh, idx, n_sub, chirp=chirp)
     F0, leak0 = _score(U0, cpl)
 
     def infid(x: np.ndarray) -> float:
         eta = x[:n_ctrl] + 1j * x[n_ctrl:]
-        U = _propagate(eta, t_g, terms, H_anh, idx, n_sub)
+        U = _propagate(eta, t_g, terms, H_anh, idx, n_sub, chirp=chirp)
         F, _ = _score(U, cpl)
         return 1.0 - F
 
     # optimizer seed: the baseline pulse, or a DRAG raised cosine at a supplied beat
     eta_seed = (eta0 if warmstart_beat_GHz is None
-                else _raised_cosine_eta(t_g, peak, n_ctrl, warmstart_beat_GHz))
+                else _raised_cosine_eta(t_g, peak, n_ctrl, warmstart_beat_GHz, chirp,
+                                   _tone_n_pump(cpl)))
     x0 = np.concatenate([eta_seed.real, eta_seed.imag])
     # keep the optimizer from running away to non-physical amplitudes
     bound = 2.0 * (abs(peak) + 1e-6)
@@ -865,7 +1191,7 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
                    bounds=[(-bound, bound)] * (2 * n_ctrl),
                    options=dict(maxiter=maxiter, ftol=1e-9, disp=verbose))
     eta_opt = res.x[:n_ctrl] + 1j * res.x[n_ctrl:]
-    Uo = _propagate(eta_opt, t_g, terms, H_anh, idx, n_sub)
+    Uo = _propagate(eta_opt, t_g, terms, H_anh, idx, n_sub, chirp=chirp)
     Fg, leakg = _score(Uo, cpl)
 
     return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
@@ -924,13 +1250,38 @@ def main() -> None:
     ap.add_argument("--crab-method", default="Nelder-Mead",
                     help="[CRAB] gradient-free scipy method (Nelder-Mead, Powell, ...)")
     ap.add_argument("--n-basis", type=int, default=6,
-                    help="sin() basis functions per quadrature (qutip backend)")
+                    help="sin() basis functions per quadrature (qutip backend); 0 "
+                         "freezes the envelope to the plain raised cosine, which is "
+                         "how to isolate the chirp as the ONLY free parameter")
     ap.add_argument("--maxiter", type=int, default=200)
+    ap.add_argument("--chirp-degree", type=int, default=0,
+                    help="optimize the pump chirp too, over Legendre coefficients "
+                         "c_1..c_D of delta(t) (c_0 is pinned -- it is degenerate "
+                         "with --wp-offset-GHz). The Stark shape is EVEN in gate "
+                         "time, so c_2 is the leading useful term: try 2 or 4")
+    ap.add_argument("--chirp-bound-GHz", type=float, default=0.02,
+                    help="box on each |c_k| (default 20 MHz)")
+    ap.add_argument("--chirp-seed-GHz", default=None,
+                    help="comma list seeding the chirp, e.g. from calibration_map's "
+                         "'suggested chirp seed'; scored as one more candidate start")
+    ap.add_argument("--chirp-seed-stark-MHz", type=float, default=None,
+                    help="build the chirp seed analytically from a pulse-averaged "
+                         "Stark shift (MHz) via stark_chirp.stark_chirp_seed")
     args = ap.parse_args()
 
     from snail_solver.paths import resolve_device
-    from snail_solver.device_utils import load_device
+    from snail_solver.device_utils import load_device, parse_chirp_arg
     cfg = load_device(resolve_device(args.device))
+
+    chirp_seed = parse_chirp_arg(args.chirp_seed_GHz)
+    if args.chirp_seed_stark_MHz is not None:
+        if chirp_seed:
+            raise SystemExit("give either --chirp-seed-GHz or --chirp-seed-stark-MHz")
+        from snail_solver.stark_chirp import describe_seed, stark_chirp_seed
+        delta = float(args.chirp_seed_stark_MHz) * 1e-3
+        chirp_seed = list(stark_chirp_seed(delta, degree=max(args.chirp_degree, 2)))
+        print(describe_seed(chirp_seed, delta))
+
     out = compare(cfg, args.t_g_ns, amp_scale=args.amp_scale,
                   wp_offset_GHz=args.wp_offset_GHz, spec_abs_GHz=args.spec_abs_GHz,
                   drag_beat_GHz=args.drag_beat_GHz, n_ctrl=args.n_ctrl,
@@ -938,7 +1289,9 @@ def main() -> None:
                   warmstart_beat_GHz=args.warmstart_drag_beat_GHz,
                   backend=args.backend, alg=args.alg, n_basis=args.n_basis,
                   crab_restarts=args.crab_restarts, crab_seed=args.crab_seed,
-                  crab_score=args.crab_score, crab_method=args.crab_method)
+                  crab_score=args.crab_score, crab_method=args.crab_method,
+                  chirp_degree=args.chirp_degree, chirp_seed_GHz=chirp_seed,
+                  chirp_bound_GHz=args.chirp_bound_GHz)
     if out.get("alg") == "CRAB":
         tag = (f"qutip/CRAB score={out.get('crab_score')} "
                f"{out.get('crab_freqs', np.zeros(0)).size} harmonics x "
@@ -952,6 +1305,13 @@ def main() -> None:
     print(f"  DRAG raised-cosine : F = {out['F_baseline']:.5f}  leak = {out['leak_baseline']:.4f}")
     print(f"  GRAPE optimized    : F = {out['F_grape']:.5f}  leak = {out['leak_grape']:.4f}")
     print(f"  improvement dF = {out['F_grape'] - out['F_baseline']:+.5f}")
+    if "chirp_coeffs_GHz" in out:
+        nz = ", ".join(f"c{k}={c:+.5f}" for k, c in
+                       enumerate(out["chirp_coeffs_GHz"]) if c)
+        print(f"  chirp (degree {out['chirp_degree']}): [{nz or 'all zero'}] GHz")
+        print(f"    same envelope, chirp OFF : F = {out['F_chirp_off']:.5f}")
+        print(f"    attributable to the chirp: dF = {out['dF_chirp']:+.5f}")
+        print(f"    --chirp-GHz \"{','.join(f'{c:g}' for c in out['chirp_coeffs_GHz'])}\"")
     print("  (validate the GRAPE pulse in the full QuTiP iswap_fidelity on the cluster)")
 
 

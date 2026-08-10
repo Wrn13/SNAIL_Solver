@@ -27,8 +27,16 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 #: keys that describe WHERE a point was calibrated (used for validation)
-CONTEXT_KEYS = ("wa_GHz", "wb_GHz", "t_g_ns", "spec_abs_GHz", "drag_beat_GHz")
+#: `chirp_coeffs_GHz` appears in BOTH tuples on purpose: a chirp is a setting the
+#: point applies, and it is also context, since an amplitude/offset calibrated under
+#: one chirp does not transfer to another. This tuple is used for DISPLAY only --
+#: `check_context` builds its own comparison set, and validates the (list-valued)
+#: chirp separately from the scalar keys.
+CONTEXT_KEYS = ("wa_GHz", "wb_GHz", "t_g_ns", "spec_abs_GHz", "drag_beat_GHz",
+                "chirp_coeffs_GHz")
 #: keys that the point actually SETS on a run
 #: `chirp_coeffs_GHz` is a list, not a scalar -- a calibrated chirp is part of the
 #: operating point exactly like the constant pump offset it generalizes.
@@ -142,6 +150,25 @@ def check_context(point: Dict[str, Any], config: Dict[str, Any],
         tol = tol_ns if key.endswith("_ns") else tol_GHz
         if abs(float(want) - float(value)) > tol:
             issues.append(f"{key}: point={want} vs run={value}")
+
+    # The chirp is LIST-valued, so it cannot join the scalar loop above -- float() on
+    # a list raises. Compare zero-padded, since [0.01] and [0.01, 0.0] are the same
+    # chirp.
+    #
+    # The `if run_chirp` guard is load-bearing: `check_context` runs BEFORE
+    # `apply_point`, so an empty run chirp means "unset, the point is about to supply
+    # it" -- matching apply_point's `is not None` semantics -- and must not warn on
+    # every legitimate use of a chirped point.
+    run_chirp = list(config.get("chirp_coeffs_GHz") or [])
+    if run_chirp:
+        point_chirp = list(point.get("chirp_coeffs_GHz") or [])
+        n = max(len(run_chirp), len(point_chirp))
+        pad = [0.0] * n
+        a = (point_chirp + pad)[:n]
+        b = (run_chirp + pad)[:n]
+        if not np.allclose(np.asarray(a, dtype=float),
+                           np.asarray(b, dtype=float), atol=tol_GHz):
+            issues.append(f"chirp_coeffs_GHz: point={point_chirp} vs run={run_chirp}")
     return issues
 
 
@@ -149,9 +176,13 @@ def apply_point(config: Dict[str, Any], point: Dict[str, Any],
                 set_t_g: bool = True) -> Dict[str, Any]:
     """Return a copy of ``config`` with the point's settings applied.
 
-    Sets ``amp_scale`` and ``wp_offset_GHz`` (and ``t_g_ns`` unless ``set_t_g``
-    is False). Context keys are not applied -- they describe where the point was
-    calibrated, and are for ``check_context`` to validate against.
+    Sets ``amp_scale``, ``wp_offset_GHz`` and ``chirp_coeffs_GHz`` (and ``t_g_ns``
+    unless ``set_t_g`` is False). Other context keys are not applied -- they describe
+    where the point was calibrated, and are for ``check_context`` to validate against.
+
+    Note the ``is not None`` test below: an explicitly stored empty chirp (``[]``)
+    counts as a setting and will clear a chirp the config carried, whereas a missing
+    key leaves the config's own value alone.
     """
     out = dict(config)
     for key in SETTING_KEYS:

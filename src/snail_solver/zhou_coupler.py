@@ -567,14 +567,25 @@ class ZhouCoupler:
         frame, not a feature of the pulse shape, so it must not be differentiated
         by the DRAG quadrature -- doing so would inject a spurious
         -i delta(t) eta / Delta term that grows with the chirp rate and has no
-        physical counterpart.
+        physical counterpart. Equivalently: in the frame rotating at the
+        INSTANTANEOUS pump frequency the chirp phase is absorbed into the frame, so
+        only the amplitude derivative survives in the numerator.
+
+        The DENOMINATOR, however, does move with the chirp. That same instantaneous
+        frame puts the suppressed process at ``Delta(t) = Delta_0 - k delta(t)``,
+        with k = ``tone.drag_n_pump`` the number of pump quanta it carries -- the
+        beat convention ``beat = separation - k w_p`` used throughout
+        ``sweep_common._nearest_collision``. Dividing by the static Delta_0 instead
+        mis-weights the quadrature by O(k delta / Delta_0), which is a ~10%
+        correction for a 100-300 MHz beat but order-unity near a collision, i.e.
+        exactly where DRAG is doing the most work. See `PumpTone.drag_detuning`.
         """
         omega_p = tone.w_p_GHz * TWO_PI
         omega_s = self.omega[self.coupler_index]
         prefactor = 1.0 if tone.is_eta else (2 * omega_p / (omega_p ** 2 - omega_s ** 2))
         amplitude = tone.envelope.value_at(t, xp)
         if tone.drag and tone.delta_drag_GHz not in (None, 0.0):
-            detuning = tone.delta_drag_GHz * TWO_PI            # rad/ns
+            detuning = tone.drag_detuning(t, xp)               # rad/ns, time-dependent
             amplitude = amplitude - 1j * tone.envelope.deriv_at(t, xp) / detuning
         if tone.chirp is not None:
             # A chirped carrier w_p + delta(t) is exactly the fixed carrier w_p

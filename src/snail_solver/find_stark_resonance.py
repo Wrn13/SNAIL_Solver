@@ -50,7 +50,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from snail_solver.device_utils import load_device, target_eta_area
+from snail_solver.device_utils import check_drag_detuning, load_device, target_eta_area
 
 TWO_PI: float = 2.0 * np.pi
 
@@ -95,7 +95,9 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                           spec_abs_GHz: Optional[float] = None,
                           shape: str = "constant", t_g_ns: Optional[float] = None,
                           drag_beat_GHz: Optional[float] = None,
-                          amp_scale: float = 1.0):
+                          amp_scale: float = 1.0,
+                          chirp_coeffs_GHz: Optional[Sequence[float]] = None,
+                          drag_n_pump: int = 1):
     """(a, b, coupler[, spectator]) system driven by a probe pump, with the pump
     frequency offset from |w_b - w_a| by wp_offset_GHz. Anharmonicity / qutrit
     levels are included.
@@ -135,13 +137,28 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
     amp_scale : float, default 1.0
         Amplitude-scale correction applied after the full-iSWAP normalization
         (raised-cosine only).
+    chirp_coeffs_GHz : sequence of float, optional
+        Legendre coefficients of the gate's pump chirp delta(t) (GHz), raised-cosine
+        only. Pass the chirp the GATE actually runs with, so the located resonance is
+        the RESIDUAL offset on top of it. Omitting it on a chirped device
+        double-counts the chirp's mean component c0 -- the probe would measure the
+        un-chirped resonance, which the caller then writes into ``wp_offset_GHz``
+        while the gate ALSO applies c0. See :class:`envelope.Chirp`.
+
+    Raises
+    ------
+    ValueError
+        If a chirp is given with ``shape="constant"``: a chirp is defined on the
+        normalized gate time u = 2t/t_g - 1, and the constant probe has no gate to
+        normalize against. Use ``shape="raised_cosine"`` to measure a chirped gate.
 
     Returns
     -------
     (ZhouCoupler, float)
         The coupler and its pump frequency w_p (GHz).
     """
-    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, ConstantPulse, RaisedCosine
+    from snail_solver.zhou_coupler import (ZhouCoupler, PumpTone, ConstantPulse,
+                                           RaisedCosine, make_chirp)
 
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     ws = float(config["coupler_freq_GHz"])
@@ -172,12 +189,24 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
         # Built exactly as run_sweep_zhou.build_point does (normalize then scale).
         t_g = float(t_g_ns if t_g_ns is not None else window_ns)
         env = RaisedCosine(amp=1.0, t_g=t_g)
-        cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
-                              drag=(drag_beat_GHz is not None),
-                              delta_drag_GHz=drag_beat_GHz),
-                     normalize_iswap=(0, 1))
+        tone = PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
+                        drag=(drag_beat_GHz is not None),
+                        delta_drag_GHz=drag_beat_GHz,
+                        chirp=make_chirp(chirp_coeffs_GHz, t_g),
+                        drag_n_pump=int(drag_n_pump))
+        if drag_beat_GHz is not None:
+            check_drag_detuning(tone)      # chirp must not sweep the pump onto the beat
+        cpl.set_pump(tone, normalize_iswap=(0, 1))
         cpl.scale_pump_amplitude(float(amp_scale))
     else:
+        if chirp_coeffs_GHz is not None and np.any(np.asarray(chirp_coeffs_GHz,
+                                                              dtype=float)):
+            raise ValueError(
+                "a chirp cannot be applied to the constant probe: Chirp is defined on "
+                "the normalized gate time u = 2t/t_g - 1, and a constant pump held "
+                "over `window_ns` has no gate to normalize against. Pass "
+                "shape='raised_cosine' (with t_g_ns) to locate the resonance of a "
+                "chirped gate.")
         # constant pump at fixed |eta| (is_eta=True, no normalization): peak_eta == eta_op
         cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=ConstantPulse(amp=eta_op, t_g=window_ns),
                               is_eta=True), normalize_iswap=None)
@@ -258,7 +287,10 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
          n_jobs: Optional[int] = None,
          spec_abs_GHz: Optional[float] = None,
          shape: str = "constant",
-         drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
+         drag_beat_GHz: Optional[float] = None,
+         chirp_coeffs_GHz: Optional[Sequence[float]] = None,
+         drag_n_pump: int = 1,
+         eta_op: Optional[float] = None) -> Dict[str, Any]:
     """Run the pump-frequency chevron and locate the Stark-shifted resonance.
 
     Parameters
@@ -283,20 +315,35 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
     spec_abs_GHz : float, optional
         If given, include a spectator mode at this ABSOLUTE frequency so the
         located resonance includes its dispersive pull; None -> bare pair.
+    chirp_coeffs_GHz : sequence of float, optional
+        The gate's chirp (GHz), so the resonance is located as the RESIDUAL offset on
+        top of it rather than the un-chirped one. Requires ``shape='raised_cosine'``.
+        See :func:`build_chevron_coupler`.
+    eta_op : float, optional
+        Drive the constant probe at THIS |eta| instead of deriving it from
+        ``(t_g, amp_scale)`` via :func:`operating_eta`. This is what makes a
+        drive-strength sweep possible: the caller picks the physical drive directly
+        rather than reaching it indirectly through a gate length it does not mean.
+        Ignored by ``shape='raised_cosine'``, whose amplitude comes from the gate.
 
     Returns
     -------
     dict
         offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer [n_off],
         eta_op, w_p_bare_GHz, resonance_offset_GHz, resonance_w_p_GHz, and the
-        probe metadata shape, drag_beat_GHz, spec_abs_GHz.
+        probe metadata shape, drag_beat_GHz, spec_abs_GHz, chirp_coeffs_GHz.
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
-    eta_op = operating_eta(config, t_g, amp_scale)
+    eta_op = (float(eta_op) if eta_op is not None
+              else operating_eta(config, t_g, amp_scale))
     times = np.linspace(0.0, window_ns, n_time)
+    chirp_list = ([float(c) for c in chirp_coeffs_GHz]
+                  if chirp_coeffs_GHz is not None else None)
     build_kw = {"shape": shape, "t_g_ns": float(t_g),
                 "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else None),
-                "amp_scale": float(amp_scale)}
+                "amp_scale": float(amp_scale),
+                "chirp_coeffs_GHz": chirp_list,
+                "drag_n_pump": int(drag_n_pump)}
     args = [(config, eta_op, float(off), times, solver, spec_abs_GHz, build_kw)
             for off in offsets_GHz]
 
@@ -333,7 +380,8 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
             "resonance_w_p_GHz": float(w_p_bare + res_off),
             "shape": shape,
             "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else np.nan),
-            "spec_abs_GHz": (float(spec_abs_GHz) if spec_abs_GHz is not None else np.nan)}
+            "spec_abs_GHz": (float(spec_abs_GHz) if spec_abs_GHz is not None else np.nan),
+            "chirp_coeffs_GHz": chirp_list}
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +480,25 @@ def main() -> None:
     ap.add_argument("--time-points", type=int, default=200)
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = SLURM_CPUS_PER_TASK/CPU)")
     ap.add_argument("--gpu", action="store_true", help="run via qutip-jax/diffrax (forces --jobs 1)")
+    ap.add_argument("--shape", choices=["constant", "raised_cosine"], default="constant",
+                    help="probe pulse. 'constant' is amplitude-robust but has "
+                         "d(eta)/dt = 0, so it is BLIND to DRAG and cannot carry a "
+                         "chirp; use 'raised_cosine' (the actual gate pulse) to locate "
+                         "the DRAG-on or chirped resonance")
+    ap.add_argument("--spec-abs-GHz", type=float, default=None,
+                    help="include a spectator at this ABSOLUTE frequency, so the "
+                         "located resonance carries its dispersive pull")
+    ap.add_argument("--drag-beat-GHz", type=float, default=None,
+                    help="apply the DRAG quadrature at this beat (needs "
+                         "--shape raised_cosine); the located offset is then the "
+                         "DRAG-on resonance")
+    ap.add_argument("--drag-n-pump", type=int, default=1,
+                    help="pump quanta of the suppressed process; with a chirp the "
+                         "beat moves as Delta(t) = beat - n*delta(t)")
+    ap.add_argument("--chirp-GHz", default=None,
+                    help="comma list of Legendre chirp coefficients (GHz) applied to "
+                         "the probe, so the located offset is the RESIDUAL on top of "
+                         "the chirp (needs --shape raised_cosine)")
     ap.add_argument("--out", default="stark.npz", help="output .npz")
     ap.add_argument("--plot", default=None, help="optional output PNG")
     ap.add_argument("--update-device", default=None,
@@ -475,8 +542,13 @@ def main() -> None:
 
     print(f"device={args.device}  t_g={t_g:.1f} ns  amp_scale={amp_scale}  "
           f"jobs={_resolve_jobs(args.jobs)}{' GPU' if args.gpu else ''}")
+    from snail_solver.device_utils import parse_chirp_arg
     result = scan(config, t_g, amp_scale, offsets, window, args.time_points,
-                  solver, n_jobs=args.jobs)
+                  solver, n_jobs=args.jobs, shape=args.shape,
+                  spec_abs_GHz=args.spec_abs_GHz,
+                  drag_beat_GHz=args.drag_beat_GHz,
+                  drag_n_pump=args.drag_n_pump,
+                  chirp_coeffs_GHz=parse_chirp_arg(args.chirp_GHz))
 
     np.savez(args.out, t_g_ns=t_g, amp_scale=amp_scale, **{
         k: v for k, v in result.items()})

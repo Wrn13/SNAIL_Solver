@@ -510,8 +510,20 @@ class PumpTone:
         spectator and is singular as the detuning -> 0 (an on-resonant collision
         needs frequency allocation, not DRAG).
     delta_drag_GHz : float, optional
-        Detuning delta_s (GHz) of the targeted off-resonant process; the
-        quadrature is -d eta/dt / (2 pi delta_drag_GHz). Required if `drag`.
+        STATIC beat Delta_0 (GHz) of the targeted off-resonant process; the
+        quadrature is -d eta/dt / (2 pi Delta(t)). Required if `drag`. On a chirped
+        tone this is only the t=0 value of the beat -- see `drag_n_pump`.
+    drag_n_pump : int, default 1
+        Number of PUMP QUANTA the suppressed process carries. On a CHIRPED tone the
+        pump sits at w_p + delta(t), so the beat is time-dependent::
+
+            Delta(t) = Delta_0 - drag_n_pump * delta(t)
+
+        matching this codebase's beat convention ``beat = separation - k w_p``
+        (``sweep_common._nearest_collision``): k = 1 for a one-pump process, 2 for a
+        subharmonic (two-pump) one, and **0 for a static, pump-independent beat**,
+        which a chirp must not move. Irrelevant without a chirp (delta = 0), so the
+        default leaves every un-chirped tone byte-identical.
     chirp : Chirp, optional
         Time-dependent offset delta(t) of the carrier. Applied as the phase
         e^{-i Phi(t)} on the pump amplitude AFTER the DRAG quadrature -- see
@@ -523,6 +535,13 @@ class PumpTone:
     `phi_p` enters as ``e^{+i phi_p}`` while the chirp enters as ``e^{-i Phi(t)}``,
     which is the sign that matches the ``e^{-i w_p t}`` carrier in X(t). A constant
     chirp `c0` therefore shifts the carrier to ``w_p + c0``, not ``w_p - c0``.
+
+    A chirp interacts with DRAG in exactly ONE place: the denominator. The quadrature
+    still differentiates the BASE envelope (the chirp phase is absorbed into the frame
+    rotating at the instantaneous pump frequency, so only the amplitude derivative
+    enters), but the beat it divides by moves with the pump. Getting this wrong is
+    silent: it simply mis-weights the quadrature, most severely near a collision where
+    Delta_0 is small and DRAG matters most.
     """
 
     w_p_GHz: float
@@ -532,3 +551,32 @@ class PumpTone:
     drag: bool = False
     delta_drag_GHz: Optional[float] = None
     chirp: Optional[Chirp] = None
+    drag_n_pump: int = 1
+
+    # -- the time-dependent DRAG beat ---------------------------------------
+    def drag_detuning(self, t: Any, xp: Any = np) -> Any:
+        """Instantaneous DRAG beat Delta(t) in rad/ns; xp-generic and trace-clean.
+
+        ``Delta_0 - drag_n_pump * delta(t)``. Returns the constant Delta_0 when the
+        tone is un-chirped or ``drag_n_pump == 0``.
+        """
+        detuning = float(self.delta_drag_GHz or 0.0) * TWO_PI
+        if self.chirp is None or not self.drag_n_pump:
+            return detuning + 0.0 * xp.asarray(t)
+        return detuning - self.drag_n_pump * self.chirp.detuning(t, xp)
+
+    def drag_detuning_floor(self, n: int = 257) -> float:
+        """min_t |Delta(t)| over the gate -- the singularity guard.
+
+        A chirp can drive Delta(t) through zero DURING the pulse even when Delta_0 is
+        comfortably large, which makes the quadrature diverge mid-gate. That failure
+        is invisible in Delta_0 alone, so callers that build a tone should check this
+        rather than ``abs(delta_drag_GHz)``.
+
+        Returns ``inf`` when DRAG is off (nothing to guard).
+        """
+        if not self.drag or self.delta_drag_GHz in (None, 0.0):
+            return float("inf")
+        t_g = float(getattr(self.envelope, "t_g", 0.0)) or 1.0
+        ts = np.linspace(0.0, t_g, int(n))
+        return float(np.min(np.abs(np.asarray(self.drag_detuning(ts, np)))))

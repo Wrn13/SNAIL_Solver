@@ -15,7 +15,7 @@ deterministic grid+zoom optimizer (numpy only, unit-testable without QuTiP).
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -40,6 +40,44 @@ def load_device(path: str) -> Dict[str, Any]:
     with open(path) as f:
         config.update(json.load(f))
     return config
+
+
+def parse_chirp_arg(text: Optional[str]) -> Optional[List[float]]:
+    """Parse a ``--chirp-GHz`` CLI value into Legendre coefficients.
+
+    Shared by every tool that takes the flag, so they cannot drift apart on what an
+    empty string means.
+
+    The distinction that matters is None vs ``[]``:
+
+    * ``None`` (flag absent) -- "say nothing", leave whatever the device config or a
+      resolved operating point supplies.
+    * ``""`` (flag given, empty) -- an explicit "no chirp", which OVERRIDES a
+      configured or saved chirp. Returns ``[]`` rather than None so a caller can tell
+      the two apart and report the override instead of silently cancelling a
+      calibrated chirp.
+
+    Parameters
+    ----------
+    text : str or None
+        Comma-separated coefficients of delta(t)/2pi in GHz, e.g. ``"0,0,-0.004"``.
+
+    Returns
+    -------
+    list of float, or None
+        None when `text` is None; otherwise the (possibly empty) coefficient list.
+    """
+    if text is None:
+        return None
+    return [float(x) for x in str(text).split(",") if x.strip()]
+
+
+def describe_chirp(coeffs: Optional[Sequence[float]]) -> str:
+    """One-line human description of a chirp, for CLI confirmation lines."""
+    if not coeffs:
+        return "none"
+    lead = ", ".join(f"c{k}={c:+g}" for k, c in enumerate(coeffs) if c)
+    return f"delta(t)/2pi = {list(map(float, coeffs))} GHz [{lead or 'all zero'}]"
 
 
 def target_eta_area(g3_GHz: float, lam_a: float, lam_b: float) -> float:
@@ -85,10 +123,49 @@ def auto_t_g(g3_GHz: float, lam_a: float, lam_b: float, target_eta: float) -> fl
     return 2.0 * target_eta_area(g3_GHz, lam_a, lam_b) / target_eta
 
 
+#: Smallest |Delta(t)| (GHz) a DRAG quadrature may reach before it is judged
+#: singular. Mirrors ``sweep_common._drag_skip_GHz`` so the explicit and swept paths
+#: agree on where DRAG stops being meaningful.
+DRAG_FLOOR_GHz: float = 5e-4
+
+
+def check_drag_detuning(tone, floor_GHz: float = DRAG_FLOOR_GHz) -> float:
+    """Raise if a chirp drives the DRAG beat through (or near) zero mid-pulse.
+
+    On a chirped tone ``Delta(t) = Delta_0 - k delta(t)`` can cross zero DURING the
+    gate even when ``Delta_0`` is comfortably large -- the quadrature then diverges
+    somewhere in the middle of the pulse, which is invisible if you only inspect
+    ``delta_drag_GHz``. This is the check that turns that into an error.
+
+    Explicit, single-point callers (`build_coupler`, tune-up, GRAPE) should let this
+    raise. Sweeps should instead pre-check and DISABLE DRAG for the offending point
+    (as they already do for a small static beat), so one bad point cannot kill a scan.
+
+    Returns
+    -------
+    float
+        ``min_t |Delta(t)|`` in GHz (``inf`` when DRAG is off).
+    """
+    floor_rad = float(min(floor_GHz, DRAG_FLOOR_GHz)) * TWO_PI
+    got = tone.drag_detuning_floor()
+    if got < floor_rad:
+        raise ValueError(
+            f"DRAG beat passes through zero during the pulse: min|Delta(t)| = "
+            f"{got / TWO_PI * 1e3:.4f} MHz < {floor_rad / TWO_PI * 1e3:.4f} MHz, with "
+            f"Delta_0 = {float(tone.delta_drag_GHz or 0.0) * 1e3:.3f} MHz, "
+            f"drag_n_pump = {tone.drag_n_pump}, chirp = "
+            f"{None if tone.chirp is None else list(tone.chirp.coeffs_GHz)} GHz. "
+            f"The chirp is sweeping the pump onto the process DRAG is meant to "
+            f"suppress. Reduce the chirp, pick a further-detuned beat, or set "
+            f"drag_n_pump=0 if that beat is genuinely pump-independent.")
+    return got / TWO_PI
+
+
 def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
                   wp_offset_GHz: float, spec_abs_GHz: Optional[float] = None,
                   drag_beat_GHz: Optional[float] = None,
-                  chirp_coeffs_GHz: Optional[Sequence[float]] = None):
+                  chirp_coeffs_GHz: Optional[Sequence[float]] = None,
+                  drag_n_pump: int = 1):
     """Build the (qubit a, qubit b, coupler[, spectator]) gate with the pump
     normalized to a full iSWAP and scaled by amp_scale (anharmonicity included).
 
@@ -114,11 +191,22 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
         (GHz), applied ON TOP of the constant `wp_offset_GHz`. None or all-zero
         leaves the tone un-chirped and the solver path unchanged. Defaults to
         ``config["chirp_coeffs_GHz"]``. See :class:`envelope.Chirp`.
+    drag_n_pump : int, default 1
+        Pump quanta carried by the process DRAG suppresses, which sets how the beat
+        moves under a chirp: ``Delta(t) = drag_beat_GHz - drag_n_pump * delta(t)``.
+        1 for a one-pump collision, 2 for a subharmonic one, 0 for a static
+        (pump-independent) beat. Irrelevant without a chirp.
 
     Returns
     -------
     (ZhouCoupler, float, float)
         The coupler, its pump frequency w_p (GHz), and the resulting peak |eta|.
+
+    Raises
+    ------
+    ValueError
+        If a chirp drives the DRAG beat through zero during the pulse; see
+        :func:`check_drag_detuning`.
     """
     from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse, make_chirp
 
@@ -146,11 +234,13 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
     if chirp_coeffs_GHz is None:
         chirp_coeffs_GHz = config.get("chirp_coeffs_GHz") or None
-    cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True,
-                          drag=(drag_beat_GHz is not None),
-                          delta_drag_GHz=(drag_beat_GHz if drag_beat_GHz is not None else 0.0),
-                          chirp=make_chirp(chirp_coeffs_GHz, t_g)),
-                 normalize_iswap=(0, 1))
+    tone = PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True,
+                    drag=(drag_beat_GHz is not None),
+                    delta_drag_GHz=(drag_beat_GHz if drag_beat_GHz is not None else 0.0),
+                    chirp=make_chirp(chirp_coeffs_GHz, t_g),
+                    drag_n_pump=int(drag_n_pump))
+    check_drag_detuning(tone)          # a chirp must not sweep the pump onto the beat
+    cpl.set_pump(tone, normalize_iswap=(0, 1))
     cpl.scale_pump_amplitude(amp_scale)
     return cpl, w_p_GHz, cpl.peak_eta()
 
@@ -158,7 +248,9 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
 def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
                          wp_offset_GHz: float, solver: Dict[str, Any],
                          spec_abs_GHz: Optional[float] = None,
-                         drag_beat_GHz: Optional[float] = None) -> float:
+                         drag_beat_GHz: Optional[float] = None,
+                         chirp_coeffs_GHz: Optional[Sequence[float]] = None,
+                         drag_n_pump: int = 1) -> float:
     """Single-shot swap probability P(|01> -> |10>) at t_g (QuTiP sesolve): a fast
     one-trajectory proxy for the rotation angle, used as a search objective.
 
@@ -179,6 +271,11 @@ def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
         Hilbert space so the probe sees it. None -> bare (a, b) pair.
     drag_beat_GHz : float, optional
         DRAG beat (GHz) for the probe pump. None -> no DRAG.
+    chirp_coeffs_GHz : sequence of float, optional
+        Pump chirp (GHz). Defaults to ``config["chirp_coeffs_GHz"]`` via
+        `build_coupler`; pass it explicitly to probe a chirp the config does not
+        carry. Without this the search objective would disagree with the gate it is
+        calibrating.
 
     Returns
     -------
@@ -186,7 +283,9 @@ def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
         P(|10>) starting from |01>, with any spectator left in its ground state.
     """
     cpl, _w_p, _eta = build_coupler(config, t_g, amp_scale, wp_offset_GHz,
-                                    spec_abs_GHz, drag_beat_GHz)
+                                    spec_abs_GHz, drag_beat_GHz,
+                                    chirp_coeffs_GHz=chirp_coeffs_GHz,
+                                    drag_n_pump=drag_n_pump)
     tail = [0] if spec_abs_GHz is not None else []       # spectator stays in |0>
     state = cpl.evolve_state([1, 0, 0] + tail, t_g, **solver)
     return float(np.abs(state[cpl.fock_index([0, 1, 0] + tail)]) ** 2)

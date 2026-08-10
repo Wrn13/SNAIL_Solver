@@ -108,10 +108,18 @@ prepare-time and run-time; `slurm/snail_sweep.slurm` documents which is which.
 
 | Module | Purpose |
 | --- | --- |
+| [tune_up](src/snail_solver/tune_up.py) | Hardware-order tune-up: Rabi → chirp → **fix the amplitude** → fit the length |
+| [stark_chirp](src/snail_solver/stark_chirp.py) | Legendre chirp that tracks the AC-Stark shift through the pulse |
 | [calibrate_gate](src/snail_solver/calibrate_gate.py) | End-to-end tune-up mirroring the experiment (frequency chevron, then Rabi) |
 | [find_stark_resonance](src/snail_solver/find_stark_resonance.py) | Locate the AC-Stark-shifted iSWAP resonance |
 | [calibration_map](src/snail_solver/calibration_map.py) | 2-D (pump offset × pump strength) landscape; can save an operating point |
 | [grape](src/snail_solver/grape.py) | Optimal control on the pump envelope vs. the DRAG baseline |
+
+`tune_up` and `calibration_map` answer the same question in opposite orders.
+`calibration_map` scans (offset, amp_scale) at a fixed length; `tune_up` *fixes* the
+peak drive |η| instead, which makes the pulse shape in normalized gate time
+independent of `t_g` and so decouples the frequency calibration from the length
+calibration — leaving the length as the only free parameter, as in the lab.
 
 **Analysis and figures**
 
@@ -162,6 +170,7 @@ are tuned to the device they name and run as written.
 | `snail_collect.slurm` / `snail_plot.slurm` | Post-processing stages |
 | `submit_sweep.sh` | Chain all of the above |
 | `snail_calibrate_gate.slurm` | Per-device gate tune-up |
+| `snail_tune_up.slurm` / `submit_tune_up.sh` | Hardware-order tune-up (fast explore → exact confirm) |
 | `snail_calibration_map.slurm` / `snail_gpu_scan.slurm` | Calibration landscape (CPU / GPU) |
 | `snail_stark.slurm` / `snail_stark_detuning.slurm` | Stark resonance and its detuning dependence |
 | `snail_grape.slurm` | Single-point optimal control |

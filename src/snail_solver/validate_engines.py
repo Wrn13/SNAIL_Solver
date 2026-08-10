@@ -18,11 +18,19 @@ justified by numbers, not by argument:
    both the accuracy delta and the measured wall-clock speedup. If the speedup is
    marginal, the honest answer is to stay on f64.
 
+3. **the reduced model** -- ``grape._propagate`` backs the DEFAULT calibration map
+   and every reduced-scored optimizer path, but had no column here, which is how it
+   went unnoticed that it ignored ``PumpTone.chirp`` outright. ``--reduced-scan``
+   measures it against the same QuTiP reference; with ``--chirp-GHz`` it is the
+   one-command check that all three engines agree on a CHIRPED device.
+
 Usage
 -----
     python -m snail_solver.validate_engines --device 2Gate4.9SNAIL.json --cutoff-scan
     python -m snail_solver.validate_engines --device 2Gate4.9SNAIL.json --precision-scan
     python -m snail_solver.validate_engines --device 2Gate4.9SNAIL.json --batch-scan 8,32,128
+    python -m snail_solver.validate_engines --device 2Gate4.9SNAIL.json --reduced-scan \
+        --chirp-GHz "0,0,-0.004"
 
 Notes
 -----
@@ -175,6 +183,68 @@ def batch_scan(args) -> None:
         print(f"{B:>7d}  {dt:>9.2f}s  {dt / B:>10.4f}s  {serial / (dt / B):>9.2f}x")
 
 
+def reduced_scan(args) -> None:
+    """The 'reduced' rotating-frame model vs the QuTiP reference -- chirp included.
+
+    This engine had no column here, and that is exactly how it went unnoticed that
+    ``grape._propagate`` ignored ``PumpTone.chirp`` entirely: the reduced model is
+    what backs the DEFAULT calibration map and every reduced-scored optimizer path,
+    yet only qutip-vs-jax was ever measured. Running it under ``--chirp-GHz`` is now
+    a one-command check that all three engines agree on a chirped device.
+
+    Unlike the batched engine, this model has THREE error sources, so the ladder
+    refines all of them together: the carrier cutoff (pruned terms), the
+    piecewise-constant control count ``n_ctrl``, and the fine-step resolution. The
+    pump is sampled through ``cpl._eta`` and then de-chirped, exactly as
+    ``grape._optimize_crab`` does, so the chirp is re-applied by ``_propagate`` on
+    its fine grid rather than held per slice.
+    """
+    from snail_solver import grape
+
+    levels = [2, 3] if args.quick else None
+    _cfg, cpl, t_g, w_p, eta = _build(args, levels)
+    chirp = grape._tone_chirp(cpl)
+    print(f"device={args.device}  dim={cpl.dim}  t_g={t_g:.3f} ns  w_p={w_p:.6f} GHz  "
+          f"|eta|={eta:.4f}")
+    print(f"chirp: {'none' if chirp is None else list(map(float, chirp.coeffs_GHz))}")
+
+    U_ref, dt_ref = _reference(cpl, t_g, args.atol, args.rtol)
+    F_ref, leak_ref = _score(U_ref)
+    print(f"reference (QuTiP sesolve, exact): F={F_ref:.10f}  leak={leak_ref:.3e}  "
+          f"[{dt_ref:.1f}s]\n")
+
+    cut = float(args.cutoff)
+    terms, H_anh, idx, max_Omega = grape._prepare(cpl, 0, 1, cut)
+    pad = grape._chirp_pad_rad(chirp, terms)
+    tone = cpl._pump_tones[0]
+    print(f"cutoff={cut} GHz -> {len(terms)} terms, max_Omega={max_Omega:.3f} rad/ns"
+          + (f", chirp pad={pad:.3f} rad/ns" if pad else ""))
+
+    ladder = [int(x) for x in args.reduced_n_ctrl.split(",")]
+    print(f"\n{'n_ctrl':>7}  {'res':>6}  {'n_sub':>7}  {'F':>12}  {'F-F_ref':>10}  "
+          f"{'max|dU|':>10}  {'time':>8}")
+    print("-" * 72)
+    for n_ctrl in ladder:
+        res = float(args.carrier_resolution)
+        ts = (np.arange(n_ctrl) + 0.5) * (t_g / n_ctrl)
+        eta_ctrl = np.array([complex(cpl._eta(tone, float(t))) for t in ts])
+        if chirp is not None:                      # _eta applies it last -> exact
+            eta_ctrl = eta_ctrl * np.exp(1j * np.asarray(chirp.phase(ts, np)))
+        n_sub = max(1, int(np.ceil((max_Omega + pad) * (t_g / n_ctrl) / res)))
+        t0 = time.time()
+        U = grape._propagate(eta_ctrl, t_g, terms, H_anh, idx, n_sub, chirp=chirp)
+        dt = time.time() - t0
+        F, _leak = _score(U)
+        print(f"{n_ctrl:>7d}  {res:>6.3f}  {n_sub:>7d}  {F:>12.9f}  "
+              f"{F - F_ref:>+10.2e}  {np.max(np.abs(U - U_ref)):>10.2e}  {dt:>7.2f}s")
+    print("\nThe reduced model is the FAST engine, not the accurate one: at the default\n"
+          "carrier_resolution=0.3 its propagator error is O(1e-1), and it converges\n"
+          "second-order in the fine step. Read its calibration maps as a landscape,\n"
+          "then confirm the optimum with --engine qutip. What this table must show is\n"
+          "that turning a chirp ON does not degrade the agreement -- run it with and\n"
+          "without --chirp-GHz and compare the max|dU| columns.")
+
+
 def main() -> None:
     """CLI entry point."""
     ap = argparse.ArgumentParser(
@@ -189,6 +259,12 @@ def main() -> None:
     ap.add_argument("--cutoff-scan", action="store_true")
     ap.add_argument("--precision-scan", action="store_true")
     ap.add_argument("--batch-scan", default=None, help="comma list of batch sizes")
+    ap.add_argument("--reduced-scan", action="store_true",
+                    help="measure the 'reduced' rotating-frame model (grape._propagate, "
+                         "the DEFAULT calibration engine) against QuTiP; combine with "
+                         "--chirp-GHz to check all three engines on a chirped device")
+    ap.add_argument("--reduced-n-ctrl", default="8,16,32,64",
+                    help="[--reduced-scan] comma list of control-slice counts")
     ap.add_argument("--cutoffs", default=None, help="comma list for --cutoff-scan")
     ap.add_argument("--cutoff", type=float, default=float("inf"),
                     help="cutoff used by --precision-scan / --batch-scan")
@@ -201,7 +277,8 @@ def main() -> None:
                     help="truncate to 2-level qubits / 3-level coupler for a fast check")
     args = ap.parse_args()
 
-    if not (args.cutoff_scan or args.precision_scan or args.batch_scan):
+    if not (args.cutoff_scan or args.precision_scan or args.batch_scan
+            or args.reduced_scan):
         args.cutoff_scan = True
     if args.cutoff_scan:
         cutoff_scan(args)
@@ -209,6 +286,8 @@ def main() -> None:
         precision_scan(args)
     if args.batch_scan:
         batch_scan(args)
+    if args.reduced_scan:
+        reduced_scan(args)
 
 
 if __name__ == "__main__":

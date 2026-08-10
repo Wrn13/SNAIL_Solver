@@ -141,12 +141,24 @@ CUTOFF="${CUTOFF:-1.0}"
 MAXITER="${MAXITER:-200}"
 AMP_SCALE="${AMP_SCALE:-1.0}"
 WP_OFFSET="${WP_OFFSET:-0.0}"
+# CHIRP_DEGREE>0 also optimizes the pump chirp delta(t), over Legendre coefficients
+# c_1..c_D (c_0 is pinned: a constant chirp IS a retuned carrier, so it is degenerate
+# with WP_OFFSET). The Stark shape |eta(t)|^2 is EVEN in gate time, so c_2 is the
+# leading useful term -- try CHIRP_DEGREE=2 or 4. N_BASIS=0 freezes the envelope to
+# the plain raised cosine, which isolates the chirp as the ONLY free parameter.
+CHIRP_DEGREE="${CHIRP_DEGREE:-0}"
+CHIRP_BOUND="${CHIRP_BOUND:-0.02}"
 
 OPTS=""
 [ -n "${SPEC_ABS:-}"       ] && OPTS="${OPTS} --spec-abs-GHz ${SPEC_ABS}"
 [ -n "${DRAG_BEAT:-}"      ] && OPTS="${OPTS} --drag-beat-GHz ${DRAG_BEAT}"
 [ -n "${WARMSTART_BEAT:-}" ] && OPTS="${OPTS} --warmstart-drag-beat-GHz ${WARMSTART_BEAT}"
 [ -n "${CRAB_SEED:-}"      ] && OPTS="${OPTS} --crab-seed ${CRAB_SEED}"
+[ -n "${CHIRP_SEED:-}"     ] && OPTS="${OPTS} --chirp-seed-GHz ${CHIRP_SEED}"
+[ -n "${CHIRP_SEED_STARK_MHZ:-}" ] && OPTS="${OPTS} --chirp-seed-stark-MHz ${CHIRP_SEED_STARK_MHZ}"
+if [ "${CHIRP_DEGREE}" != "0" ]; then
+    OPTS="${OPTS} --chirp-degree ${CHIRP_DEGREE} --chirp-bound-GHz ${CHIRP_BOUND}"
+fi
 if [ "${ALG}" = "CRAB" ]; then
     OPTS="${OPTS} --crab-restarts ${CRAB_RESTARTS} --crab-score ${CRAB_SCORE}"
     OPTS="${OPTS} --crab-method ${CRAB_METHOD}"
@@ -167,6 +179,7 @@ echo "host=$(hostname) job=${SLURM_JOB_ID:-none} device=${DEVICE} t_g=${T_G}"
 echo "backend=${BACKEND} alg=${ALG} n_basis=${N_BASIS} n_ctrl=${N_CTRL} maxiter=${MAXITER}"
 [ "${ALG}" = "CRAB" ] && echo "crab: restarts=${CRAB_RESTARTS} score=${CRAB_SCORE} method=${CRAB_METHOD} seed=${CRAB_SEED:-<random>}"
 echo "amp_scale=${AMP_SCALE} wp_offset=${WP_OFFSET} GHz opts=${OPTS:-<bare gate>}"
+[ "${CHIRP_DEGREE}" != "0" ] && echo "chirp: degree=${CHIRP_DEGREE} bound=${CHIRP_BOUND} GHz seed=${CHIRP_SEED:-${CHIRP_SEED_STARK_MHZ:+stark ${CHIRP_SEED_STARK_MHZ} MHz}}"
 echo "start=$(date -Is)"
 
 srun ${LAUNCHER} -m snail_solver.grape \

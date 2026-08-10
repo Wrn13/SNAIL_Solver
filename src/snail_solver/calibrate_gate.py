@@ -108,7 +108,7 @@ def frequency_chevron(config: Dict[str, Any], t_g: float, amp_scale: float,
                       span_MHz: float, n_points: int, window_factor: float,
                       time_points: int, solver: Dict[str, Any],
                       n_jobs: Optional[int], spec_abs_GHz: Optional[float] = None,
-                      drag_beat_GHz: Optional[float] = None,
+                      drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
                       shape: str = "constant") -> Dict[str, Any]:
     """Frequency (Stark) calibration: pump-frequency chevron at the calibrated
     amplitude; the resonance offset maximises swap contrast. Thin wrapper over
@@ -154,7 +154,8 @@ def frequency_chevron(config: Dict[str, Any], t_g: float, amp_scale: float,
     offsets = np.linspace(-span / 2.0, span / 2.0, n_points)
     return FS.scan(config, t_g, amp_scale, offsets, window_factor * t_g,
                    time_points, solver, n_jobs=n_jobs, spec_abs_GHz=spec_abs_GHz,
-                   shape=shape, drag_beat_GHz=drag_beat_GHz)
+                   shape=shape, drag_beat_GHz=drag_beat_GHz,
+                   drag_n_pump=drag_n_pump)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +244,8 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
                     solver: Optional[Dict[str, Any]] = None,
                     n_jobs: Optional[int] = None,
                     spec_abs_GHz: Optional[float] = None,
-                    drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
+                    drag_beat_GHz: Optional[float] = None,
+                    drag_n_pump: int = 1) -> Dict[str, Any]:
     """Iterate Stark-frequency and amplitude calibration to self-consistency, then
     run the final gate test.
 
@@ -298,7 +300,7 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
         chev = frequency_chevron(config, t_g, amp_scale, span_MHz, chevron_points,
                                  window_factor, time_points, solver, n_jobs,
                                  spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz,
-                                 shape=chev_shape)
+                                 shape=chev_shape, drag_n_pump=drag_n_pump)
         wp_offset = float(chev["resonance_offset_GHz"])
         amp = amplitude_scan(config, t_g, wp_offset, amp_bounds, amp_points, solver,
                              spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz)
@@ -315,7 +317,9 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
     print(f"  final: F_avg={final['F_avg']:.4f}  leakage={final['leakage']:.4f}  "
           f"transfer={final['transfer']:.4f}  "
           f"phi_cond={final['conditional_phase_rad']:+.3f} rad")
-    return {"t_g_ns": float(t_g), "iterations": history, "final": final}
+    return {"t_g_ns": float(t_g), "iterations": history, "final": final,
+            "drag_beat_GHz": drag_beat_GHz, "drag_n_pump": int(drag_n_pump),
+            "spec_abs_GHz": spec_abs_GHz}
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +385,17 @@ def main() -> None:
     ap.add_argument("--window-factor", type=float, default=2.0)
     ap.add_argument("--time-points", type=int, default=160)
     ap.add_argument("--jobs", type=int, default=0, help="workers for chevron scans")
+    ap.add_argument("--spec-abs-GHz", type=float, default=None,
+                    help="include a spectator at this ABSOLUTE frequency, so the "
+                         "tune-up sees its dispersive pull")
+    ap.add_argument("--drag-beat-GHz", type=float, default=None,
+                    help="calibrate the DRAG-ON gate: switches the chevron to the "
+                         "shaped probe (a constant probe has d(eta)/dt = 0 and is "
+                         "blind to the quadrature), so the located offset is the "
+                         "DRAG-on resonance")
+    ap.add_argument("--drag-n-pump", type=int, default=1,
+                    help="pump quanta of the suppressed process; with a chirp the "
+                         "beat moves as Delta(t) = beat - n*delta(t)")
     ap.add_argument("--gpu", action="store_true", help="qutip-jax/diffrax (forces --jobs 1)")
     ap.add_argument("--out", default="calibration.json", help="output JSON (+ .npz)")
     ap.add_argument("--update-device", default=None,
@@ -417,7 +432,9 @@ def main() -> None:
                              chevron_points=args.chevron_points,
                              window_factor=args.window_factor,
                              time_points=args.time_points, solver=solver,
-                             n_jobs=args.jobs)
+                             n_jobs=args.jobs, spec_abs_GHz=args.spec_abs_GHz,
+                             drag_beat_GHz=args.drag_beat_GHz,
+                             drag_n_pump=args.drag_n_pump)
     npz = save_record(record, args.out)
     print(f"written {args.out} and {npz}")
 

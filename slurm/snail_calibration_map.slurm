@@ -144,6 +144,19 @@ CTX=""
 [ -n "${DELTA:-}"          ] && CTX="${CTX} --delta-GHz ${DELTA}"
 [ -n "${DRAG_BEAT:-}"      ] && CTX="${CTX} --drag-beat-GHz ${DRAG_BEAT}"
 [ -n "${COUPLER_LEVELS:-}" ] && CTX="${CTX} --coupler-levels ${COUPLER_LEVELS}"
+# CHIRP holds a pump chirp FIXED across the grid (the scan axes stay offset x
+# amplitude), so the map is of the chirped gate and the saved operating point records
+# the chirp it was calibrated under. CHIRP="" forces no chirp even on a chirped device.
+[ -n "${CHIRP+x}"          ] && CTX="${CTX} --chirp-GHz ${CHIRP:-\"\"}"
+# CHIRP_SCAN_COEFF repeats the WHOLE map across one Legendre coefficient, re-optimizing
+# (offset, amplitude) at each value -- the tune-up genuinely moves with the chirp. Cost
+# is CHIRP_POINTS full maps, so use a coarse grid. To CALIBRATE a chirp rather than
+# survey it, prefer snail_grape.slurm with CHIRP_DEGREE set: it searches continuously.
+if [ -n "${CHIRP_SCAN_COEFF:-}" ]; then
+    CTX="${CTX} --chirp-scan-coeff ${CHIRP_SCAN_COEFF}"
+    CTX="${CTX} --chirp-lo ${CHIRP_LO:--0.01} --chirp-hi ${CHIRP_HI:-0.01}"
+    CTX="${CTX} --chirp-points ${CHIRP_POINTS:-7}"
+fi
 
 SAVE=""
 if [ -n "${POINT}" ]; then
@@ -171,6 +184,8 @@ mkdir -p "$(dirname "${FIG}")" "$(dirname "${NPZ}")" "$(dirname "${LOG}")"
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} device=${DEVICE} t_g=${T_G}"
 echo "engine=${ENGINE} metric=${METRIC} jobs=${JOBS} point=${POINT:-<none, not saving>}"
 echo "grid=${WP_POINTS}x${AMP_POINTS} span=${WP_SPAN}MHz amp=[${AMP_LO},${AMP_HI}]"
+[ -n "${CHIRP+x}" ] && echo "chirp (fixed): ${CHIRP:-<none, forced off>}"
+[ -n "${CHIRP_SCAN_COEFF:-}" ] && echo "chirp axis: c${CHIRP_SCAN_COEFF} over ${CHIRP_POINTS:-7} values in [${CHIRP_LO:--0.01}, ${CHIRP_HI:-0.01}] GHz (that many FULL maps)"
 echo "start=$(date -Is)"
 echo "progress log: ${LOG}   (tail -f ${LOG} to watch a running job)"
 

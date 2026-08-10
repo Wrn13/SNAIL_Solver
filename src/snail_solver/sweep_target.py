@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from snail_solver.sweep_common import (
-    Point, TWO_PI, DEFAULT_CONFIG, _drag_skip_GHz,
-    _nearest_collision, _stark_offset_GHz,
+    Point, TWO_PI, DEFAULT_CONFIG, _drag_skip_GHz, _drag_ok_with_chirp,
+    _nearest_collision, _pump_quanta_of, _stark_offset_GHz,
     _grape_augment,
 )
 
@@ -110,8 +110,11 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         # Hardware-style: calibrate with the spectator present at wspec_GHz, and with
         # DRAG on (tuned to the nearest-collision beat from the nominal pump) if this
         # point runs DRAG, so the tune-up matches the gate as actually operated.
-        _cb = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, _w_p_nom)[1]
-        _cal_drag = (_cb if (_use_drag and abs(_cb) >= _drag_skip_GHz(config)) else None)
+        _cn = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, _w_p_nom)
+        _cb, _ck = _cn[1], _pump_quanta_of(_cn[2])
+        _cal_drag = (_cb if (_use_drag and _drag_ok_with_chirp(
+            config, _cb, _ck, config.get("chirp_coeffs_GHz") or None,
+            float(config["t_g_ns"]))) else None)
         rec = CG.run_calibration(
             sub, float(config["t_g_ns"]),
             iters=int(config.get("calibrate_iters", 1)),
@@ -123,7 +126,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
             window_factor=float(config.get("stark_window_factor", 2.0)),
             time_points=int(config.get("stark_time_points", 120)),
             solver=_sv, n_jobs=1,
-            spec_abs_GHz=(None if no_spec else wspec_GHz), drag_beat_GHz=_cal_drag)["final"]
+            spec_abs_GHz=(None if no_spec else wspec_GHz), drag_beat_GHz=_cal_drag,
+            drag_n_pump=_ck)["final"]
         amp_scale_used = float(rec["amp_scale"])
         wp_offset_used_GHz = float(rec["wp_offset_GHz"])
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
@@ -132,13 +136,17 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                    nsteps=int(config.get("nsteps", 500000)))
         # nearest collision from the pre-Stark pump, for the DRAG-matched chevron
         # (only meaningful when DRAG is forced on every point via drag_always).
-        _cb = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, w_p_GHz)[1]
+        _cn = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, w_p_GHz)
+        _cb, _ck = _cn[1], _pump_quanta_of(_cn[2])
         _chev_drag = (_cb if (bool(config.get("drag_always", False))
-                              and abs(_cb) >= _drag_skip_GHz(config)) else None)
+                              and _drag_ok_with_chirp(
+                                  config, _cb, _ck,
+                                  config.get("chirp_coeffs_GHz") or None,
+                                  float(config["t_g_ns"]))) else None)
         _chevron = _stark_offset_GHz(config, wa_GHz, wb_GHz,
                                      float(config["t_g_ns"]), amp_scale_used, _sv,
                                      spec_abs_GHz=(None if no_spec else wspec_GHz),
-                                     drag_beat_GHz=_chev_drag)
+                                     drag_beat_GHz=_chev_drag, drag_n_pump=_ck)
         wp_offset_used_GHz += float(_chevron["resonance_offset_GHz"])
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
 
@@ -179,6 +187,9 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     # Round the beat to 1 kHz so placements exactly at the threshold classify
     # deterministically (strict < threshold, i.e. genuinely below the cutoff).
     drag_beat = nearest[1]
+    # k for this channel: a chirp sweeps the pump, so the beat DRAG divides by moves
+    # as Delta(t) = beat - k*delta(t). The "static" channel is pump-independent (k=0).
+    drag_n_pump = _pump_quanta_of(nearest[2])
     beat_abs = round(abs(drag_beat), 6)
     thr_GHz = float(config.get("drag_compare_below_MHz", 100.0)) / 1000.0
     drag_compare = bool(config.get("drag_compare", False))
@@ -201,7 +212,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                               is_eta=True, drag=use_drag,
                               delta_drag_GHz=(drag_beat if use_drag else None),
                               chirp=make_chirp(config.get("chirp_coeffs_GHz") or None,
-                                               float(config["t_g_ns"]))),
+                                               float(config["t_g_ns"])),
+                              drag_n_pump=drag_n_pump),
                      normalize_iswap=(a, b))
         cpl.scale_pump_amplitude(amp_scale)
 

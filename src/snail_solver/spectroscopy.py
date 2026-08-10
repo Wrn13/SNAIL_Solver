@@ -194,6 +194,9 @@ def _scan_column(task: Tuple[int, float, Dict[str, Any], Dict[str, Any]]
             col[ia] = base_pop                                 # no drive: unchanged
             continue
         # amp IS the peak |eta| for this envelope (verified: amp -> peak_eta)
+        # Deliberately UN-chirped: this is a swept spectroscopy PROBE at f_d, not the
+        # gate pump, so the device's `chirp_coeffs_GHz` (which is defined about the
+        # gate's own carrier |w_b - w_a| over the gate time) does not belong on it.
         cpl.set_pump(PumpTone(w_p_GHz=f_d, envelope=EnvCls(amp=float(amp),
                                                           t_g=probe_ns),
                               is_eta=True))

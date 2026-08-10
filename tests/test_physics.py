@@ -265,6 +265,123 @@ class TestChirp(unittest.TestCase):
         self.assertIsNotNone(make_chirp([0.0, 0.01], self.T_G))
 
 
+class TestChirpInReducedModel(unittest.TestCase):
+    """The reduced rotating-frame model must carry a chirp exactly.
+
+    ``grape._propagate`` is the engine behind the DEFAULT calibration map and every
+    reduced-scored optimizer path. It used to ignore ``PumpTone.chirp`` outright, so
+    a chirped device calibrated as if un-chirped and reported a plausible wrong
+    number. The identity that makes the fix exact: ``_H`` forms
+    ``eta^n_pos conj(eta)^n_neg``, so folding ``e^{-i Phi(t)}`` into the complex eta
+    hands a term carrying k = n_pos - n_neg net pump quanta exactly ``e^{-i k Phi}``.
+    """
+
+    T_G = 77.2
+    CUTOFF = 1.0
+
+    def setUp(self):
+        from snail_solver import grape
+        from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+        self.grape = grape
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[3, 3, 4], anharmonicities_GHz={0: -0.12, 1: -0.12})
+        # Normalize to the FULL-iSWAP amplitude rather than picking a peak by hand.
+        # This matters: the chirp enters through eta^n_pos conj(eta)^n_neg, so its
+        # effect is strongly amplitude-dependent, and an arbitrary weak peak (0.05
+        # against this device's operating 1.80) suppresses by ~1e3 exactly the term
+        # these tests exist to measure.
+        cpl.set_pump(PumpTone(w_p_GHz=1.7, is_eta=True,
+                              envelope=RaisedCosine(amp=1.0, t_g=self.T_G)),
+                     normalize_iswap=(0, 1))
+        (self.terms, self.H_anh, self.idx,
+         self.max_Omega) = grape._prepare(cpl, 0, 1, self.CUTOFF)
+        self.n_ctrl = 8
+        peak = float(cpl.peak_eta())
+        ts = (np.arange(self.n_ctrl) + 0.5) * (self.T_G / self.n_ctrl)
+        self.eta = (peak * 0.5 * (1.0 - np.cos(TWO_PI * ts / self.T_G))).astype(complex)
+
+    def _n_sub(self, chirp=None):
+        """The step count the production callers use, chirp padding included."""
+        pad = self.grape._chirp_pad_rad(chirp, self.terms)
+        dt = self.T_G / self.n_ctrl
+        return max(1, int(np.ceil((self.max_Omega + pad) * dt / 0.3)))
+
+    def _U(self, n_sub, offset_rad=0.0, chirp=None):
+        return self.grape._propagate(self.eta, self.T_G, self.terms, self.H_anh,
+                                     self.idx, n_sub, offset_rad, chirp=chirp)
+
+    def test_constant_chirp_equals_offset_rad(self):
+        """delta(t) = c0 must reproduce the carrier shift offset_rad = 2 pi c0.
+
+        The two mechanisms are completely different code paths -- one displaces every
+        precomputed carrier by k * offset, the other multiplies a phase onto eta --
+        so their agreement pins the (n_pos - n_neg) sign convention end to end.
+        """
+        from snail_solver.zhou_coupler import Chirp
+        c0 = 0.01
+        chirp = Chirp([c0], self.T_G)
+        n_sub = self._n_sub(chirp)            # SAME step count, else discretization differs
+        np.testing.assert_allclose(self._U(n_sub, chirp=chirp),
+                                   self._U(n_sub, offset_rad=TWO_PI * c0), atol=1e-10)
+
+    def test_absent_chirp_is_byte_identical(self):
+        """The un-chirped path must be untouched -- not merely close."""
+        from snail_solver.zhou_coupler import Chirp
+        n_sub = self._n_sub()
+        bare = self.grape._propagate(self.eta, self.T_G, self.terms, self.H_anh,
+                                     self.idx, n_sub)
+        np.testing.assert_array_equal(bare, self._U(n_sub, chirp=None))
+        # an all-zero Chirp object is a phase of exactly 1, so it must also be exact
+        np.testing.assert_array_equal(
+            bare, self._U(n_sub, chirp=Chirp([0.0, 0.0], self.T_G)))
+
+    def test_fine_step_resolution_is_required(self):
+        """Folding the chirp per CONTROL SLICE is not accurate enough.
+
+        This pins the design decision with numbers. delta(t) peaks at 2 pi c1 = 0.31
+        rad/ns, so across one control slice (t_g/n_ctrl = 9.7 ns here) Phi moves by
+        ~3 rad -- times k = 2 net pump quanta in the coefficient. Holding that
+        constant over the slice is an O(1) error in the pump term; a fine step moves
+        it by ~0.02 rad instead.
+
+        Asserted as a RATIO rather than two absolute thresholds, because both errors
+        scale together with the drive and the step count: what has to stay true is
+        that per-slice folding is dramatically worse, not that either number sits at
+        a particular value. Measured here: ~2e-3 fine vs ~2e-1 per-slice, a factor of
+        ~70. If someone "simplifies" `_propagate` back to a per-slice phase, the
+        ratio collapses to 1 and this fires.
+        """
+        from snail_solver.zhou_coupler import Chirp
+        chirp = Chirp([0.0, 0.05], self.T_G)
+        n_sub = self._n_sub(chirp)
+        U_ref = self._U(4 * n_sub, chirp=chirp)                 # converged reference
+        err_fine = np.max(np.abs(self._U(n_sub, chirp=chirp) - U_ref))
+
+        ts_mid = (np.arange(self.n_ctrl) + 0.5) * (self.T_G / self.n_ctrl)
+        eta_slice = self.eta * np.exp(-1j * np.asarray(chirp.phase(ts_mid, np)))
+        U_slice = self.grape._propagate(eta_slice, self.T_G, self.terms, self.H_anh,
+                                        self.idx, n_sub)
+        err_slice = np.max(np.abs(U_slice - U_ref))
+
+        self.assertLess(err_fine, 1e-2)              # fine-step folding is accurate
+        self.assertGreater(err_slice, 1e-2)          # per-slice folding is not
+        self.assertGreater(err_slice, 20.0 * err_fine,
+                           f"per-slice folding ({err_slice:.2e}) must be far worse "
+                           f"than fine-step ({err_fine:.2e})")
+
+    def test_chirp_pad_rad_bounds_the_added_bandwidth(self):
+        """n_sub must grow with the chirp rate, or the propagation under-resolves."""
+        from snail_solver.zhou_coupler import Chirp
+        self.assertEqual(self.grape._chirp_pad_rad(None, self.terms), 0.0)
+        k_max = max(abs(p - n) for _Om, p, n, _O in self.terms)
+        self.assertGreater(k_max, 1)          # the g3 terms carry up to 3 pump quanta
+        c1 = 0.05                             # delta(t) = 2 pi c1 u, so max|delta| = 2 pi c1
+        self.assertAlmostEqual(
+            self.grape._chirp_pad_rad(Chirp([0.0, c1], self.T_G), self.terms),
+            k_max * TWO_PI * c1, places=6)
+
+
 class TestEnvelopeArrayAPI(unittest.TestCase):
     """`value_at`/`deriv_at` must agree with the scalar path and be branch-free.
 
@@ -711,6 +828,672 @@ class TestPlotterSmoke(unittest.TestCase):
                                capture_output=True, text=True, env=env)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertTrue(os.path.exists(out))
+
+
+class TestStarkChirp(unittest.TestCase):
+    """The Stark-tracking seed rests on a Legendre projection; pin it to closed forms.
+
+    The whole reason chirp is parametrized in Legendre coefficients about the gate's
+    normalized time is that the shape being tracked, |eta(t)|^2 / eta_pk^2 =
+    cos^4(pi u / 2) for a Hann envelope, has a clean expansion there -- and is EVEN,
+    which is what makes c_2 (not c_1) the leading useful coefficient.
+    """
+
+    def test_table_matches_an_independent_projection(self):
+        """The hardcoded coefficients must reproduce a Gauss-Legendre projection."""
+        from numpy.polynomial import legendre as L
+        from snail_solver.stark_chirp import HANN_STARK_LEGENDRE
+        f = lambda u: np.cos(np.pi * u / 2) ** 4          # noqa: E731
+        x, w = np.polynomial.legendre.leggauss(200)
+        for k, tabulated in enumerate(HANN_STARK_LEGENDRE):
+            a_k = (2 * k + 1) / 2 * np.sum(w * f(x) * L.legval(x, np.eye(k + 1)[k]))
+            self.assertAlmostEqual(a_k, tabulated, places=9, msg=f"a_{k}")
+
+    def test_closed_forms(self):
+        """a_0 = 3/8 and a_2 = -225/(32 pi^2), exactly.
+
+        a_0 doubles as a cross-check against a completely separate part of the
+        codebase: it is the same 0.375 that `find_stark_resonance.operating_eta`
+        documents as the Hann <eta^2> / eta_pk^2 factor.
+        """
+        from snail_solver.stark_chirp import HANN_MEAN_FACTOR, HANN_STARK_LEGENDRE
+        self.assertAlmostEqual(HANN_STARK_LEGENDRE[0], 3 / 8, places=12)
+        self.assertAlmostEqual(HANN_STARK_LEGENDRE[2], -225 / (32 * np.pi ** 2),
+                               places=9)
+        self.assertAlmostEqual(HANN_MEAN_FACTOR, 0.375, places=12)
+
+    def test_odd_coefficients_vanish(self):
+        """The shape is even in u, so a linear chirp is the WRONG first guess."""
+        from snail_solver.stark_chirp import HANN_STARK_LEGENDRE
+        np.testing.assert_array_equal(HANN_STARK_LEGENDRE[1::2],
+                                      np.zeros(HANN_STARK_LEGENDRE[1::2].size))
+
+    def test_seed_ratios_and_pinned_c0(self):
+        """c_2 = -1.900 delta, c_4 = +1.334 delta, and c_0 pinned to zero."""
+        from snail_solver.stark_chirp import stark_chirp_seed
+        delta = 0.002
+        c = stark_chirp_seed(delta, degree=4)
+        self.assertEqual(c[0], 0.0)                       # degenerate with wp_offset
+        self.assertAlmostEqual(c[2] / delta, -1.899772, places=5)
+        self.assertAlmostEqual(c[4] / delta, +1.334393, places=5)
+        # unpinned, the mean of the tracking shape IS the calibrated shift
+        c_full = stark_chirp_seed(delta, degree=4, pin_c0=False)
+        self.assertAlmostEqual(c_full[0], delta, places=12)
+
+    def test_map_ridge_recovers_a_synthetic_stark_ridge(self):
+        """The ridge fit must return the planted slope, sub-grid.
+
+        The ridge is deliberately placed BETWEEN offset grid points, so a fit that
+        merely took the discrete argmax would fail the tolerance.
+        """
+        from snail_solver.stark_chirp import stark_slope_from_map
+        amps = np.linspace(0.6, 1.4, 21)
+        offs = np.linspace(-20.0, 20.0, 41)               # 1 MHz spacing
+        true_m = -6.0                                     # MHz per amp^2
+        Z = np.exp(-((offs[None, :] - true_m * amps[:, None] ** 2) / 4.0) ** 2)
+        fit = stark_slope_from_map({"Z": Z, "offsets_MHz": offs, "amps": amps,
+                                    "best": {"amp_scale": 1.0}})
+        self.assertAlmostEqual(fit["slope_MHz_per_amp2"], true_m, places=1)
+        self.assertGreater(fit["r2"], 0.99)
+        self.assertAlmostEqual(fit["delta_stark_MHz"], true_m, places=1)
+
+    def test_ridge_of_a_flat_map_is_not_trusted(self):
+        """A map with no ridge must produce a LOW r2, not a confident wrong seed."""
+        from snail_solver.stark_chirp import stark_slope_from_map
+        amps = np.linspace(0.6, 1.4, 21)
+        offs = np.linspace(-20.0, 20.0, 41)
+        Z = np.exp(-(offs[None, :] / 4.0) ** 2) * np.ones((amps.size, 1))
+        fit = stark_slope_from_map({"Z": Z, "offsets_MHz": offs, "amps": amps,
+                                    "best": {"amp_scale": 1.0}})
+        self.assertAlmostEqual(fit["slope_MHz_per_amp2"], 0.0, places=6)
+
+
+class TestChirpPhaseImplementationsAgree(unittest.TestCase):
+    """Phi(t) exists in three places; they must not drift apart.
+
+    ``envelope.Chirp.phase`` is the definition, ``jax_engine._chirp_phase`` is the
+    traceable twin used by the batched engine, and ``grape._chirp_phase_jax`` is the
+    one the gradient optimizer differentiates through. Each is duplicated (rather
+    than shared) only because the coefficients have to arrive as a traced argument;
+    this test is what makes that duplication safe.
+    """
+
+    T_G = 61.0
+    COEFFS = [0.011, -0.023, 0.007, 0.004]
+
+    def test_numpy_and_jax_engine_agree(self):
+        from snail_solver.envelope import Chirp
+        from snail_solver.jax_engine import _chirp_phase
+        ts = np.linspace(0.0, self.T_G, 97)
+        ref = Chirp(self.COEFFS, self.T_G).phase(ts, np)
+        got = _chirp_phase({"chirp": [np.asarray(self.COEFFS)]}, ts, 0, self.T_G, np)
+        np.testing.assert_allclose(got, ref, atol=1e-12)
+
+    def test_grape_traced_version_agrees(self):
+        from snail_solver.envelope import Chirp
+        from snail_solver.grape import _chirp_phase_jax
+        ts = np.linspace(0.0, self.T_G, 97)
+        ref = Chirp(self.COEFFS, self.T_G).phase(ts, np)
+        got = _chirp_phase_jax(np.asarray(self.COEFFS), ts, self.T_G, np)
+        np.testing.assert_allclose(got, ref, atol=1e-12)
+
+    def test_phase_is_the_integral_of_the_detuning(self):
+        """Independent of all three: dPhi/dt must equal delta(t)."""
+        from snail_solver.envelope import Chirp
+        ch = Chirp(self.COEFFS, self.T_G)
+        ts = np.linspace(0.05 * self.T_G, 0.95 * self.T_G, 41)
+        h = 1e-5
+        fd = (ch.phase(ts + h, np) - ch.phase(ts - h, np)) / (2 * h)
+        np.testing.assert_allclose(fd, ch.detuning(ts, np), rtol=1e-6)
+
+
+class TestChirpOptimization(unittest.TestCase):
+    """`grape` must be able to OPTIMIZE the chirp, and must not disturb it when off."""
+
+    T_G = 40.0
+
+    def _coupler(self, chirp_coeffs=None):
+        from snail_solver.zhou_coupler import (PumpTone, RaisedCosine, ZhouCoupler,
+                                               make_chirp)
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[2, 2, 3], anharmonicities_GHz={0: -0.12, 1: -0.12})
+        cpl.set_pump(PumpTone(w_p_GHz=1.7, is_eta=True,
+                              envelope=RaisedCosine(amp=1.0, t_g=self.T_G),
+                              chirp=make_chirp(chirp_coeffs, self.T_G)),
+                     normalize_iswap=(0, 1))
+        return cpl
+
+    def test_chirp_degree_zero_reports_no_chirp_keys(self):
+        """The default must be a strict no-op: no chirp keys, tone untouched."""
+        from snail_solver import grape
+        cpl = self._coupler()
+        out = grape.optimize_pulse(cpl, 0, 1, self.T_G, backend="qutip", alg="CRAB",
+                                   n_basis=1, crab_score="reduced", maxiter=3,
+                                   cutoff_GHz=1.0, crab_seed=0)
+        self.assertNotIn("chirp_coeffs_GHz", out)
+        self.assertIsNone(cpl._pump_tones[0].chirp)
+
+    def test_optimizer_restores_the_tone_chirp(self):
+        """A configured chirp must survive the optimizer, whatever it did internally."""
+        from snail_solver import grape
+        cpl = self._coupler([0.0, 0.0, -0.004])
+        before = list(cpl._pump_tones[0].chirp.coeffs_GHz)
+        grape.optimize_pulse(cpl, 0, 1, self.T_G, backend="qutip", alg="CRAB",
+                             n_basis=1, crab_score="reduced", maxiter=3,
+                             cutoff_GHz=1.0, crab_seed=0, chirp_degree=2)
+        self.assertIsNotNone(cpl._pump_tones[0].chirp)
+        self.assertEqual(list(cpl._pump_tones[0].chirp.coeffs_GHz), before)
+
+    def test_crab_optimizes_a_chirp_and_pins_c0(self):
+        """With chirp_degree > 0 the result carries coefficients, and c_0 stays 0."""
+        from snail_solver import grape
+        cpl = self._coupler()
+        out = grape.optimize_pulse(cpl, 0, 1, self.T_G, backend="qutip", alg="CRAB",
+                                   n_basis=0, crab_score="reduced", maxiter=25,
+                                   cutoff_GHz=1.0, crab_seed=0, chirp_degree=2,
+                                   chirp_bound_GHz=0.02)
+        self.assertIn("chirp_coeffs_GHz", out)
+        c = out["chirp_coeffs_GHz"]
+        self.assertEqual(len(c), 3)                       # c_0 .. c_2
+        self.assertEqual(c[0], 0.0, "c_0 must stay pinned -- it is degenerate "
+                                    "with wp_offset_GHz")
+        self.assertTrue(all(abs(x) <= 0.02 + 1e-12 for x in c), "bound violated")
+        # with n_basis = 0 the envelope has NO free parameters, so switching the
+        # chirp off must reproduce the baseline exactly
+        self.assertAlmostEqual(out["F_chirp_off"], out["F_baseline"], places=9)
+        self.assertGreaterEqual(out["F_grape"], out["F_baseline"] - 1e-12)
+
+    def test_chirp_seed_is_scored_not_forced(self):
+        """A deliberately terrible seed must not drag the result below baseline."""
+        from snail_solver import grape
+        cpl = self._coupler()
+        out = grape.optimize_pulse(cpl, 0, 1, self.T_G, backend="qutip", alg="CRAB",
+                                   n_basis=0, crab_score="reduced", maxiter=10,
+                                   cutoff_GHz=1.0, crab_seed=0, chirp_degree=2,
+                                   chirp_seed_GHz=[0.0, 0.02, -0.02])
+        self.assertGreaterEqual(out["F_grape"], out["F_baseline"] - 1e-12)
+
+
+class TestTimeDependentDrag(unittest.TestCase):
+    r"""A chirped pump sweeps the beat DRAG divides by.
+
+    DRAG is ``eta -> eta - i (deta/dt) / Delta``. The numerator differentiates the
+    BASE envelope (the chirp phase is absorbed into the frame rotating at the
+    instantaneous pump frequency), but the DENOMINATOR moves with the pump::
+
+        Delta(t) = Delta_0 - k delta(t)
+
+    with k the pump quanta the suppressed process carries -- this module's own beat
+    convention is ``beat = separation - k w_p``. Dividing by the static Delta_0 is a
+    ~10% error for a 100-300 MHz beat and ORDER UNITY near a collision, which is
+    exactly where DRAG is doing the work.
+    """
+
+    T_G = 40.0
+    COEFFS = [0.0, 0.01, 0.03]
+    D0 = 0.3
+
+    def _tone(self, k, chirped=True, D0=None):
+        from snail_solver.envelope import Chirp, PumpTone, RaisedCosine
+        return PumpTone(w_p_GHz=1.7, envelope=RaisedCosine(1.0, self.T_G), drag=True,
+                        delta_drag_GHz=(self.D0 if D0 is None else D0),
+                        chirp=(Chirp(self.COEFFS, self.T_G) if chirped else None),
+                        drag_n_pump=k)
+
+    def test_matches_the_closed_form(self):
+        """Delta(t) == 2 pi Delta_0 - k delta(t), against Chirp.detuning directly."""
+        from snail_solver.envelope import Chirp
+        ts = np.linspace(0.0, self.T_G, 65)
+        delta = Chirp(self.COEFFS, self.T_G).detuning(ts, np)
+        for k in (0, 1, 2, 3):
+            with self.subTest(k=k):
+                np.testing.assert_allclose(
+                    self._tone(k).drag_detuning(ts, np),
+                    TWO_PI * self.D0 - k * delta, atol=1e-12)
+
+    def test_k_zero_is_the_old_constant_beat(self):
+        """A static (pump-independent) channel must NOT be moved by a chirp."""
+        ts = np.linspace(0.0, self.T_G, 65)
+        np.testing.assert_allclose(self._tone(0).drag_detuning(ts, np),
+                                   TWO_PI * self.D0, atol=1e-12)
+
+    def test_unchirped_is_unchanged_for_any_k(self):
+        """Without a chirp k is irrelevant -- so the default cannot break old calls."""
+        ts = np.linspace(0.0, self.T_G, 65)
+        for k in (0, 1, 2):
+            with self.subTest(k=k):
+                np.testing.assert_allclose(
+                    self._tone(k, chirped=False).drag_detuning(ts, np),
+                    TWO_PI * self.D0, atol=1e-12)
+
+    def test_the_correction_is_observable(self):
+        """Guards against the whole thing being a silent no-op.
+
+        Also pins the regime claim: small for a far-detuned beat, order-unity near a
+        collision. If someone reverts the denominator to a constant, both fire.
+        """
+        from snail_solver.zhou_coupler import ZhouCoupler
+        ts = np.linspace(0.0, self.T_G, 17)
+
+        def eta_of(k, D0):
+            cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                              participations={0: 0.1, 1: 0.1},
+                              nonlinearities={3: 0.06}, levels=[2, 2, 3],
+                              anharmonicities_GHz={0: -0.12, 1: -0.12})
+                              # noqa: E127
+            tone = self._tone(k, D0=D0)
+            cpl.set_pump(tone, normalize_iswap=(0, 1))
+            return np.array([cpl._eta(tone, float(t)) for t in ts])
+
+        far0, far1 = eta_of(0, 0.3), eta_of(1, 0.3)
+        self.assertGreater(np.max(np.abs(far1 - far0)), 1e-3)      # not a no-op
+        near0, near1 = eta_of(0, 0.02), eta_of(1, 0.02)
+        rel = np.max(np.abs(near1 - near0)) / np.max(np.abs(near0))
+        self.assertGreater(rel, 0.2, "near a collision the correction is order-unity")
+
+    def test_detuning_floor_and_guard(self):
+        """min_t |Delta(t)| is what matters, not |Delta_0| -- and it must raise."""
+        from snail_solver.device_utils import check_drag_detuning
+        # Delta_0 = 20 MHz is comfortably above the 5 MHz skip, but the chirp sweeps
+        # the beat down through zero during the pulse.
+        bad = self._tone(2, D0=0.02)
+        self.assertLess(bad.drag_detuning_floor() / TWO_PI, 0.02)
+        with self.assertRaises(ValueError) as ctx:
+            check_drag_detuning(bad)
+        self.assertIn("min|Delta(t)|", str(ctx.exception))
+        # a far-detuned beat is fine, and DRAG-off is never guarded
+        check_drag_detuning(self._tone(1, D0=0.3))
+        self.assertEqual(self._tone(1, chirped=False).drag_detuning_floor(),
+                         TWO_PI * self.D0)
+
+    def test_jax_engine_agrees(self):
+        """The traceable twin must reproduce Chirp.detuning exactly."""
+        from snail_solver.envelope import Chirp
+        from snail_solver.jax_engine import _chirp_detuning
+        ts = np.linspace(0.0, self.T_G, 65)
+        np.testing.assert_allclose(
+            _chirp_detuning({"chirp": [np.asarray(self.COEFFS)]}, ts, 0, self.T_G, np),
+            Chirp(self.COEFFS, self.T_G).detuning(ts, np), atol=1e-12)
+
+    def test_chirp_gradient_flows_through_drag(self):
+        """THE regression: the chirp gradient must see the DRAG denominator.
+
+        `jax_engine` used to freeze the DRAG beat into `spec`, which is not merely
+        inaccurate -- it makes the chirp gradient WRONG. For a magnitude-sensitive
+        objective it is catastrophic: with the denominator frozen the chirp enters
+        only through the phase e^{-i Phi}, which cannot change |eta| at all, so the
+        gradient collapses to exactly zero.
+        """
+        try:
+            import jax
+        except ImportError:                                    # pragma: no cover
+            self.skipTest("jax not installed")
+        jax.config.update("jax_enable_x64", True)
+        import jax.numpy as jnp
+        from snail_solver import jax_engine as JE
+        from snail_solver.zhou_coupler import ZhouCoupler
+
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[2, 2, 3], anharmonicities_GHz={0: -0.12, 1: -0.12})
+        cpl.set_pump(self._tone(2), normalize_iswap=(0, 1))
+        spec, base = JE.pulse_spec(cpl), JE.pulse_params(cpl)
+        ts = jnp.asarray(np.linspace(0.0, self.T_G, 33))
+        c0 = np.asarray(self.COEFFS)
+
+        def objective(c, sp):
+            p = {"amp": jnp.asarray(base["amp"]), "chirp": [c],
+                 "iq": [jnp.asarray(q) for q in base["iq"]]}
+            return jnp.sum(jnp.abs(JE.eta_at(sp, p, ts, 0, jnp)) ** 2)
+
+        g = np.asarray(jax.grad(objective)(jnp.asarray(c0), spec))
+        h = 1e-6
+        fd = np.array([(float(objective(jnp.asarray(c0 + h * np.eye(3)[i]), spec))
+                        - float(objective(jnp.asarray(c0 - h * np.eye(3)[i]), spec)))
+                       / (2 * h) for i in range(3)])
+        np.testing.assert_allclose(g, fd, atol=1e-6)
+        self.assertGreater(np.max(np.abs(fd)), 1e-3,
+                           "objective must actually depend on the chirp")
+
+
+class TestPumpQuantaMapping(unittest.TestCase):
+    """k per collision channel, and the chirp-aware DRAG safety test."""
+
+    def test_kinds(self):
+        from snail_solver.sweep_common import _pump_quanta_of
+        self.assertEqual(_pump_quanta_of("onepump"), 1)
+        self.assertEqual(_pump_quanta_of("subharm"), 2)
+        self.assertEqual(_pump_quanta_of("static"), 0,
+                         "a static beat is pump-independent; a chirp must not move it")
+        self.assertEqual(_pump_quanta_of("unknown-kind"), 1)      # safe default
+
+    def test_chirp_aware_skip(self):
+        """A beat that clears the static threshold can still be swept through zero."""
+        from snail_solver.sweep_common import _drag_ok_with_chirp
+        cfg = {"drag_skip_below_MHz": 5.0}
+        chirp = [0.0, 0.01, 0.03]
+        self.assertTrue(_drag_ok_with_chirp(cfg, 0.3, 1, chirp, 40.0))
+        self.assertFalse(_drag_ok_with_chirp(cfg, 0.02, 2, chirp, 40.0))
+        # k = 0 is immune, and so is an absent chirp
+        self.assertTrue(_drag_ok_with_chirp(cfg, 0.02, 0, chirp, 40.0))
+        self.assertTrue(_drag_ok_with_chirp(cfg, 0.02, 2, None, 40.0))
+        # the static test still applies
+        self.assertFalse(_drag_ok_with_chirp(cfg, 0.001, 1, None, 40.0))
+
+
+class TestTuneUpAlgebra(unittest.TestCase):
+    """Amplitude/length algebra: the identity that makes length the ONLY free knob.
+
+    ``set_pump(normalize_iswap=...)`` fixes the pulse AREA to A = (pi/2)/(6 g3 lam_a
+    lam_b), which is independent of t_g. For a Hann envelope area = amp * t_g / 2, so
+    holding the PEAK fixed means amp_scale must grow with t_g. Getting that direction
+    backwards still produces a smooth curve with a maximum, so it would not announce
+    itself -- hence the explicit test.
+    """
+
+    def test_nominal_length_has_unit_amp_scale(self):
+        """t_g0 is by definition the length at which no amplitude correction is needed."""
+        from snail_solver.tune_up import fixed_eta_amp_scale, nominal_t_g
+        cfg = _cfg()
+        for eta in (1.2, 1.8, 2.5):
+            t_g0 = nominal_t_g(cfg, eta)
+            self.assertAlmostEqual(fixed_eta_amp_scale(cfg, t_g0, eta), 1.0, places=12,
+                                   msg=f"eta*={eta}")
+
+    def test_amp_scale_round_trip(self):
+        """peak_eta_of inverts fixed_eta_amp_scale at every length."""
+        from snail_solver.tune_up import fixed_eta_amp_scale, nominal_t_g, peak_eta_of
+        cfg = _cfg()
+        eta = 1.8
+        t_g0 = nominal_t_g(cfg, eta)
+        for t_g in t_g0 * np.array([0.7, 0.9, 1.0, 1.15, 1.4]):
+            s = fixed_eta_amp_scale(cfg, t_g, eta)
+            self.assertAlmostEqual(peak_eta_of(cfg, t_g, s), eta, places=10)
+
+    def test_longer_gate_needs_larger_amp_scale(self):
+        """The normalizer shrinks amp as 1/t_g to hold area; holding the peak undoes it."""
+        from snail_solver.tune_up import fixed_eta_amp_scale, nominal_t_g
+        cfg = _cfg()
+        eta = 1.8
+        t_g0 = nominal_t_g(cfg, eta)
+        s = [fixed_eta_amp_scale(cfg, t, eta) for t in (0.8 * t_g0, t_g0, 1.25 * t_g0)]
+        self.assertLess(s[0], s[1])
+        self.assertLess(s[1], s[2])
+        self.assertAlmostEqual(s[2] / s[1], 1.25, places=10)   # strictly linear in t_g
+
+    def test_envelope_in_normalized_time_is_length_independent(self):
+        """THE decoupling claim: at fixed peak |eta|, |eta(u)| does not depend on t_g.
+
+        This is why the chirp coefficients -- functions of |eta(u)| alone -- can be
+        calibrated once and reused while the length is tuned, instead of the two
+        fighting each other the way (offset, amp_scale) scans do.
+        """
+        from snail_solver.device_utils import build_coupler
+        from snail_solver.tune_up import fixed_eta_amp_scale, nominal_t_g
+        cfg = _cfg()
+        eta = 1.8
+        t_g0 = nominal_t_g(cfg, eta)
+        u = np.linspace(-1.0, 1.0, 65)
+        shapes = []
+        for t_g in (t_g0, 1.35 * t_g0):
+            cpl, _w, _e = build_coupler(cfg, t_g, fixed_eta_amp_scale(cfg, t_g, eta), 0.0)
+            tone = cpl._pump_tones[0]
+            shapes.append(np.abs(cpl._eta_at(tone, (u + 1.0) * t_g / 2.0)))
+        np.testing.assert_allclose(shapes[0], shapes[1], rtol=1e-10, atol=1e-12)
+        self.assertAlmostEqual(float(np.max(shapes[0])), eta, places=6)
+
+
+class TestTuneUpShiftFit(unittest.TestCase):
+    """delta(|eta|) = delta0 + k2|eta|^2 + k4|eta|^4, split into static + Stark.
+
+    The split is the physics: delta0 survives at zero drive (static dressing, a pure
+    carrier retune) while k2/k4 vary along the pulse and are the only part a chirp can
+    track. Charging a static offset to the Stark terms inflates them and yields a
+    confident, wrong chirp.
+    """
+
+    def test_recovers_known_coefficients(self):
+        from snail_solver.tune_up import fit_shift_curve
+        eta = np.linspace(0.5, 2.2, 11)
+        d0, k2, k4 = -0.7, -0.85, 0.11
+        fit = fit_shift_curve(eta, d0 + k2 * eta ** 2 + k4 * eta ** 4)
+        self.assertAlmostEqual(fit["delta0"], d0, places=9)
+        self.assertAlmostEqual(fit["k2"], k2, places=9)
+        self.assertAlmostEqual(fit["k4"], k4, places=9)
+        self.assertAlmostEqual(fit["r2"], 1.0, places=12)
+
+    def test_static_offset_is_not_charged_to_the_stark_terms(self):
+        """A purely static ridge must come back as delta0, with NO Stark shift.
+
+        This is the evan_device case: the ridge sits near -0.7 MHz and barely moves
+        with drive. Pinning the origin instead would report a large fake k2.
+        """
+        from snail_solver.tune_up import fit_shift_curve
+        eta = np.linspace(0.7, 2.3, 9)
+        fit = fit_shift_curve(eta, np.full(eta.size, -0.7))
+        self.assertAlmostEqual(fit["delta0"], -0.7, places=8)
+        self.assertLess(abs(fit["k2"]), 1e-8)
+        self.assertLess(fit["stark_span_MHz"], 1e-8)
+
+        pinned = fit_shift_curve(eta, np.full(eta.size, -0.7), fit_static=False)
+        self.assertGreater(abs(pinned["k2"]), 0.05)      # the fake shift, quantified
+
+    def test_nans_are_dropped_not_propagated(self):
+        from snail_solver.tune_up import fit_shift_curve
+        eta = np.linspace(0.5, 2.2, 11)
+        y = -0.85 * eta ** 2
+        y[3] = np.nan                                    # one railed/failed row
+        fit = fit_shift_curve(eta, y)
+        self.assertEqual(fit["n_used"], 10)
+        self.assertAlmostEqual(fit["k2"], -0.85, places=8)
+        self.assertLess(abs(fit["delta0"]), 1e-8)
+
+    def test_stark_span_measures_the_drive_dependence(self):
+        """stark_span is what the chirp is built from, so it must exclude delta0."""
+        from snail_solver.tune_up import fit_shift_curve
+        eta = np.linspace(1.0, 2.0, 9)
+        fit = fit_shift_curve(eta, 5.0 - 0.5 * eta ** 2)
+        self.assertAlmostEqual(fit["stark_span_MHz"], 0.5 * (2.0 ** 2 - 1.0 ** 2),
+                               places=8)
+
+    def test_too_few_rows_raises(self):
+        from snail_solver.tune_up import fit_shift_curve
+        with self.assertRaises(ValueError):
+            fit_shift_curve(np.array([1.0, 2.0, 3.0]), np.array([1.0, 4.0, 9.0]))
+
+
+class TestTuneUpChirpProjection(unittest.TestCase):
+    """Projecting the MEASURED shift onto Legendre must generalize the analytic seed."""
+
+    @staticmethod
+    def _table(k2, k4, eta_star=1.8):
+        return {"fit": {"delta0": 0.0, "k2": k2, "k4": k4, "r2": 1.0},
+                "target_eta": eta_star}
+
+    def test_pure_quadratic_reproduces_the_analytic_seed(self):
+        """With k4 = 0 the shift is exactly ~|eta|^2, so this must equal stark_chirp_seed.
+
+        Two independent code paths -- a tabulated closed form and a Gauss-Legendre
+        quadrature over the fitted curve -- landing on the same numbers.
+        """
+        from snail_solver.stark_chirp import stark_chirp_seed
+        from snail_solver.tune_up import chirp_from_measured_shift
+        res = chirp_from_measured_shift(self._table(-0.9, 0.0), degree=4)
+        np.testing.assert_allclose(res["coeffs_GHz"],
+                                   stark_chirp_seed(res["mean_shift_GHz"], degree=4),
+                                   rtol=0, atol=1e-13)
+        self.assertLess(res["rel_diff"], 1e-12)
+        self.assertEqual(res["quartic_fraction"], 0.0)
+
+    def test_mean_shift_is_the_hann_average(self):
+        """c_0 IS <delta> over the pulse: 3/8 k2 eta*^2 when the shift is pure |eta|^2."""
+        from snail_solver.stark_chirp import HANN_MEAN_FACTOR
+        from snail_solver.tune_up import chirp_from_measured_shift
+        k2, eta = -0.9, 1.8
+        res = chirp_from_measured_shift(self._table(k2, 0.0, eta), degree=4)
+        self.assertAlmostEqual(res["mean_shift_GHz"],
+                               HANN_MEAN_FACTOR * k2 * eta ** 2 * 1e-3, places=12)
+
+    def test_c0_pinned_and_odd_terms_exactly_zero(self):
+        from snail_solver.tune_up import chirp_from_measured_shift
+        res = chirp_from_measured_shift(self._table(-0.9, 0.2), degree=6)
+        c = res["coeffs_GHz"]
+        self.assertEqual(c[0], 0.0)                     # degenerate with wp_offset
+        np.testing.assert_array_equal(c[1::2], np.zeros(c[1::2].size))
+        self.assertNotEqual(c[2], 0.0)                  # c_2 leads, not c_1
+
+    def test_quartic_term_moves_the_chirp(self):
+        """rel_diff is a readout of what the measured k4 buys over the pure-|eta|^2 seed."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        res = chirp_from_measured_shift(self._table(-0.9, 0.3), degree=4)
+        self.assertGreater(res["rel_diff"], 0.05)
+        self.assertAlmostEqual(res["quartic_fraction"],
+                               abs(0.3 * 1.8 ** 4) / abs(0.9 * 1.8 ** 2), places=10)
+
+    def test_static_offset_goes_to_the_carrier_not_the_chirp(self):
+        """delta0 must move wp_offset and leave every chirp coefficient untouched.
+
+        A drive-independent shift has no shape along the pulse, so there is nothing
+        for a chirp to track; routing it into c_k would be the same double-count that
+        pinning c_0 exists to prevent.
+        """
+        from snail_solver.tune_up import chirp_from_measured_shift
+        plain = chirp_from_measured_shift(self._table(-0.9, 0.2), degree=4)
+        with_static = chirp_from_measured_shift(
+            {"fit": {"delta0": -0.7, "k2": -0.9, "k4": 0.2, "r2": 1.0},
+             "target_eta": 1.8}, degree=4)
+        np.testing.assert_allclose(with_static["coeffs_GHz"], plain["coeffs_GHz"],
+                                   rtol=0, atol=1e-15)
+        self.assertAlmostEqual(with_static["mean_shift_GHz"] - plain["mean_shift_GHz"],
+                               -0.7e-3, places=12)
+        self.assertAlmostEqual(with_static["static_GHz"], -0.7e-3, places=12)
+
+    def test_chirp_is_independent_of_gate_length_with_drag_off(self):
+        """With DRAG off the coefficients depend on |eta(u)| only -- THE decoupling."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        a = chirp_from_measured_shift(self._table(-0.9, 0.2), t_g=77.0)
+        b = chirp_from_measured_shift(self._table(-0.9, 0.2), t_g=120.0)
+        np.testing.assert_array_equal(a["coeffs_GHz"], b["coeffs_GHz"])
+
+
+class TestTuneUpDragCoupledChirp(unittest.TestCase):
+    """DRAG's quadrature and the chirp are a fixed point, not a formula.
+
+    ``|eta_tot|^2 = |eta|^2 + [(d eta/dt) / Delta(t)]^2`` raises the Stark shift, and
+    ``Delta(t) = Delta_0 - k delta(t)`` moves with the chirp that shift produces. The
+    quadrature also scales as 1/t_g, which BREAKS the length-independence the DRAG-off
+    calibration relies on -- that is why the orchestrator has an outer loop at all.
+    """
+
+    @staticmethod
+    def _table(k2=-0.9, k4=0.0, eta_star=1.8):
+        return {"fit": {"delta0": 0.0, "k2": k2, "k4": k4, "r2": 1.0},
+                "target_eta": eta_star}
+
+    def test_drag_off_is_the_zero_quadrature_limit(self):
+        """beat=None and an infinitely detuned beat must agree: q -> 0 either way."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        off = chirp_from_measured_shift(self._table(), t_g=80.0)
+        far = chirp_from_measured_shift(self._table(), t_g=80.0,
+                                        drag_beat_GHz=1e6, drag_n_pump=1)
+        np.testing.assert_allclose(far["coeffs_GHz"], off["coeffs_GHz"],
+                                   rtol=1e-9, atol=1e-15)
+
+    def test_quadrature_increases_the_shift(self):
+        """DRAG adds drive, so |delta| grows -- it never leaves the chirp untouched."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        off = chirp_from_measured_shift(self._table(), t_g=80.0)
+        on = chirp_from_measured_shift(self._table(), t_g=80.0,
+                                       drag_beat_GHz=0.05, drag_n_pump=1)
+        self.assertGreater(on["drag_delta_frac"], 0.0)
+        self.assertGreater(abs(on["mean_shift_GHz"]), abs(off["mean_shift_GHz"]))
+
+    def test_drag_breaks_length_independence(self):
+        """q ~ 1/t_g, so with DRAG on a shorter gate needs a DIFFERENT chirp.
+
+        This is the claim that forces `run_tune_up`'s outer chirp<->length loop; if it
+        ever became false the loop would be dead code.
+        """
+        from snail_solver.tune_up import chirp_from_measured_shift
+        short = chirp_from_measured_shift(self._table(), t_g=60.0,
+                                          drag_beat_GHz=0.05, drag_n_pump=1)
+        long = chirp_from_measured_shift(self._table(), t_g=120.0,
+                                         drag_beat_GHz=0.05, drag_n_pump=1)
+        self.assertGreater(short["drag_delta_frac"], long["drag_delta_frac"],
+                           "a shorter gate has a steeper envelope, so a bigger "
+                           "quadrature and a bigger DRAG contribution")
+        self.assertGreater(abs(short["coeffs_GHz"][2] - long["coeffs_GHz"][2]), 0.0)
+
+    def test_k_scales_the_detuning_pull(self):
+        """k = 2 (subharmonic) pulls Delta(t) twice as hard as k = 1; k = 0 not at all."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        kw = dict(t_g=80.0, drag_beat_GHz=0.05)
+        k0 = chirp_from_measured_shift(self._table(), drag_n_pump=0, **kw)
+        k1 = chirp_from_measured_shift(self._table(), drag_n_pump=1, **kw)
+        k2_ = chirp_from_measured_shift(self._table(), drag_n_pump=2, **kw)
+        self.assertAlmostEqual(k0["min_abs_detuning_GHz"], 0.05, places=12)
+        # the shift here is negative, so Delta = D0 - k delta moves AWAY from zero
+        self.assertGreater(k1["min_abs_detuning_GHz"], k0["min_abs_detuning_GHz"])
+        self.assertGreater(k2_["min_abs_detuning_GHz"], k1["min_abs_detuning_GHz"])
+
+    def test_t_g_required_when_drag_is_on(self):
+        """Silently assuming a length would silently produce the wrong quadrature."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        with self.assertRaises(ValueError):
+            chirp_from_measured_shift(self._table(), drag_beat_GHz=0.05)
+
+    def test_predicted_drag_contribution_scales_as_eta_to_the_fourth(self):
+        """The prediction `drag_shift_table` tests against must scale as |eta|^4.
+
+        For a Hann pulse d eta/dt ~ eta/t_g and a full-swap t_g ~ 1/eta, so the
+        quadrature q ~ eta^2 and a shift following k2|eta|^2 goes as q^2 ~ eta^4. That
+        exponent is the discriminator: measure 4 and DRAG is only adding drive, which
+        the chirp already covers; measure anything else and there is a mechanism the
+        quadrature model does not contain.
+        """
+        from snail_solver.tune_up import (chirp_from_measured_shift, nominal_t_g,
+                                          project_nodrag_mean)
+        cfg = _cfg()
+        etas = np.array([1.2, 1.5, 1.8, 2.1])
+        pred = []
+        for e in etas:
+            tbl = {"fit": {"delta0": 0.0, "k2": -0.9, "k4": 0.0, "r2": 1.0},
+                   "target_eta": float(e)}
+            on = chirp_from_measured_shift(tbl, float(e), drag_beat_GHz=0.3,
+                                           drag_n_pump=1,
+                                           t_g=nominal_t_g(cfg, float(e)))
+            pred.append(abs(on["mean_shift_GHz"]
+                            - project_nodrag_mean(tbl, float(e))))
+        slope = np.polyfit(np.log(etas), np.log(np.array(pred)), 1)[0]
+        self.assertAlmostEqual(slope, 4.0, delta=0.15)
+
+
+class TestTuneUpSwapFit(unittest.TestCase):
+    """The time-Rabi fit must find the FIRST full swap, not a harmonic of it."""
+
+    def test_recovers_period(self):
+        from snail_solver.tune_up import fit_swap_period
+        t = np.linspace(0.0, 200.0, 400)
+        T = 62.5
+        fit = fit_swap_period(t, 0.97 * np.sin(np.pi * t / (2 * T)) ** 2 + 0.01)
+        self.assertTrue(fit["ok"])
+        self.assertAlmostEqual(fit["T_swap_ns"], T, places=4)
+
+    def test_survives_noise(self):
+        from snail_solver.tune_up import fit_swap_period
+        rng = np.random.default_rng(0)
+        t = np.linspace(0.0, 200.0, 400)
+        T = 62.5
+        y = np.sin(np.pi * t / (2 * T)) ** 2 + rng.normal(0.0, 0.01, t.size)
+        fit = fit_swap_period(t, y)
+        self.assertTrue(fit["ok"])
+        self.assertAlmostEqual(fit["T_swap_ns"], T, delta=0.5)
+
+    def test_short_trace_raises(self):
+        from snail_solver.tune_up import fit_swap_period
+        with self.assertRaises(ValueError):
+            fit_swap_period(np.arange(4.0), np.zeros(4))
 
 
 if __name__ == "__main__":

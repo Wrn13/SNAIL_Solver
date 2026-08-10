@@ -242,7 +242,10 @@ def pulse_spec(cpl) -> Dict[str, Any]:
                           else 2 * omega_p / (omega_p ** 2 - omega_s ** 2)),
             "phi_p": float(tone.phi_p),
             "drag": bool(tone.drag and tone.delta_drag_GHz not in (None, 0.0)),
+            # Delta_0 only. The chirp-dependent part of the beat is rebuilt inside
+            # `eta_at` from `params["chirp"]` -- see the note there.
             "drag_rad": float((tone.delta_drag_GHz or 0.0) * TWO_PI),
+            "drag_n_pump": int(getattr(tone, "drag_n_pump", 1)),
         })
     return {"n_tones": len(tones), "tones": tones}
 
@@ -307,17 +310,49 @@ def _chirp_phase(params: Dict[str, Any], t: Any, p: int, t_g: float, xp: Any):
     return np.pi * t_g * total
 
 
+def _chirp_detuning(params: Dict[str, Any], t: Any, p: int, t_g: float, xp: Any):
+    """Instantaneous chirp offset delta(t) in rad/ns; mirrors envelope.Chirp.detuning.
+
+    Duplicated here (rather than calling the Chirp object) for the same reason as
+    ``_chirp_phase``: the coefficients must come from `params` to be a vmap/grad axis.
+    The two are pinned together by a test.
+    """
+    coeffs = params["chirp"][p]
+    n = coeffs.shape[0] if hasattr(coeffs, "shape") else len(coeffs)
+    if n == 0:
+        return 0.0 * xp.asarray(t)
+    u = xp.clip(2.0 * xp.asarray(t) / t_g - 1.0, -1.0, 1.0)
+    P = [xp.ones_like(u), u]
+    for k in range(1, n):
+        P.append(((2 * k + 1) * u * P[k] - k * P[k - 1]) / (k + 1))
+    total = coeffs[0] * P[0]
+    for k in range(1, n):
+        total = total + coeffs[k] * P[k]
+    return TWO_PI * total
+
+
 def eta_at(spec: Dict[str, Any], params: Dict[str, Any], t: Any, p: int, xp: Any):
     """Pump amplitude eta_p(t) -- the traceable twin of ``ZhouCoupler._eta_at``.
 
     Same ordering: DRAG differentiates the BASE envelope, then the chirp phase
     multiplies the result.
+
+    The DRAG denominator is rebuilt HERE from ``params["chirp"]`` rather than read off
+    ``spec``, because a chirped pump moves the beat it suppresses:
+    ``Delta(t) = Delta_0 - k delta(t)``. Keeping it in `spec` would freeze it as a
+    constant, which is not merely inaccurate -- it would silently break the GRADIENT,
+    since `grape` differentiates this function with respect to the very chirp
+    coefficients the denominator depends on.
     """
     st = spec["tones"][p]
     amp = params["amp"][p]
     a = amp * _shape_at(st, params, t, p, xp, deriv=False)
     if st["drag"]:
-        a = a - 1j * amp * _shape_at(st, params, t, p, xp, deriv=True) / st["drag_rad"]
+        detuning = st["drag_rad"]
+        k = st.get("drag_n_pump", 1)
+        if k:
+            detuning = detuning - k * _chirp_detuning(params, t, p, st["t_g"], xp)
+        a = a - 1j * amp * _shape_at(st, params, t, p, xp, deriv=True) / detuning
     a = a * xp.exp(-1j * _chirp_phase(params, t, p, st["t_g"], xp))
     return st["prefactor"] * a * xp.exp(1j * st["phi_p"])
 
