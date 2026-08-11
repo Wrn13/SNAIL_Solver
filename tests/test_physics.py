@@ -1302,6 +1302,28 @@ class TestTuneUpShiftFit(unittest.TestCase):
         with self.assertRaises(ValueError):
             fit_shift_curve(np.array([1.0, 2.0, 3.0]), np.array([1.0, 4.0, 9.0]))
 
+    def test_one_wild_row_is_dropped_not_averaged_in(self):
+        """A leaking chevron must be excluded, not merely down-weighted.
+
+        `rabi_shift_table` NaNs any row below the contrast floor; this pins the
+        consequence, which is that the surviving rows alone set k2 and k4. Measured on
+        evan_device one such row (contrast 0.215) sat 14 MHz from both its neighbours
+        and, left in, dragged r2 to 0.345.
+        """
+        from snail_solver.tune_up import fit_shift_curve
+        eta = np.array([0.7, 1.1, 1.5, 1.9, 2.3])
+        clean = -0.7 - 0.3 * eta ** 2
+        wild = clean.copy()
+        wild[3] = -14.0                                  # the leaking row
+        poisoned = fit_shift_curve(eta, wild)
+        dropped = wild.copy()
+        dropped[3] = np.nan
+        rescued = fit_shift_curve(eta, dropped)
+        self.assertLess(poisoned["r2"], 0.9)             # the guard would fire
+        self.assertGreater(rescued["r2"], 0.999)
+        self.assertAlmostEqual(rescued["k2"], -0.3, places=6)
+        self.assertAlmostEqual(rescued["delta0"], -0.7, places=6)
+
 
 class TestTuneUpChirpProjection(unittest.TestCase):
     """Projecting the MEASURED shift onto Legendre must generalize the analytic seed."""

@@ -245,13 +245,14 @@ def fit_chevron_center(offsets_GHz: np.ndarray, metric: np.ndarray) -> Dict[str,
 
 
 def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
-                     eta_lo: float = 0.4, eta_hi: float = 1.3,
+                     eta_lo: float = 0.3, eta_hi: float = 1.0,
                      amp_points: int = 9, wp_span_MHz: Optional[float] = None,
                      wp_points: int = 25, span_linewidths: float = 4.0,
                      chirp_coeffs_GHz: Optional[Sequence[float]] = None,
                      drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
                      spec_abs_GHz: Optional[float] = None,
                      wp_offset_GHz: float = 0.0, r2_min: float = 0.9,
+                     contrast_min: float = 0.35,
                      window_tg: float = 2.0, n_time: int = 161, jobs: int = 0,
                      solver: Optional[Dict[str, Any]] = None,
                      logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
@@ -296,7 +297,10 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     Parameters
     ----------
     eta_lo, eta_hi : float
-        Amplitude window as a FRACTION of `target_eta`.
+        Amplitude window as a FRACTION of `target_eta`. `eta_hi` defaults to 1.0
+        because the pulse never exceeds its own peak: sampling above eta* adds no
+        information the chirp can use, and a CONSTANT probe held above the operating
+        drive is exactly where the chevron stops being a two-level feature.
     wp_span_MHz : float, optional
         Fixed offset span for every row. Leave as None to size each row from its own
         linewidth, which is almost always what you want.
@@ -310,6 +314,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     r2_min : float
         Refuse to return a curve whose fit is worse than this -- a railed or
         artefact-tracking ridge yields a plausible-looking wrong chirp.
+    contrast_min : float
+        Drop rows whose chevron contrast falls below this. At strong drive leakage
+        can outpace the exchange, and the surviving feature is not a resonance.
 
     Returns
     -------
@@ -353,22 +360,45 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                             drag_n_pump=drag_n_pump, eta_op=float(e))
             m = np.asarray(chev["resonance_metric"], dtype=float)
             cen = fit_chevron_center(chev["offsets_GHz"], m)
-            # A width comparable to the window means the wings were never sampled, so
-            # the centre is an extrapolation. Widening is cheap next to trusting it.
-            too_wide = (not cen["ok"]) or (cen["hwhm_GHz"] * 1e3 > 0.4 * span)
-            if not too_wide or wp_span_MHz is not None or attempt == 2:
+            # Widen ONLY when the width itself is unconstrained -- a linewidth
+            # comparable to the window means the wings were never sampled, so the
+            # centre is an extrapolation. A fit rejected for any OTHER reason (bad
+            # rmse) means the lineshape is not Lorentzian, and no amount of widening
+            # repairs that: it is leakage destroying the two-level chevron, which the
+            # contrast floor below catches. Retrying such a row cost two futile
+            # widenings out to +/-251 MHz before this distinction existed.
+            if (cen["hwhm_GHz"] * 1e3 <= 0.4 * span or wp_span_MHz is not None
+                    or attempt == 2):
                 break
             span *= 3.0
             if logger:
                 logger.info(f"    row {i + 1}: hwhm {cen['hwhm_GHz'] * 1e3:.2f} MHz too "
-                            f"wide for the window -- retrying at +/-{span / 2:.1f} MHz")
+                            f"wide for +/-{span / 6:.1f} MHz -- retrying at "
+                            f"+/-{span / 2:.1f} MHz")
 
         windows[i] = window_ns
         spans[i] = span
+        contrast[i] = float(np.nanmax(m) - np.nanmin(m))
+        # A chevron with no contrast is not a resonance measurement. At strong drive
+        # the exchange can lose population to leakage faster than it swaps, and what
+        # is left is not a two-level feature at all -- measured on evan_device, the
+        # |eta| = 1.94 row came back at contrast 0.215 and put its "resonance" 14 MHz
+        # away from both neighbours. Drop it here, with a reason, rather than letting
+        # one such row set k2 and k4 for the whole chirp; `fit_shift_curve` ignores
+        # NaNs, so the curve is still fitted from the rows that mean something.
+        if contrast[i] < contrast_min:
+            ridge[i] = np.nan
+            if logger:
+                logger.info(f"  rabi row {i + 1}/{eta.size}: |eta|={e:.4f} DROPPED -- "
+                            f"contrast {contrast[i]:.3f} < {contrast_min}; the swap is "
+                            f"leaking, so this chevron does not locate a resonance")
+            chevrons.append({"eta": float(e), "offsets_GHz": chev["offsets_GHz"],
+                             "metric": m, "fit": cen, "window_ns": window_ns,
+                             "span_MHz": span, "dropped": "low_contrast"})
+            continue
         # report the ridge RELATIVE to the offset the probe already carries, so the
         # caller accumulates a residual rather than re-adding the current setting
         ridge[i] = (cen["center_GHz"] - float(wp_offset_GHz)) * 1e3
-        contrast[i] = float(np.nanmax(m) - np.nanmin(m))
         chevrons.append({"eta": float(e), "offsets_GHz": chev["offsets_GHz"],
                          "metric": m, "fit": cen, "window_ns": window_ns,
                          "span_MHz": span})
@@ -830,11 +860,12 @@ def project_nodrag_mean(table: Dict[str, Any], target_eta: float,
 def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
                 spec_abs_GHz: Optional[float] = None, chirp_degree: int = 4,
-                eta_lo: float = 0.4, eta_hi: float = 1.3,
+                eta_lo: float = 0.3, eta_hi: float = 1.0,
                 amp_points: int = 9, wp_span_MHz: Optional[float] = None,
                 wp_points: int = 25, tg_points: int = 13, max_drag_iters: int = 4,
                 window_tg: float = 2.0, n_time: int = 161,
                 span_linewidths: float = 4.0, drag_shift_points: int = 0,
+                contrast_min: float = 0.35,
                 chirp_tol_GHz: float = 1e-4, offset_tol_MHz: float = 0.2,
                 do_time_rabi: bool = True, jobs: int = 0,
                 solver: Optional[Dict[str, Any]] = None,
@@ -875,7 +906,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                   wp_span_MHz=wp_span_MHz, wp_points=wp_points,
                   spec_abs_GHz=spec_abs_GHz, drag_n_pump=drag_n_pump,
                   window_tg=window_tg, n_time=n_time, jobs=jobs, solver=solver,
-                  span_linewidths=span_linewidths, logger=log, **map_kw)
+                  span_linewidths=span_linewidths, contrast_min=contrast_min,
+                  logger=log, **map_kw)
 
     # -- 1: the Rabi sweep, measured once ------------------------------------
     log.info("step 1: Rabi (constant-probe chevron per drive strength), DRAG OFF")
@@ -1076,9 +1108,15 @@ def main() -> None:
                          "exchange even for the weakest (slowest) drive row")
     ap.add_argument("--n-time", type=int, default=161,
                     help="chevron readout times (one solve covers all of them)")
-    ap.add_argument("--eta-lo", type=float, default=0.4,
+    ap.add_argument("--eta-lo", type=float, default=0.3,
                     help="Rabi amplitude window, as a fraction of --target-eta")
-    ap.add_argument("--eta-hi", type=float, default=1.3)
+    ap.add_argument("--eta-hi", type=float, default=1.0,
+                    help="the pulse never exceeds its peak, so sampling above 1.0 is "
+                         "extrapolation into where a constant probe misbehaves")
+    ap.add_argument("--contrast-min", type=float, default=0.35,
+                    help="drop chevrons with less contrast than this -- at strong "
+                         "drive leakage can outpace the exchange and the surviving "
+                         "feature is not a resonance")
     ap.add_argument("--amp-points", type=int, default=9,
                     help="drive-strength rows; each is one exact chevron")
     ap.add_argument("--wp-span-MHz", type=float, default=None,
@@ -1127,6 +1165,7 @@ def main() -> None:
         span_linewidths=args.span_linewidths,
         drag_shift_points=args.drag_shift_points,
         eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
+        contrast_min=args.contrast_min,
         wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
         tg_points=args.tg_points, max_drag_iters=args.max_drag_iters,
         do_time_rabi=not args.skip_time_rabi, jobs=args.jobs,
