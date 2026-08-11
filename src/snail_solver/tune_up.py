@@ -80,6 +80,19 @@ from snail_solver.device_utils import auto_t_g, target_eta_area
 TWO_PI = 2.0 * np.pi
 
 
+class RabiFitError(ValueError):
+    """A Rabi sweep that measured fine but cannot be turned into a chirp.
+
+    Carries the partial table on ``.table`` so the caller can still plot and save
+    what was measured. Every one of these errors tells the user to inspect the
+    chevrons; without the data attached there would be nothing to inspect.
+    """
+
+    def __init__(self, message: str, table: Dict[str, Any]):
+        super().__init__(message)
+        self.table = table
+
+
 # ===========================================================================
 # Fixed-amplitude algebra
 # ===========================================================================
@@ -210,7 +223,8 @@ def fit_chevron_center(offsets_GHz: np.ndarray, metric: np.ndarray) -> Dict[str,
     Returns
     -------
     dict
-        ``center_GHz``, ``hwhm_GHz``, ``depth``, ``rmse``, ``vertex_GHz``, ``ok``.
+        ``center_GHz``, ``hwhm_GHz``, ``depth``, ``base`` (the fitted floor),
+        ``rmse``, ``vertex_GHz``, ``ok``.
     """
     from scipy.optimize import curve_fit
     from snail_solver.find_stark_resonance import locate_resonance
@@ -222,7 +236,8 @@ def fit_chevron_center(offsets_GHz: np.ndarray, metric: np.ndarray) -> Dict[str,
     vertex = float(locate_resonance(x, y)) if x.size >= 3 else float("nan")
     if x.size < 5:
         return {"center_GHz": vertex, "hwhm_GHz": float("nan"), "depth": float("nan"),
-                "rmse": float("nan"), "vertex_GHz": vertex, "ok": False}
+                "base": float("nan"), "rmse": float("nan"), "vertex_GHz": vertex,
+                "ok": False}
 
     def model(xx, amp, x0, w, c):
         return amp * w ** 2 / (w ** 2 + (xx - x0) ** 2) + c
@@ -241,7 +256,7 @@ def fit_chevron_center(offsets_GHz: np.ndarray, metric: np.ndarray) -> Dict[str,
     except Exception:                                        # pragma: no cover
         amp, x0, w, c, rmse, good = (float("nan"),) * 5 + (False,)
     return {"center_GHz": x0 if good else vertex, "hwhm_GHz": abs(w), "depth": amp,
-            "rmse": rmse, "vertex_GHz": vertex, "ok": good}
+            "base": c, "rmse": rmse, "vertex_GHz": vertex, "ok": good}
 
 
 def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
@@ -394,14 +409,16 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                             f"leaking, so this chevron does not locate a resonance")
             chevrons.append({"eta": float(e), "offsets_GHz": chev["offsets_GHz"],
                              "metric": m, "fit": cen, "window_ns": window_ns,
-                             "span_MHz": span, "dropped": "low_contrast"})
+                             "span_MHz": span, "dropped": "low_contrast",
+                             "times_ns": chev["times_ns"], "P10": chev["P10"]})
             continue
         # report the ridge RELATIVE to the offset the probe already carries, so the
         # caller accumulates a residual rather than re-adding the current setting
         ridge[i] = (cen["center_GHz"] - float(wp_offset_GHz)) * 1e3
         chevrons.append({"eta": float(e), "offsets_GHz": chev["offsets_GHz"],
                          "metric": m, "fit": cen, "window_ns": window_ns,
-                         "span_MHz": span})
+                         "span_MHz": span, "times_ns": chev["times_ns"],
+                         "P10": chev["P10"]})
         if logger:
             logger.info(f"  rabi row {i + 1}/{eta.size}: |eta|={e:.4f} -> "
                         f"{ridge[i]:+.4f} MHz (span +/-{span / 2:.1f} MHz, contrast "
@@ -409,37 +426,42 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                         f"{'lorentzian' if cen['ok'] else 'PARABOLIC FALLBACK'}, "
                         f"vertex {(cen['vertex_GHz'] - wp_offset_GHz) * 1e3:+.4f} MHz)")
 
+    partial = {"eta": eta, "delta_MHz": ridge, "t_g_ref_ns": t_g0,
+               "target_eta": float(target_eta), "contrast": contrast,
+               "windows_ns": windows, "spans_MHz": spans, "chevrons": chevrons}
+
     # a ridge sitting on the scan edge is not a measurement
     step = spans / max(int(wp_points) - 1, 1)
     railed = np.isfinite(ridge) & (np.abs(np.abs(ridge) - spans / 2.0) <= step)
     if railed.any():
-        raise ValueError(
+        raise RabiFitError(
             f"{int(railed.sum())}/{ridge.size} ridge rows rail against their scan "
             f"window (spans {np.nanmin(spans) / 2:.1f}-{np.nanmax(spans) / 2:.1f} MHz "
             f"half-width) -- raise --span-linewidths. A railed ridge produces a "
-            f"confident, wrong chirp.")
+            f"confident, wrong chirp.", partial)
 
     fit = fit_shift_curve(eta, ridge, weights=contrast)
+    partial["fit"] = fit
     if not (fit["r2"] >= r2_min):
-        raise ValueError(
+        raise RabiFitError(
             f"the ridge is not well described by delta0 + k2|eta|^2 + k4|eta|^4 "
             f"(r2 = {fit['r2']:.3f} < {r2_min}, residual {fit['resid_MHz']:.4f} MHz). "
             f"The ridge may be tracking leakage rather than the Stark shift, or the "
             f"offset grid may be too coarse to resolve it. Inspect the chevrons "
-            f"before trusting a chirp built from them.")
+            f"before trusting a chirp built from them.", partial)
     # A drive-dependent span below the fit's own scatter is not a measured shift, and
     # a chirp built from it would be fitted noise dressed as physics. The STATIC part
     # is still trustworthy -- it is the bulk of the signal -- so this is a chirp
     # problem, not an offset problem.
     if fit["stark_span_MHz"] <= fit["resid_MHz"]:
-        raise ValueError(
+        raise RabiFitError(
             f"the DRIVE-DEPENDENT shift ({fit['stark_span_MHz']:.4f} MHz across "
             f"|eta| in [{eta[0]:.2f}, {eta[-1]:.2f}]) is smaller than the fit residual "
             f"({fit['resid_MHz']:.4f} MHz), so there is no resolved Stark shift to "
             f"build a chirp from. The static offset delta0 = {fit['delta0']:+.4f} MHz "
             f"is still meaningful -- calibrate wp_offset and run without a chirp, or "
             f"widen --eta-lo/--eta-hi and refine --wp-points until the drive "
-            f"dependence clears the noise.")
+            f"dependence clears the noise.", partial)
     if logger:
         logger.info(f"  rabi: delta0={fit['delta0']:+.4f} MHz (static), "
                     f"k2={fit['k2']:+.4f} MHz/|eta|^2, k4={fit['k4']:+.4f} "
@@ -578,6 +600,172 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
             "static_GHz": float(fit.get("delta0", 0.0)) * 1e-3,
             "rel_diff": rel_diff, "quartic_fraction": float(quartic), **extra,
             "degree": int(degree), "target_eta": eta_star}
+
+
+# ===========================================================================
+# Seeing what was fitted
+# ===========================================================================
+#: Categorical slots 1 and 2 of the reference data-viz palette, which is validated
+#: for CVD separation and contrast. Fixed by ROLE, never by rank: the Lorentzian is
+#: always blue and the parabolic vertex always orange, in every panel, so a reader
+#: who learns the pairing once keeps it.
+_C_LORENTZ = "#2a78d6"
+_C_VERTEX = "#eb6834"
+_C_INK = "#52514e"
+
+
+def plot_rabi_table(table: Dict[str, Any], out: str = "figs/rabi_chevrons.png",
+                    title: Optional[str] = None) -> str:
+    """Render the Rabi sweep: every chevron, its envelope fit, and the shift curve.
+
+    One row per drive strength, left to right: the raw chevron; the Rabi oscillation
+    on resonance and one linewidth off it; and the max-over-time envelope with the
+    Lorentzian that was fitted to it. The bottom panel is the result: the located
+    resonance versus |eta|, with the ``delta0 + k2|eta|^2 + k4|eta|^4`` curve through
+    it.
+
+    The middle column is the measurement in its rawest form. Detuning speeds the
+    oscillation up and shrinks its amplitude -- ``Omega_eff = sqrt(Omega^2 + d^2)``
+    with peak ``Omega^2/Omega_eff^2`` -- and it is the peak of that envelope, over
+    all offsets, that the right-hand column fits. Seeing the two together is the
+    point: if the on-resonance trace does not reach 1 and come back, the chevron has
+    no well-defined centre no matter how good the Lorentzian looks.
+
+    The two resonance estimators are drawn TOGETHER on every envelope, because their
+    disagreement is the diagnostic. On a clean two-level chevron the Lorentzian
+    centre and the parabolic vertex land on top of each other; when they separate by
+    more than the shift being measured, the lineshape is not
+    ``Omega^2/(Omega^2 + delta^2)`` and no amount of fitting will recover a
+    resonance. That is exactly what happens at strong drive on these devices, and it
+    is visible at a glance here in a way it is not in the log.
+
+    Accepts a full table or the partial one carried by :class:`RabiFitError`, so a
+    sweep that failed its guards can still be looked at -- which is what those error
+    messages ask the user to do.
+
+    Returns
+    -------
+    str
+        The path written.
+    """
+    import os
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    try:
+        from snail_solver.plot_results import set_literature_style
+        set_literature_style()
+    except Exception:                                        # style is a nicety
+        pass
+
+    chevrons = list(table.get("chevrons", []))
+    if not chevrons:
+        raise ValueError("no chevrons to plot")
+    eta = np.asarray(table["eta"], dtype=float)
+    ridge = np.asarray(table["delta_MHz"], dtype=float)
+    fit = table.get("fit")
+    n = len(chevrons)
+
+    fig = plt.figure(figsize=(16.2, 2.9 * n + 3.4), layout="constrained")
+    gs = fig.add_gridspec(n + 1, 3, width_ratios=[1.0, 0.95, 1.1],
+                          height_ratios=[2.9] * n + [3.4])
+    axes = np.array([[fig.add_subplot(gs[r, c]) for c in range(3)]
+                     for r in range(n)])
+    for i, ch in enumerate(chevrons):
+        ax0, axt, ax1 = axes[i, 0], axes[i, 1], axes[i, 2]
+        off = np.asarray(ch["offsets_GHz"], dtype=float) * 1e3
+        m = np.asarray(ch["metric"], dtype=float)
+        cen, vtx = ch["fit"]["center_GHz"] * 1e3, ch["fit"]["vertex_GHz"] * 1e3
+        dropped = ch.get("dropped")
+
+        if "P10" in ch:
+            # sequential magnitude -> one perceptually uniform ramp, pinned to [0, 1]
+            # so every row is directly comparable to every other
+            mesh = ax0.pcolormesh(off, np.asarray(ch["times_ns"], dtype=float),
+                                  np.asarray(ch["P10"], dtype=float).T,
+                                  shading="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+            fig.colorbar(mesh, ax=ax0, label=r"$P(|10\rangle)$", pad=0.02)
+        ax0.axvline(cen, color=_C_LORENTZ, ls="--", lw=1.6)
+        ax0.set_ylabel("time (ns)")
+        ax0.set_title(rf"$|\eta|$ = {ch['eta']:.3f}   "
+                      rf"({ch['window_ns']:.0f} ns window)", fontsize=10)
+
+        # -- the oscillation itself, on resonance and one linewidth away ---------
+        if "P10" in ch:
+            P = np.asarray(ch["P10"], dtype=float)
+            ts = np.asarray(ch["times_ns"], dtype=float)
+            hw = ch["fit"].get("hwhm_GHz", np.nan) * 1e3
+            j_on = int(np.argmin(np.abs(off - cen)))
+            axt.plot(ts, P[j_on], "-", lw=2.0, color=_C_LORENTZ,
+                     label=rf"on resonance ({off[j_on]:+.2f} MHz)")
+            if np.isfinite(hw):
+                j_off = int(np.argmin(np.abs(off - (cen + hw))))
+                if j_off != j_on:
+                    axt.plot(ts, P[j_off], "-", lw=1.6, color=_C_VERTEX, alpha=0.85,
+                             label=rf"+1 HWHM ({off[j_off]:+.2f} MHz)")
+            axt.axhline(1.0, color=_C_INK, ls=":", lw=1.0)
+            axt.set_ylim(-0.03, 1.22)      # headroom so the legend clears the trace
+            axt.set_ylabel(r"$P(|10\rangle)$")
+            axt.set_title(rf"Rabi oscillation, peak {P[j_on].max():.3f}", fontsize=9)
+            axt.legend(fontsize=7.5, framealpha=0.95, loc="upper right",
+                       ncol=2, borderaxespad=0.3)
+            axt.grid(alpha=0.25)
+
+        ax1.plot(off, m, "o", ms=4.5, color=_C_INK, label="max-over-time $P(|10\\rangle)$")
+        f = ch["fit"]
+        if np.isfinite(f.get("hwhm_GHz", np.nan)) and f.get("ok"):
+            xs = np.linspace(off.min(), off.max(), 400)
+            w, d, b = f["hwhm_GHz"] * 1e3, f["depth"], f.get("base", 0.0)
+            ax1.plot(xs, d * w ** 2 / (w ** 2 + (xs - cen) ** 2) + b,
+                     "-", lw=2.0, color=_C_LORENTZ,
+                     label=rf"Lorentzian, HWHM {w:.1f} MHz")
+        ax1.axvline(cen, color=_C_LORENTZ, ls="--", lw=1.6,
+                    label=f"centre {cen:+.2f} MHz")
+        ax1.axvline(vtx, color=_C_VERTEX, ls=":", lw=1.8,
+                    label=f"parabolic vertex {vtx:+.2f} MHz")
+        gap = abs(cen - vtx)
+        note = f"contrast {np.nanmax(m) - np.nanmin(m):.2f}   estimators differ {gap:.2f} MHz"
+        if dropped:
+            note += f"   DROPPED ({dropped})"
+        ax1.set_title(note, fontsize=9,
+                      color=("#b3261e" if dropped else _C_INK))
+        ax1.legend(fontsize=7.5, framealpha=0.95, loc="upper left",
+                   borderaxespad=0.4)
+        ax1.grid(alpha=0.25)
+        if i == n - 1:
+            for ax in (ax0, ax1):
+                ax.set_xlabel(r"pump offset from $|\omega_b-\omega_a|$ (MHz)")
+            axt.set_xlabel("time (ns)")
+
+    # -- the result: resonance vs drive, and the curve fitted through it --------
+    axr = fig.add_subplot(gs[n, :])
+    ok = np.isfinite(ridge)
+    axr.plot(eta[ok], ridge[ok], "o", ms=7, color=_C_LORENTZ, label="located resonance")
+    if (~ok).any():
+        axr.plot(eta[~ok], np.zeros((~ok).sum()), "x", ms=9, color=_C_VERTEX,
+                 label="dropped (low contrast)")
+    if fit:
+        xs = np.linspace(0.0, float(eta.max()) * 1.05, 300)
+        axr.plot(xs, fit["delta0"] + fit["k2"] * xs ** 2 + fit["k4"] * xs ** 4,
+                 "-", lw=2.0, color=_C_INK,
+                 label=(rf"$\delta =$ {fit['delta0']:+.3f} "
+                        rf"{fit['k2']:+.3f}$\,|\eta|^2$ {fit['k4']:+.3f}$\,|\eta|^4$"
+                        rf"   ($r^2$ = {fit['r2']:.4f})"))
+        axr.axhline(fit["delta0"], color=_C_INK, ls=":", lw=1.2)
+    axr.set_xlabel(r"drive strength $|\eta|$")
+    axr.set_ylabel("resonance offset (MHz)")
+    axr.set_title("the shift curve the chirp is built from", fontsize=10)
+    axr.legend(fontsize=8, framealpha=0.9)
+    axr.grid(alpha=0.25)
+
+    fig.suptitle(title or (rf"Rabi sweep: resonance vs drive, "
+                           rf"$\eta^*$ = {table['target_eta']:.2f}"), fontsize=12)
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
 
 
 # ===========================================================================
@@ -927,7 +1115,12 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         measurement of the quadrature's effect on the resonance.
         """
         from snail_solver import find_stark_resonance as FSR
-        offs = (np.linspace(-wp_span_MHz / 2e3, wp_span_MHz / 2e3, int(wp_points))
+        # Same linewidth sizing as the Rabi rows: the shaped gate's chevron is just
+        # as wide as the constant probe's at the same drive, so a span fixed in MHz
+        # would be as wrong here as it was there.
+        span = (float(wp_span_MHz) if wp_span_MHz is not None
+                else 2.0 * float(span_linewidths) * 1e3 / (2.0 * float(t_g)))
+        offs = (np.linspace(-span / 2e3, span / 2e3, int(wp_points))
                 + float(wp_offset))
         chev = FSR.scan(config, float(t_g),
                         fixed_eta_amp_scale(config, float(t_g), target_eta), offs,
@@ -1142,6 +1335,10 @@ def main() -> None:
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
     ap.add_argument("--out", default=None, help="write the record + stages to JSON")
+    ap.add_argument("--plot", nargs="?", const="figs/rabi_chevrons.png", default=None,
+                    help="render every chevron, its envelope fit and the shift curve. "
+                         "Written even when the run FAILS its guards -- those errors "
+                         "ask you to inspect the chevrons, so they have to be visible")
     ap.add_argument("--save-point", default=None,
                     help="save the result into the device JSON under this name")
     ap.add_argument("--overwrite", action="store_true")
@@ -1157,20 +1354,28 @@ def main() -> None:
     if args.coupler_levels is not None:
         config = {**config, "coupler_levels": int(args.coupler_levels)}
 
-    out = run_tune_up(
-        config, args.target_eta, drag_beat_GHz=args.drag_beat_GHz,
-        drag_n_pump=args.drag_n_pump, spec_abs_GHz=args.spec_abs_GHz,
-        chirp_degree=args.chirp_degree,
-        window_tg=args.window_tg, n_time=args.n_time,
-        span_linewidths=args.span_linewidths,
-        drag_shift_points=args.drag_shift_points,
-        eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
-        contrast_min=args.contrast_min,
-        wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
-        tg_points=args.tg_points, max_drag_iters=args.max_drag_iters,
-        do_time_rabi=not args.skip_time_rabi, jobs=args.jobs,
-        solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},
-        logger=logger)
+    try:
+        out = run_tune_up(
+            config, args.target_eta, drag_beat_GHz=args.drag_beat_GHz,
+            drag_n_pump=args.drag_n_pump, spec_abs_GHz=args.spec_abs_GHz,
+            chirp_degree=args.chirp_degree,
+            window_tg=args.window_tg, n_time=args.n_time,
+            span_linewidths=args.span_linewidths,
+            drag_shift_points=args.drag_shift_points,
+            eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
+            contrast_min=args.contrast_min,
+            wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
+            tg_points=args.tg_points, max_drag_iters=args.max_drag_iters,
+            do_time_rabi=not args.skip_time_rabi, jobs=args.jobs,
+            solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},
+            logger=logger)
+    except RabiFitError as exc:
+        # The measurement succeeded; only the interpretation failed. Save and draw it
+        # before dying, so the "inspect the chevrons" instruction is actionable.
+        if args.plot:
+            print(f"  wrote {plot_rabi_table(exc.table, args.plot)} "
+                  f"(the sweep that failed)")
+        raise
 
     rec = out["operating_point"]
     print("\n=== tune-up result ===")
@@ -1198,6 +1403,9 @@ def main() -> None:
             json.dump({"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
                        "stages": out["stages"]}, fh, indent=2, default=_plain)
         print(f"  written {path}")
+
+    if args.plot:
+        print(f"  wrote {plot_rabi_table(out['stages']['rabi'], args.plot)}")
 
     if args.save_point:
         from snail_solver.operating_points import save_point

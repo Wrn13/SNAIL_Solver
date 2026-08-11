@@ -1325,6 +1325,84 @@ class TestTuneUpShiftFit(unittest.TestCase):
         self.assertAlmostEqual(rescued["delta0"], -0.7, places=6)
 
 
+class TestChevronCentreFit(unittest.TestCase):
+    """Locating a sub-MHz shift on a grid whose step is larger than the shift.
+
+    The centre has to come from the whole lineshape, not from the three points
+    around the argmax -- that is the only reason a shift smaller than one grid step
+    is measurable at all.
+    """
+
+    @staticmethod
+    def _chevron(centre_MHz, hwhm_GHz=4e-3, n_off=13, span_MHz=13.0, n_t=241,
+                 window_ns=300.0):
+        """An ideal two-level chevron: P = (O/Og)^2 sin^2(Og t / 2), Og angular."""
+        off = np.linspace(-span_MHz / 2, span_MHz / 2, n_off) * 1e-3
+        t = np.linspace(0.0, window_ns, n_t)
+        d = off - centre_MHz * 1e-3
+        Og = np.sqrt(hwhm_GHz ** 2 + d ** 2)
+        P = ((hwhm_GHz ** 2 / Og ** 2)[:, None]
+             * np.sin(TWO_PI * Og[:, None] * t[None, :] / 2.0) ** 2)
+        return off, P.max(axis=1)
+
+    def test_recovers_centre_well_inside_one_grid_step(self):
+        from snail_solver.tune_up import fit_chevron_center
+        step = 13.0 / 12
+        for true in (-0.31, -0.65, +0.42):
+            off, m = self._chevron(true)
+            fit = fit_chevron_center(off, m)
+            self.assertTrue(fit["ok"], f"centre {true}")
+            self.assertAlmostEqual(fit["center_GHz"] * 1e3, true, delta=0.05,
+                                   msg=f"centre {true} (grid step {step:.2f} MHz)")
+
+    def test_beats_the_parabolic_vertex_it_replaces(self):
+        """The Lorentzian must be at least as good as the estimator it supersedes."""
+        from snail_solver.tune_up import fit_chevron_center
+        errs_l, errs_v = [], []
+        for true in (-0.31, -0.65, +0.42, -1.08):
+            off, m = self._chevron(true)
+            f = fit_chevron_center(off, m)
+            errs_l.append(abs(f["center_GHz"] * 1e3 - true))
+            errs_v.append(abs(f["vertex_GHz"] * 1e3 - true))
+        self.assertLessEqual(max(errs_l), max(errs_v) + 1e-9)
+
+    def test_recovers_the_linewidth(self):
+        """HWHM is what sizes the next scan, so a wrong one costs a wasted re-measure."""
+        from snail_solver.tune_up import fit_chevron_center
+        off, m = self._chevron(-0.5, hwhm_GHz=4e-3)
+        self.assertAlmostEqual(fit := fit_chevron_center(off, m)["hwhm_GHz"] * 1e3,
+                               4.0, delta=0.2, msg=f"got {fit}")
+
+
+class TestRabiPlot(unittest.TestCase):
+    """The plot must render from a PARTIAL table, since that is when it matters most.
+
+    Every Rabi guard failure tells the user to inspect the chevrons; if the plotter
+    needed a complete table the instruction would be unfollowable.
+    """
+
+    def test_renders_without_a_fit(self):
+        import tempfile
+
+        from snail_solver.tune_up import fit_chevron_center, plot_rabi_table
+        off, m = TestChevronCentreFit._chevron(-0.4)
+        t = np.linspace(0.0, 300.0, 41)
+        P = np.tile(m[:, None], (1, t.size))
+        chev = {"eta": 0.9, "offsets_GHz": off, "metric": m, "P10": P, "times_ns": t,
+                "window_ns": 300.0, "span_MHz": 13.0, "fit": fit_chevron_center(off, m)}
+        table = {"eta": np.array([0.9]), "delta_MHz": np.array([-0.4]),
+                 "target_eta": 0.9, "chevrons": [chev]}      # note: no "fit" key
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_rabi_table(table, os.path.join(d, "r.png"))
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_empty_table_raises_rather_than_writing_a_blank(self):
+        from snail_solver.tune_up import plot_rabi_table
+        with self.assertRaises(ValueError):
+            plot_rabi_table({"eta": np.array([]), "delta_MHz": np.array([]),
+                             "target_eta": 0.9, "chevrons": []}, "unused.png")
+
+
 class TestTuneUpChirpProjection(unittest.TestCase):
     """Projecting the MEASURED shift onto Legendre must generalize the analytic seed."""
 
