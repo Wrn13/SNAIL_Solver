@@ -453,11 +453,16 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
 
     Evaluates the fitted shift along the pulse -- ``|eta(u)| = eta* cos^2(pi u / 2)``
     for a Hann envelope -- and projects delta(u) onto Legendre polynomials by
-    Gauss-Legendre quadrature. Exact, not approximate: delta is a degree-8
-    polynomial in cos(pi u / 2), so a modest node count integrates it to machine
-    precision. Pointwise evaluation needs no deconvolution because the measured
-    curve is the INSTANTANEOUS shift -- the whole reason :func:`rabi_shift_table`
-    uses a constant probe.
+    Gauss-Legendre quadrature. The QUADRATURE is exact regardless of `degree` (a
+    modest node count integrates any of this to machine precision), but delta(u)
+    as a function of u is itself a degree-8 polynomial in cos(pi u / 2) -- so the
+    Legendre series in u does not terminate below ``degree=8``, and the module
+    default of 4 is a TRUNCATION of the already-fit k2/k4 curve, not an added fit.
+    :func:`plot_chirp_ridge` shows this as a small overshoot of the chirp above the
+    measured ridge near |eta| -> 0; pass ``degree=8`` for an exact reconstruction.
+    Pointwise evaluation needs no deconvolution because the measured curve is the
+    INSTANTANEOUS shift -- the whole reason :func:`rabi_shift_table` uses a
+    constant probe.
 
     Generalizes ``stark_chirp.stark_chirp_seed``, which assumes shift proportional
     to |eta|^2 and so only reproduces the tabulated cos^4 shape; with a measured k4
@@ -733,6 +738,85 @@ def plot_rabi_table(table: Dict[str, Any], out: str = "figs/rabi_chevrons.png",
 
     fig.suptitle(title or (rf"Rabi sweep: resonance vs drive, "
                            rf"$\eta^*$ = {table['target_eta']:.2f}"), fontsize=12)
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz: float,
+                     t_g: float, out: str = "figs/chirp_ridge.png",
+                     title: Optional[str] = None) -> str:
+    """Overlay the chirp's actual pump trajectory on the fitted Rabi ridge.
+
+    This is the same picture as Fig. 4 of Qiu et al. 2023 (arXiv:2306.10162): a
+    frequency-modulated drive tracks the amplitude-dependent Stark shift through
+    the pulse, rather than crossing it at one fixed frequency. As the Hann/raised-
+    cosine envelope |eta(t)| rises from 0 to the peak and back down, the chirp's
+    instantaneous frequency traces along ``delta0 + k2|eta|^2 + k4|eta|^4`` almost
+    exactly -- by construction, since that curve is what the chirp was Legendre-
+    projected from (:func:`chirp_from_measured_shift`). A flat, unchirped carrier
+    at the same mean offset is drawn for contrast: the gap that opens up between it
+    and the ridge as |eta(t)| rises is exactly the resonance error a chirp removes.
+
+    This is a DEFINITIONAL check, not an independent measurement -- it shows the
+    calibration is self-consistent, not that the assembled gate actually achieves
+    it. For that, see the shaped-chevron residual in `run_tune_up` step 3, or the
+    ``chirp_ablation`` transfer-probability comparison.
+
+    Past `measured_eta_max` (shaded) the ridge itself is extrapolated past where
+    the Rabi sweep measured it -- the chirp there is tracking a fit, not data.
+
+    Returns
+    -------
+    str
+        The path written.
+    """
+    import os
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from snail_solver.envelope import Chirp, RaisedCosine
+    try:
+        from snail_solver.plot_results import set_literature_style
+        set_literature_style()
+    except Exception:                                        # style is a nicety
+        pass
+
+    eta = np.asarray(table["eta"], dtype=float)
+    ridge = np.asarray(table["delta_MHz"], dtype=float)
+    fit = table["fit"]
+    target_eta = float(proj["target_eta"])
+    measured_eta_max = float(proj.get("measured_eta_max", np.nanmax(eta)))
+
+    ts = np.linspace(0.0, float(t_g), 400)
+    eta_t = np.asarray(RaisedCosine(target_eta, float(t_g)).value_at(ts))
+    chirp_MHz = 1e3 * (float(wp_offset_GHz)
+                       + np.asarray(Chirp(proj["coeffs_GHz"], float(t_g)).detuning(ts))
+                       / TWO_PI)
+    flat_MHz = np.full_like(ts, 1e3 * float(wp_offset_GHz))
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.8), layout="constrained")
+    xs = np.linspace(0.0, float(max(np.nanmax(eta), target_eta)) * 1.05, 300)
+    if target_eta > measured_eta_max:
+        ax.axvspan(measured_eta_max, xs.max(), color=_C_VERTEX, alpha=0.08,
+                  label=f"extrapolated (> |eta|={measured_eta_max:.2f})")
+    ax.plot(xs, fit["delta0"] + fit["k2"] * xs ** 2 + fit["k4"] * xs ** 4,
+           "-", lw=1.6, color=_C_INK, alpha=0.6, label="fitted ridge")
+    ax.plot(eta, ridge, "o", ms=6, color=_C_INK, label="measured ridge")
+    ax.plot(eta_t, chirp_MHz, "-", lw=2.4, color=_C_LORENTZ,
+           label="chirped pump (rides the ridge)")
+    ax.plot(eta_t, flat_MHz, "--", lw=1.8, color=_C_VERTEX,
+           label="flat carrier (same mean offset)")
+    ax.set_xlabel(r"drive strength $|\eta|$")
+    ax.set_ylabel("pump offset (MHz)")
+    ax.set_title(title or (rf"chirp trajectory vs. the Rabi ridge, "
+                          rf"$\eta^*$ = {target_eta:.2f}"), fontsize=11)
+    ax.legend(fontsize=8, framealpha=0.9, loc="best")
+    ax.grid(alpha=0.25)
+
     if os.path.dirname(out):
         os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -1295,7 +1379,12 @@ def main() -> None:
                          "2 subharmonic, 0 static/pump-independent)")
     ap.add_argument("--spec-abs-GHz", type=float, default=None)
     ap.add_argument("--chirp-degree", type=int, default=4,
-                    help="Legendre truncation for the chirp (even terms only matter)")
+                    help="Legendre truncation for the chirp (even terms only matter). "
+                         "delta(u) is an EXACT degree-8 polynomial in cos(pi u/2), so "
+                         "8 reconstructs it exactly with no added noise sensitivity -- "
+                         "the extra terms are algebra on the already-fit k2/k4, not "
+                         "new fit parameters. Below 8, plot_chirp_ridge will show the "
+                         "chirp overshoot the measured ridge near |eta| -> 0")
     ap.add_argument("--window-tg", type=float, default=2.0,
                     help="chevron time window in units of t_g0; ~2 captures a full "
                          "exchange even for the weakest (slowest) drive row")
@@ -1339,6 +1428,11 @@ def main() -> None:
                     help="render every chevron, its envelope fit and the shift curve. "
                          "Written even when the run FAILS its guards -- those errors "
                          "ask you to inspect the chevrons, so they have to be visible")
+    ap.add_argument("--plot-ridge", nargs="?", const="figs/chirp_ridge.png", default=None,
+                    help="overlay the chirp's pump trajectory on the fitted ridge "
+                         "(the Fig. 4 / arXiv:2306.10162 picture -- riding the ridge "
+                         "instead of a flat carrier). Needs a completed run, so this "
+                         "is skipped when the Rabi guards fail")
     ap.add_argument("--save-point", default=None,
                     help="save the result into the device JSON under this name")
     ap.add_argument("--overwrite", action="store_true")
@@ -1412,6 +1506,11 @@ def main() -> None:
 
     if args.plot:
         print(f"  wrote {plot_rabi_table(out['stages']['rabi'], args.plot)}")
+
+    if args.plot_ridge:
+        ridge_path = plot_chirp_ridge(out["stages"]["rabi"], out["stages"]["chirp"],
+                                      rec["wp_offset_GHz"], rec["t_g_ns"], args.plot_ridge)
+        print(f"  wrote {ridge_path}")
 
     if args.save_point:
         from snail_solver.operating_points import save_point

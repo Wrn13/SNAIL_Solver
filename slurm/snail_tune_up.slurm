@@ -101,7 +101,11 @@
 #   WINDOW_TG   chevron time window in SWAPS (window scales as 1/|eta|)   [2.0]
 #   N_TIME      chevron readout times (one solve covers all)          [161]
 #   TG_POINTS   length-scan grid points                              [13]
-#   CHIRP_DEGREE  Legendre truncation (even terms only matter)        [4]
+#   CHIRP_DEGREE  Legendre truncation (even terms only matter). delta(u) is an
+#               EXACT degree-8 polynomial in cos(pi u/2), so 8 reconstructs it
+#               exactly for free (algebra on the already-fit k2/k4, not a new fit);
+#               below that, PLOT_RIDGE will show the chirp overshoot the ridge
+#               near |eta| -> 0                                            [4]
 #   DRAG_BEAT   beat of the process DRAG suppresses, in GHz; enables the
 #               chirp<->DRAG iteration                             [none]
 #   DRAG_N_PUMP pump quanta of that process: 1 one-pump, 2 subharmonic,
@@ -118,6 +122,10 @@
 #   PLOT_OUT    figure path; defaults to its OWN folder per device+eta so
 #               fanned-out runs never overwrite each other's plot
 #                                          [figs/tuneup_<dev>_eta<target_eta>/rabi_chevrons.png]
+#   PLOT_RIDGE  set to 0 to skip the chirp-vs-ridge overlay (Fig. 4 /
+#               arXiv:2306.10162 picture)                                  [1]
+#   PLOT_RIDGE_OUT  figure path, same per-run folder as PLOT_OUT by default
+#                                             [figs/tuneup_<dev>_eta<target_eta>/chirp_ridge.png]
 #   SAVE_POINT  save the result into the device JSON under this name  [none]
 #   OVERWRITE   set to 1 to replace an existing SAVE_POINT             [0]
 #   LAUNCHER / CODE_DIR   as in snail_sweep.slurm (CODE_DIR = repo root)
@@ -166,6 +174,8 @@ PLOT="${PLOT:-1}"
 # already keeps fanned-out runs (e.g. from submit_tune_up.sh) from clobbering each
 # other's figure.
 PLOT_OUT="${PLOT_OUT:-figs/tuneup_${DEVICE%.json}_eta${TARGET_ETA}/rabi_chevrons.png}"
+PLOT_RIDGE="${PLOT_RIDGE:-1}"
+PLOT_RIDGE_OUT="${PLOT_RIDGE_OUT:-figs/tuneup_${DEVICE%.json}_eta${TARGET_ETA}/chirp_ridge.png}"
 
 OPTS=""
 [ -n "${SPEC_ABS:-}"       ] && OPTS="${OPTS} --spec-abs-GHz ${SPEC_ABS}"
@@ -174,6 +184,7 @@ OPTS=""
 [ -n "${COUPLER_LEVELS:-}" ] && OPTS="${OPTS} --coupler-levels ${COUPLER_LEVELS}"
 [ "${SKIP_TIME_RABI:-0}" = "1" ] && OPTS="${OPTS} --skip-time-rabi"
 [ "${PLOT}" = "1"          ] && OPTS="${OPTS} --plot ${PLOT_OUT}"
+[ "${PLOT_RIDGE}" = "1"    ] && OPTS="${OPTS} --plot-ridge ${PLOT_RIDGE_OUT}"
 [ -n "${SAVE_POINT:-}"     ] && OPTS="${OPTS} --save-point ${SAVE_POINT}"
 [ "${OVERWRITE:-0}" = "1" ] && OPTS="${OPTS} --overwrite"
 
