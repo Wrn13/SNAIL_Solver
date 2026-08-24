@@ -27,8 +27,13 @@
 #                      vs drive strength and fit its power law (4 = 'DRAG only adds
 #                      drive', already covered by the chirp)               [0=off]
 #   SPEC_ABS     absolute spectator frequency                           [none]
+#   PLOT         set to 0 to skip rendering the Rabi sweep                 [1]
 #   CPUS         --cpus-per-task                                          [16]
 #   DRY          set to 1 to print the sbatch commands without submitting
+#
+# Each (device, target_eta) combination gets its OWN figure --
+# figs/tuneup_<device>_eta<value>/rabi_chevrons.png -- so a multi-eta fan-out never
+# has one run's plot overwrite another's.
 set -euo pipefail
 
 DEVICES="${DEVICES:-1Gate4.2SNAIL.json,2Gate4.9SNAIL.json,evan_device.json}"
@@ -41,7 +46,7 @@ cd "${HERE}"
 PASS=""
 for V in AMP_POINTS WP_POINTS WP_SPAN SPAN_LINEWIDTHS TG_POINTS WINDOW_TG N_TIME \
          CHIRP_DEGREE MAX_DRAG_ITERS DRAG_SHIFT_POINTS COUPLER_LEVELS \
-         DRAG_BEAT DRAG_N_PUMP SPEC_ABS; do
+         DRAG_BEAT DRAG_N_PUMP SPEC_ABS PLOT ETA_LO ETA_HI; do
   [ -n "${!V:-}" ] && PASS="${PASS} ${V}=${!V}"
 done
 
@@ -61,18 +66,20 @@ for DEV in "${DEVLIST[@]}"; do
     TAG="${DEV%.json}_eta${ETA}"
     POINT="${SAVE_POINT}"
     [ "${MULTI}" = 1 ] && POINT="${SAVE_POINT}_eta${ETA}"
+    PLOT_OUT="figs/tuneup_${TAG}/rabi_chevrons.png"
 
     if [ "${DRY:-0}" = "1" ]; then
-      echo "DEVICE=${DEV} TARGET_ETA=${ETA} SAVE_POINT=${POINT} OVERWRITE=1${PASS} \\"
+      echo "DEVICE=${DEV} TARGET_ETA=${ETA} SAVE_POINT=${POINT} OVERWRITE=1" \
+           "PLOT_OUT=${PLOT_OUT}${PASS} \\"
       echo "    sbatch --job-name=tu_${TAG} --cpus-per-task=${CPUS} slurm/snail_tune_up.slurm"
       continue
     fi
 
     JID=$(env DEVICE="${DEV}" TARGET_ETA="${ETA}" SAVE_POINT="${POINT}" OVERWRITE=1 \
-               OUT="tuneup_${TAG}.json" ${PASS} \
+               OUT="tuneup_${TAG}.json" PLOT_OUT="${PLOT_OUT}" ${PASS} \
           sbatch --parsable --job-name="tu_${TAG}" --cpus-per-task="${CPUS}" \
                  slurm/snail_tune_up.slurm)
-    echo "${DEV} @ eta*=${ETA}: job ${JID} -> point '${POINT}'"
+    echo "${DEV} @ eta*=${ETA}: job ${JID} -> point '${POINT}', plot '${PLOT_OUT}'"
     IDS="${IDS:+${IDS},}${JID}"
   done
 done
@@ -87,6 +94,7 @@ submitted: ${IDS}
 when they finish:
   uv run python -m snail_solver.operating_points --device <dev>   # list saved points
   cat results/tuneup_<dev>_eta<value>.json                        # full per-stage data
+  open figs/tuneup_<dev>_eta<value>/rabi_chevrons.png              # every chevron + fit
 
 then run the gate at a chosen point, e.g.
   ./slurm/submit_sweep.sh spectator tuned_v1 -- --sweep spectator \\

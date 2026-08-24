@@ -114,6 +114,10 @@
 #   SKIP_TIME_RABI  set to 1 to skip the constant-drive cross-check    [0]
 #   JOBS        parallel workers (default: --cpus-per-task)
 #   OUT         JSON path for the full record + per-stage data  [tuneup_<dev>.json]
+#   PLOT        set to 0 to skip rendering the Rabi sweep                  [1]
+#   PLOT_OUT    figure path; defaults to its OWN folder per device+eta so
+#               fanned-out runs never overwrite each other's plot
+#                                          [figs/tuneup_<dev>_eta<target_eta>/rabi_chevrons.png]
 #   SAVE_POINT  save the result into the device JSON under this name  [none]
 #   OVERWRITE   set to 1 to replace an existing SAVE_POINT             [0]
 #   LAUNCHER / CODE_DIR   as in snail_sweep.slurm (CODE_DIR = repo root)
@@ -157,6 +161,11 @@ DRAG_N_PUMP="${DRAG_N_PUMP:-1}"
 MAX_DRAG_ITERS="${MAX_DRAG_ITERS:-4}"
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-1}}"
 OUT="${OUT:-tuneup_${DEVICE%.json}.json}"
+PLOT="${PLOT:-1}"
+# Own folder per device+eta, so DEVICE/TARGET_ETA alone -- with no other override --
+# already keeps fanned-out runs (e.g. from submit_tune_up.sh) from clobbering each
+# other's figure.
+PLOT_OUT="${PLOT_OUT:-figs/tuneup_${DEVICE%.json}_eta${TARGET_ETA}/rabi_chevrons.png}"
 
 OPTS=""
 [ -n "${SPEC_ABS:-}"       ] && OPTS="${OPTS} --spec-abs-GHz ${SPEC_ABS}"
@@ -164,6 +173,7 @@ OPTS=""
 [ -n "${DRAG_BEAT:-}"      ] && OPTS="${OPTS} --drag-beat-GHz ${DRAG_BEAT}"
 [ -n "${COUPLER_LEVELS:-}" ] && OPTS="${OPTS} --coupler-levels ${COUPLER_LEVELS}"
 [ "${SKIP_TIME_RABI:-0}" = "1" ] && OPTS="${OPTS} --skip-time-rabi"
+[ "${PLOT}" = "1"          ] && OPTS="${OPTS} --plot ${PLOT_OUT}"
 [ -n "${SAVE_POINT:-}"     ] && OPTS="${OPTS} --save-point ${SAVE_POINT}"
 [ "${OVERWRITE:-0}" = "1" ] && OPTS="${OPTS} --overwrite"
 
