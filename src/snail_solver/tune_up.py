@@ -14,54 +14,52 @@ rather than the (offset, amp_scale) grid in ``calibration_map``:
 5. **DRAG** shifts the detuning, so calibrate it separately -- and iterate, because
    the chirp and DRAG are mutually coupled (see `run_tune_up`).
 
-Two things about step 1 that are easy to get wrong, and were
-------------------------------------------------------------
-**It has to be a chevron.** Reading the resonance off a fixed-length
-(offset, amp_scale) map does not work: raising the amplitude over-rotates the gate,
-and an over-rotated pulse transfers most population slightly OFF resonance, because
-detuning is what removes the excess rotation. The per-row argmax then tracks
-rotation-angle error rather than the Stark shift, and the two are indistinguishable
-in the output. On evan_device, with the EXACT solver, that failure showed up as peak
-transfer falling 0.76 -> 0.23 across the amplitude window, a ridge railed against the
-scan edge, and r2 = 0.58. A chevron scans TIME as well, so full contrast is reached
-on resonance at any amplitude -- and its window must scale as 1/|eta| so every row
-runs the same number of swaps rather than the same number of nanoseconds.
+Two things about step 1 that are easy to get wrong
+----------------------------------------------------
+**It has to be a chevron, not a calibration-map slice.** At fixed gate length,
+raising the amplitude over-rotates the gate, and an over-rotated pulse transfers most
+population slightly OFF resonance (detuning is what removes the excess rotation). So
+a fixed-length map's per-row argmax tracks rotation-angle error, not the Stark shift
+-- on evan_device this cost peak transfer 0.76 -> 0.23 across the amplitude window, a
+railed ridge, and r2 = 0.58, even with the exact solver. A chevron avoids this because
+it scans TIME too: full contrast is reached on resonance at any amplitude. Its window
+must scale as 1/|eta| so every row gets the same number of swaps, not nanoseconds.
 
 **Not all of the measured offset is a Stark shift.** The ridge splits into a static
-part that survives at zero drive -- from the static Hamiltonian, a pure carrier
-retune -- and the drive-dependent part. Only the second has a shape along the pulse,
-so only the second belongs in the chirp; see :func:`fit_shift_curve`. On evan_device
-the static part is the bulk of it.
+part that survives at zero drive (from the static Hamiltonian -- a pure carrier
+retune) and a drive-dependent part. Only the drive-dependent part has a shape along
+the pulse, so only it belongs in the chirp (:func:`fit_shift_curve`). On evan_device
+the static part is the bulk of the signal.
 
 Why fix the amplitude (the reason this ordering exists)
--------------------------------------------------------
+---------------------------------------------------------
 At fixed peak |eta| the envelope in normalized gate time u = 2t/t_g - 1 is
 ``|eta(u)| = eta* cos^2(pi u / 2)`` -- **independent of t_g**. So the Stark shift
-delta(u) = f(|eta(u)|), and therefore the chirp coefficients, are t_g-independent too.
-Fixing the amplitude DECOUPLES the frequency calibration from the length calibration,
-which is what makes "length is the only remaining free parameter" literally true.
+delta(u) and the chirp coefficients are t_g-independent too, which decouples the
+frequency calibration from the length calibration and makes "length is the only
+remaining free parameter" literally true.
 
-Under the fixed-t_g / scan-amp_scale ordering the two fight each other: changing
-amp_scale changes |eta|, which changes the Stark shift, which changes the required
-offset -- exactly the feedback ``calibration_map``'s docstring blames for making
-alternating 1-D scans rail.
+The alternative ordering -- fixed t_g, scan amp_scale -- doesn't have this property:
+changing amp_scale changes |eta|, which changes the Stark shift, which changes the
+required offset. That's the feedback ``calibration_map``'s docstring blames for
+making alternating 1-D scans rail.
 
 The amplitude/length algebra
 ----------------------------
 ``set_pump(normalize_iswap=...)`` holds the pulse AREA at A = (pi/2)/(6 g3 la lb),
-which is independent of t_g, so a Hann pulse has ``peak_eta = 2A/t_g``. Hence::
+independent of t_g, so a Hann pulse has ``peak_eta = 2A/t_g``. Hence::
 
     amp_scale(t_g) = eta* t_g / (2A)      # holds |eta| fixed as t_g varies
     t_g0           = 2A / eta*            # = device_utils.auto_t_g; amp_scale == 1 here
 
-The rotation angle goes as the area = amp x t_g, so at fixed |eta| it is proportional
-to t_g and a full iSWAP sits near t_g0. **The fitted length is the empirical
-correction to** ``auto_t_g``, exactly as ``amp_scale`` is the empirical correction to
-the analytic amplitude in the other ordering.
+Rotation angle goes as area = amp x t_g, so at fixed |eta| it's proportional to t_g,
+and a full iSWAP sits near t_g0. The fitted length is the empirical correction to
+``auto_t_g``, just as ``amp_scale`` is the empirical correction to the analytic
+amplitude in the other ordering.
 
-Watch the direction: **a LONGER t_g needs a LARGER amp_scale**. The normalizer shrinks
-the amplitude as 1/t_g to hold the area, so holding the peak means scaling back up.
-Inverting this still produces a smooth curve with a maximum, so it is unit-tested.
+Watch the direction: a LONGER t_g needs a LARGER amp_scale (the normalizer shrinks
+amplitude as 1/t_g to hold the area, so holding the peak means scaling back up).
+Inverting this still produces a smooth curve with a maximum, so it's unit-tested.
 
 CLI
 ---
@@ -139,27 +137,23 @@ def fit_shift_curve(eta: np.ndarray, delta_MHz: np.ndarray,
                     fit_static: bool = True) -> Dict[str, Any]:
     """Fit delta(|eta|) = delta0 + k2 |eta|^2 + k4 |eta|^4 and split it in two.
 
-    The measured resonance offset has two physically distinct parts, and separating
-    them is the point of this fit:
-
     * ``delta0`` -- the offset that survives at ZERO drive. It comes from the static
-      Hamiltonian (qutrit anharmonicity, coupler dressing), not from the pump, so it
-      is a correction to the bare resonance |w_b - w_a| and belongs entirely in
-      ``wp_offset_GHz``. A chirp must NOT track it: a constant chirp is exactly a
+      Hamiltonian (qutrit anharmonicity, coupler dressing), not the pump, so it's a
+      correction to the bare resonance |w_b - w_a| and belongs entirely in
+      ``wp_offset_GHz``. A chirp must not track it -- a constant chirp is just a
       retuned carrier, so putting it there would double-count.
-    * ``k2``, ``k4`` -- the drive-dependent AC-Stark shift. This is the part that
-      varies along the pulse, and therefore the ONLY part the chirp can correct.
+    * ``k2``, ``k4`` -- the drive-dependent AC-Stark shift, the part that varies
+      along the pulse and so the only part the chirp can correct.
 
-    Measured on evan_device the static part dominates: the ridge sits near -0.7 MHz
-    and barely moves across the amplitude window. Forcing the curve through the origin
-    then charges that constant to the Stark terms, which inflates them and produces a
-    large, confident, wrong chirp -- and because the fit is poor the r2 guard fires,
-    so the failure is loud rather than silent. Set ``fit_static=False`` only when the
+    On evan_device the static part dominates (ridge near -0.7 MHz, barely moving
+    with drive). Forcing the curve through the origin would charge that constant to
+    the Stark terms, inflating them into a confident, wrong chirp -- caught by the
+    r2 guard, since the fit is then poor. Set ``fit_static=False`` only when the
     probe is known to have no static offset.
 
-    Even powers only, because the shift depends on drive intensity and not on sign;
-    the chirp needs delta down to |eta| = 0, which is extrapolation, and an
-    unconstrained interpolant would invent structure there.
+    Even powers only: the shift depends on drive intensity, not sign, and the chirp
+    needs delta down to |eta| = 0 (extrapolation), where an unconstrained interpolant
+    would invent structure.
 
     Parameters
     ----------
@@ -168,7 +162,7 @@ def fit_shift_curve(eta: np.ndarray, delta_MHz: np.ndarray,
     delta_MHz : ndarray
         Measured resonance offset per row (MHz). NaNs are dropped.
     weights : ndarray, optional
-        Per-row weight; pass the chevron contrast, since low-drive rows have the
+        Per-row weight; pass the chevron contrast -- low-drive rows have the
         broadest peaks and hence the noisiest ridge.
     fit_static : bool, default True
         Include the drive-independent term.
@@ -178,8 +172,8 @@ def fit_shift_curve(eta: np.ndarray, delta_MHz: np.ndarray,
     dict
         ``delta0`` (MHz), ``k2``, ``k4`` (MHz per |eta|^2 / ^4), ``r2``, ``n_used``,
         ``resid_MHz``, ``stark_span_MHz`` (how much the DRIVE-DEPENDENT part moves
-        across the measured window -- if this is at the resolution limit there is no
-        chirp to build).
+        across the measured window -- at the resolution limit there's no chirp to
+        build).
     """
     eta = np.asarray(eta, dtype=float)
     y = np.asarray(delta_MHz, dtype=float)
@@ -209,16 +203,16 @@ def fit_shift_curve(eta: np.ndarray, delta_MHz: np.ndarray,
 def fit_chevron_center(offsets_GHz: np.ndarray, metric: np.ndarray) -> Dict[str, Any]:
     """Resonance offset of a constant-drive chevron, by fitting its ANALYTIC envelope.
 
-    For a two-level exchange at Rabi rate Omega and detuning d, the maximum transfer
-    over time is the Lorentzian ``Omega^2 / (Omega^2 + d^2)``. Fitting that whole
-    shape, rather than refining a parabola through the three points around the argmax,
-    is what makes a SUB-MHz shift measurable on a grid whose step is larger than the
-    shift itself: every offset constrains the centre, so the precision comes from the
-    fit rather than from the grid.
+    For a two-level exchange at Rabi rate Omega and detuning d, peak transfer over
+    time is the Lorentzian ``Omega^2 / (Omega^2 + d^2)``. Fitting that whole shape --
+    rather than a parabola through the three points around the argmax -- is what
+    makes a SUB-MHz shift measurable on a grid whose step is larger than the shift
+    itself: every offset constrains the centre, so precision comes from the fit, not
+    the grid.
 
-    ``find_stark_resonance.locate_resonance`` keeps the parabolic estimator, which is
-    the right tool for the broad, strongly-peaked chevrons it is used on. It is
-    returned here as ``vertex_GHz`` so the two can be compared.
+    ``find_stark_resonance.locate_resonance`` keeps the parabolic estimator, the
+    right tool for the broad, strongly-peaked chevrons it's used on; returned here
+    as ``vertex_GHz`` so the two can be compared.
 
     Returns
     -------
@@ -274,58 +268,45 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     """Step 1: measure the resonant pump offset as a function of drive strength.
 
     One CONSTANT-amplitude chevron per drive strength: at each |eta| the pump
-    frequency is scanned and the population is read out over TIME, and the resonance
-    is the offset of maximum Rabi contrast.
+    frequency is scanned and the population read out over TIME, and the resonance
+    is the offset of maximum Rabi contrast. See the module docstring for why this
+    has to be a chevron rather than a fixed-length calibration-map slice.
 
-    Why a chevron rather than a slice of the (offset, amp_scale) calibration map.
-    The map scores one fixed gate length, so raising the amplitude over-rotates the
-    gate -- and an over-rotated pulse transfers MOST population slightly off
-    resonance, because detuning is what removes the excess rotation. Its per-row
-    argmax therefore tracks rotation-angle error, not the Stark shift, and the two
-    are indistinguishable in the result. Measured on this device that failure is not
-    subtle: peak transfer fell 0.76 -> 0.23 across the amplitude window, the ridge
-    railed against the scan edge, and the fit came back at r2 = 0.58 -- with the
-    EXACT solver, so it is a defect of the experiment and not of an engine.
+    The constant probe measures the INSTANTANEOUS shift delta(|eta|), exactly what
+    the chirp needs -- a shaped-pulse ridge would give the pulse average instead,
+    which would need deconvolving. It's also blind to DRAG (d eta/dt = 0), so
+    `drag_beat_GHz` here only reaches the shaped cross-check in
+    `calibrate_drag_offset`.
 
-    A chevron is immune because it scans time as well: full contrast is reached at
-    resonance for ANY amplitude, only sooner or later. This is also what the
-    corresponding hardware experiment does, and why it is a chevron there too.
+    Every point is an exact ``sesolve`` trajectory covering all times, so the whole
+    table costs ``amp_points * wp_points`` solves with no reduced-model
+    approximation to validate.
 
-    The constant probe measures the INSTANTANEOUS shift delta(|eta|), which is
-    exactly what the chirp needs -- a shaped-pulse ridge would instead return the
-    pulse-average, and rebuilding delta(u) from an average requires deconvolving the
-    envelope. It is also blind to DRAG (d eta/dt = 0), so `drag_beat_GHz` here only
-    reaches the shaped cross-check in `calibrate_drag_offset`.
-
-    Every point is an exact ``sesolve`` trajectory -- one solve covers all times --
-    so the whole table costs ``amp_points * wp_points`` solves and there is no
-    reduced-model approximation left to validate.
-
-    The offset span is per-row and ADAPTIVE, for the same reason the time window is.
-    A chevron's linewidth IS the exchange rate, ``Omega ~ 1 / (2 t_g(|eta|))``, so it
-    grows with the drive: a span that resolves the weakest row leaves the strongest
-    one's wings unsampled, and the Lorentzian centre is then unconstrained. Each row
-    starts at ``span_linewidths`` estimated linewidths and re-measures wider whenever
-    the fitted width comes back too large for its own window -- the estimate is only
-    leading order, and measured widths ran ~2-4x above it.
+    The offset span and the time window are both ADAPTIVE per row: a chevron's
+    linewidth is the exchange rate, ``Omega ~ 1 / (2 t_g(|eta|))``, which grows with
+    drive. A span sized for the weakest row would leave the strongest row's wings
+    unsampled; a window fixed in ns would give each row a different number of swaps.
+    Each row starts at ``span_linewidths`` estimated linewidths and re-measures wider
+    if the fitted width comes back too large for its own window (measured widths ran
+    ~2-4x above the leading-order estimate).
 
     Parameters
     ----------
     eta_lo, eta_hi : float
         Amplitude window as a FRACTION of `target_eta`. `eta_hi` defaults to 1.0
-        because the pulse never exceeds its own peak: sampling above eta* adds no
-        information the chirp can use, and a CONSTANT probe held above the operating
-        drive is exactly where the chevron stops being a two-level feature.
+        because the pulse never exceeds its own peak, and a constant probe held
+        above the operating drive is exactly where the chevron stops being a
+        two-level feature.
     wp_span_MHz : float, optional
-        Fixed offset span for every row. Leave as None to size each row from its own
-        linewidth, which is almost always what you want.
+        Fixed offset span for every row. Leave as None to size each row from its
+        own linewidth, which is almost always what you want.
     span_linewidths : float
         Half-span in estimated linewidths when `wp_span_MHz` is None.
     window_tg : float
-        Chevron time window in SWAPS, not in ns: each row runs for
+        Chevron time window in SWAPS, not ns: each row runs for
         ``window_tg * nominal_t_g(|eta|)``, so every drive strength gets the same
-        number of exchange periods. ~2 gives a clean contrast peak without holding a
-        strong drive long enough to leak.
+        number of exchange periods. ~2 gives a clean contrast peak without holding
+        a strong drive long enough to leak.
     r2_min : float
         Refuse to return a curve whose fit is worse than this -- a railed or
         artefact-tracking ridge yields a plausible-looking wrong chirp.
@@ -354,14 +335,8 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     spans = np.full(eta.size, np.nan)
     chevrons = []
     for i, e in enumerate(eta):
-        # The window scales with the drive, because the exchange rate does. A window
-        # fixed in ns would give every row a different number of swaps: the weakest
-        # would never complete one (no contrast to locate a resonance with) and the
-        # strongest would be held far past its swap, accumulating leakage until the
-        # chevron stops being a two-level feature at all. Measured with a fixed
-        # window, contrast fell 0.54 -> 0.27 across the amplitude range and the
-        # strongest row's "resonance" moved by 4 MHz. At |eta| the full-swap time is
-        # nominal_t_g(|eta|), so this gives every row the same ~window_tg swaps.
+        # Window scales with drive: fixed in ns, the weakest row would never complete
+        # a swap and the strongest would sit in leakage. window_tg swaps per row.
         window_ns = float(window_tg) * nominal_t_g(config, float(e))
         span = (float(wp_span_MHz) if wp_span_MHz is not None
                 else 2.0 * float(span_linewidths) * linewidth_MHz(e))
@@ -375,13 +350,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                             drag_n_pump=drag_n_pump, eta_op=float(e))
             m = np.asarray(chev["resonance_metric"], dtype=float)
             cen = fit_chevron_center(chev["offsets_GHz"], m)
-            # Widen ONLY when the width itself is unconstrained -- a linewidth
-            # comparable to the window means the wings were never sampled, so the
-            # centre is an extrapolation. A fit rejected for any OTHER reason (bad
-            # rmse) means the lineshape is not Lorentzian, and no amount of widening
-            # repairs that: it is leakage destroying the two-level chevron, which the
-            # contrast floor below catches. Retrying such a row cost two futile
-            # widenings out to +/-251 MHz before this distinction existed.
+            # Widen only when the width itself is unconstrained (wings never sampled).
+            # A bad-rmse rejection instead means leakage broke the two-level chevron
+            # -- the contrast floor below catches that -- so widening won't help.
             if (cen["hwhm_GHz"] * 1e3 <= 0.4 * span or wp_span_MHz is not None
                     or attempt == 2):
                 break
@@ -394,13 +365,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
         windows[i] = window_ns
         spans[i] = span
         contrast[i] = float(np.nanmax(m) - np.nanmin(m))
-        # A chevron with no contrast is not a resonance measurement. At strong drive
-        # the exchange can lose population to leakage faster than it swaps, and what
-        # is left is not a two-level feature at all -- measured on evan_device, the
-        # |eta| = 1.94 row came back at contrast 0.215 and put its "resonance" 14 MHz
-        # away from both neighbours. Drop it here, with a reason, rather than letting
-        # one such row set k2 and k4 for the whole chirp; `fit_shift_curve` ignores
-        # NaNs, so the curve is still fitted from the rows that mean something.
+        # No contrast means no resonance: at strong drive leakage can outpace the
+        # exchange, and one such row would otherwise set k2, k4 for the whole chirp.
+        # fit_shift_curve ignores NaNs, so dropping it here is enough.
         if contrast[i] < contrast_min:
             ridge[i] = np.nan
             if logger:
@@ -485,47 +452,43 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
     """Step 2: project the measured shift onto the Legendre chirp basis.
 
     Evaluates the fitted shift along the pulse -- ``|eta(u)| = eta* cos^2(pi u / 2)``
-    for a Hann envelope -- and projects the resulting delta(u) onto Legendre
-    polynomials by Gauss-Legendre quadrature. Exact, not approximate: delta is a
-    degree-8 polynomial in cos(pi u / 2), so a modest node count integrates it to
-    machine precision.
+    for a Hann envelope -- and projects delta(u) onto Legendre polynomials by
+    Gauss-Legendre quadrature. Exact, not approximate: delta is a degree-8
+    polynomial in cos(pi u / 2), so a modest node count integrates it to machine
+    precision. Pointwise evaluation needs no deconvolution because the measured
+    curve is the INSTANTANEOUS shift -- the whole reason :func:`rabi_shift_table`
+    uses a constant probe.
 
-    The measured curve is the INSTANTANEOUS shift (a constant probe has no envelope
-    to average over), so it can be evaluated pointwise along the pulse with no
-    deconvolution. That is the whole reason :func:`rabi_shift_table` uses a constant
-    probe.
+    Generalizes ``stark_chirp.stark_chirp_seed``, which assumes shift proportional
+    to |eta|^2 and so only reproduces the tabulated cos^4 shape; with a measured k4
+    the cos^8 content is captured too (``rel_diff`` reports how much that's worth).
 
-    This generalizes ``stark_chirp.stark_chirp_seed``, which assumes the shift is
-    exactly proportional to |eta|^2 and therefore reproduces only the tabulated cos^4
-    shape. With a measured k4 the cos^8 content is captured too; ``rel_diff`` in the
-    result reports how much that is worth.
-
-    DRAG, and why this is a fixed point rather than a formula
-    --------------------------------------------------------
+    DRAG is a fixed point, not a formula
+    -------------------------------------
     DRAG adds a quadrature ``q(t) = (d eta/dt) / Delta(t)``, so the drive the qubit
-    actually sees has ``|eta_tot|^2 = |eta|^2 + q^2`` -- and the Stark shift follows
-    the TOTAL drive. Meanwhile ``Delta(t) = Delta_0 - k delta(t)`` moves with the very
-    chirp being computed. Each therefore depends on the other, and the pair is solved
-    by iteration to a fixed point instead of in one pass.
+    sees is ``|eta_tot|^2 = |eta|^2 + q^2`` and the Stark shift follows the TOTAL
+    drive. But ``Delta(t) = Delta_0 - k delta(t)`` moves with the chirp being
+    computed, so each depends on the other -- solved by iterating to a fixed point.
 
-    Two consequences worth stating plainly:
-
-    * The quadrature is measured, not assumed: k2 and k4 come from the constant-probe
-      sweep, and the same shift law is evaluated at the larger total amplitude. The
-      constant probe's blindness to DRAG (d eta/dt = 0) is therefore not a gap --
-      it measures delta as a function of drive, and DRAG only changes the drive.
-    * ``q`` scales as 1/t_g, so with DRAG on the chirp is NO LONGER independent of
-      the gate length. The decoupling that makes length the only free parameter is a
-      DRAG-off statement; with DRAG on, the length and the chirp must be re-solved
-      together, which is what ``run_tune_up``'s outer loop does.
+    * The quadrature is measured, not assumed: k2, k4 come from the constant-probe
+      sweep, evaluated here at the larger total amplitude. The probe's blindness to
+      DRAG (d eta/dt = 0) isn't a gap -- it measures delta vs drive, and DRAG only
+      adds drive.
+    * ``q`` scales as 1/t_g, so with DRAG on the chirp is no longer length-
+      independent. The length/chirp decoupling is a DRAG-off statement; with DRAG
+      on, the two are re-solved together by ``run_tune_up``'s outer loop.
 
     Returns
     -------
     dict
         ``coeffs_GHz`` (length degree+1, c_0 = 0 when pinned), ``mean_shift_GHz``,
         ``rel_diff`` vs the pure-|eta|^2 analytic seed, ``quartic_fraction``,
-        and with DRAG on ``drag_iters``, ``drag_delta_frac`` (how much of the shift
-        the quadrature adds) and ``min_abs_detuning_GHz``.
+        ``measured_eta_max`` and ``extrapolation_ratio`` (target_eta over the
+        largest |eta| the Rabi sweep actually measured -- 1 means pure
+        interpolation; well above 1 means the chirp's peak is built from a
+        polynomial extrapolated past where it was fitted), and with DRAG on
+        ``drag_iters``, ``drag_delta_frac`` (how much of the shift the quadrature
+        adds) and ``min_abs_detuning_GHz``.
     """
     from numpy.polynomial import legendre as L
     from snail_solver import stark_chirp as SC
@@ -533,6 +496,18 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
     fit = table["fit"]
     eta_star = float(target_eta if target_eta is not None else table["target_eta"])
     k2, k4 = float(fit["k2"]), float(fit["k4"])
+    # eta_star can exceed the eta the Rabi sweep actually measured (see eta_hi in
+    # rabi_shift_table): the chevron diagnostic must stay in the weakly-nonlinear
+    # regime, but the chirp built from its fit is free to be evaluated at a higher
+    # drive. Past the measured window that's an EXTRAPOLATION of a low-order
+    # polynomial into a regime the fit never saw -- worth flagging, not silently
+    # trusting, since it's exactly where the perturbative eta^2+eta^4 model is also
+    # least likely to hold.
+    measured_eta = table.get("eta")
+    measured_eta_max = (float(np.nanmax(np.asarray(measured_eta, dtype=float)))
+                        if measured_eta is not None else float("nan"))
+    extrapolation_ratio = (eta_star / measured_eta_max
+                           if measured_eta_max > 0 else float("nan"))
 
     n_quad = max(2 * int(degree) + 8, 32)
     u, w = np.polynomial.legendre.leggauss(n_quad)
@@ -599,7 +574,9 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
             "stark_mean_GHz": stark_mean_GHz,
             "static_GHz": float(fit.get("delta0", 0.0)) * 1e-3,
             "rel_diff": rel_diff, "quartic_fraction": float(quartic), **extra,
-            "degree": int(degree), "target_eta": eta_star}
+            "degree": int(degree), "target_eta": eta_star,
+            "measured_eta_max": measured_eta_max,
+            "extrapolation_ratio": extrapolation_ratio}
 
 
 # ===========================================================================
@@ -619,29 +596,24 @@ def plot_rabi_table(table: Dict[str, Any], out: str = "figs/rabi_chevrons.png",
     """Render the Rabi sweep: every chevron, its envelope fit, and the shift curve.
 
     One row per drive strength, left to right: the raw chevron; the Rabi oscillation
-    on resonance and one linewidth off it; and the max-over-time envelope with the
-    Lorentzian that was fitted to it. The bottom panel is the result: the located
-    resonance versus |eta|, with the ``delta0 + k2|eta|^2 + k4|eta|^4`` curve through
-    it.
+    on resonance and one linewidth off it; and the max-over-time envelope with its
+    fitted Lorentzian. The bottom panel is the result: located resonance vs |eta|,
+    with the ``delta0 + k2|eta|^2 + k4|eta|^4`` curve through it.
 
-    The middle column is the measurement in its rawest form. Detuning speeds the
-    oscillation up and shrinks its amplitude -- ``Omega_eff = sqrt(Omega^2 + d^2)``
-    with peak ``Omega^2/Omega_eff^2`` -- and it is the peak of that envelope, over
-    all offsets, that the right-hand column fits. Seeing the two together is the
-    point: if the on-resonance trace does not reach 1 and come back, the chevron has
-    no well-defined centre no matter how good the Lorentzian looks.
+    The middle column is the measurement in its rawest form -- detuning speeds the
+    oscillation up and shrinks it (``Omega_eff = sqrt(Omega^2 + d^2)``, peak
+    ``Omega^2/Omega_eff^2``), and the right column fits the peak of that envelope
+    over all offsets. If the on-resonance trace doesn't reach 1 and come back, the
+    chevron has no well-defined centre no matter how good the Lorentzian looks.
 
-    The two resonance estimators are drawn TOGETHER on every envelope, because their
-    disagreement is the diagnostic. On a clean two-level chevron the Lorentzian
-    centre and the parabolic vertex land on top of each other; when they separate by
-    more than the shift being measured, the lineshape is not
-    ``Omega^2/(Omega^2 + delta^2)`` and no amount of fitting will recover a
-    resonance. That is exactly what happens at strong drive on these devices, and it
-    is visible at a glance here in a way it is not in the log.
+    The Lorentzian centre and parabolic vertex are drawn together on every envelope
+    because their disagreement is the diagnostic: on a clean two-level chevron they
+    coincide, and when they separate by more than the shift being measured, the
+    lineshape isn't ``Omega^2/(Omega^2 + delta^2)`` and no fit recovers a resonance
+    -- which is exactly what happens at strong drive on these devices.
 
     Accepts a full table or the partial one carried by :class:`RabiFitError`, so a
-    sweep that failed its guards can still be looked at -- which is what those error
-    messages ask the user to do.
+    sweep that failed its guards can still be inspected.
 
     Returns
     -------
@@ -1070,19 +1042,17 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         4.  length via the shaped scan                  -> t_g_ns
         --- with DRAG, iterate 2-4 to self-consistency ---
 
-    The Rabi sweep runs ONCE. It measures delta as a function of drive strength, and
-    that law is a property of the device, not of the pulse -- so the chirp, DRAG's
-    quadrature and the length are all derived from it without re-measuring.
+    The Rabi sweep runs ONCE: it measures a property of the device, not of the pulse,
+    so the chirp, DRAG's quadrature and the length are all derived from it without
+    re-measuring.
 
-    Why steps 2-4 must be iterated when DRAG is on. DRAG adds a quadrature
-    ``(d eta/dt)/Delta(t)`` to the drive, which raises the total amplitude and hence
-    the Stark shift; the chirp built from that shift then moves ``Delta(t)`` itself.
-    That inner fixed point is solved analytically inside
+    Why steps 2-4 iterate when DRAG is on. DRAG's quadrature raises the total drive
+    and hence the Stark shift; the chirp built from that shift then moves
+    ``Delta(t)`` itself. That inner fixed point is solved analytically inside
     :func:`chirp_from_measured_shift`. But the quadrature also scales as ``1/t_g``,
-    so the chirp now DEPENDS on the gate length -- the decoupling that makes length
-    the only free parameter holds only with DRAG off. The outer loop closes that
-    remaining coupling: chirp -> length -> chirp, converging in 2-3 passes because
-    the quadrature is a small fraction of the drive.
+    so with DRAG on the chirp depends on the gate length too -- the outer loop here
+    closes that remaining coupling (chirp -> length -> chirp), converging in 2-3
+    passes since the quadrature is a small fraction of the drive.
     """
     log = logger or logging.getLogger("tune_up")
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
@@ -1154,6 +1124,16 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                     f"min|Delta(t)|={proj['min_abs_detuning_GHz'] * 1e3:.2f} MHz, "
                     f"{proj['drag_iters']} inner pass(es)")
         log.info(f"step 2 (pass {it + 1}/{n_outer}) at t_g={t_g:.3f} ns:\n{msg})")
+        xr = proj["extrapolation_ratio"]
+        if xr > 1.15:
+            log.info(f"  WARNING: target_eta={target_eta:.2f} is {xr:.2f}x the "
+                     f"largest |eta|={proj['measured_eta_max']:.2f} the Rabi sweep "
+                     f"measured -- the chirp near the pulse peak is a quartic "
+                     f"EXTRAPOLATION past the fitted window, in the same "
+                     f"majority-nonlinear regime where the diagnostic chevron "
+                     f"itself stops being trustworthy. Treat it as a candidate, "
+                     f"not a calibration, until checked against the gate's own "
+                     f"performance (chirp_ablation below, or calibration_map).")
 
         # -- 3: what the assembled gate still wants ---------------------------
         residual_GHz = shaped_residual(t_g, chirp, wp_offset)
@@ -1197,12 +1177,9 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     drag_info = ({"history": history, "iters": len(history)}
                  if drag_beat_GHz is not None else None)
 
-    # -- MEASURE the DRAG-induced shift, rather than trusting the model ------
-    # Everything above routes DRAG through one assumption: that its quadrature shifts
-    # the resonance only by adding drive, through the same law the constant probe
-    # measured. That assumption is never tested by the steps that rely on it -- the
-    # constant probe cannot see DRAG at all. These shaped DRAG-off/DRAG-on chevrons
-    # are the test, and they are recorded whether or not they agree.
+    # Everything above assumes DRAG shifts the resonance only by adding drive,
+    # through the law the (DRAG-blind) constant probe measured. These shaped
+    # DRAG-off/DRAG-on chevrons are the direct test of that assumption.
     if drag_beat_GHz is not None:
         predicted = (float(proj["mean_shift_GHz"])
                      - float(project_nodrag_mean(table, target_eta, chirp_degree)))
@@ -1251,9 +1228,32 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
             log.info(f"  time-Rabi skipped: {exc}")
 
     t_g = float(length["t_g_ns"])
+    amp_scale = fixed_eta_amp_scale(config, t_g, target_eta)
+
+    # -- does the chirp's SHAPE actually help, over a plain retuned carrier? -----
+    # wp_offset already carries the chirp's mean component, so zeroing the chirp
+    # here isolates exactly what tracking the shift THROUGH the pulse buys, at the
+    # same length and drive. This is the direct answer to "is the chirp effective".
+    try:
+        from snail_solver.device_utils import transfer_probability
+        flat_transfer = transfer_probability(
+            config, t_g, amp_scale, wp_offset, solver, spec_abs_GHz=spec_abs_GHz,
+            drag_beat_GHz=drag_beat_GHz, chirp_coeffs_GHz=[], drag_n_pump=drag_n_pump)
+        stages["chirp_ablation"] = {
+            "transfer_with_chirp": float(length["transfer"]),
+            "transfer_flat_carrier": float(flat_transfer),
+            "leakage_with_chirp": 1.0 - float(length["transfer"]),
+            "leakage_flat_carrier": 1.0 - float(flat_transfer)}
+        log.info(f"chirp ablation: transfer {length['transfer']:.6f} with the chirp "
+                 f"vs {flat_transfer:.6f} with a flat retuned carrier at the same "
+                 f"t_g/amp_scale/wp_offset -- leakage {1 - length['transfer']:.2e} "
+                 f"vs {1 - flat_transfer:.2e}")
+    except Exception as exc:                                  # never fatal: it is a check
+        log.info(f"  chirp ablation skipped: {exc}")
+
     pair = list(np.asarray(config["qubit_freqs_GHz"], dtype=float))
     record = {
-        "amp_scale": fixed_eta_amp_scale(config, t_g, target_eta),
+        "amp_scale": amp_scale,
         "wp_offset_GHz": float(wp_offset),
         "t_g_ns": t_g,
         "chirp_coeffs_GHz": [float(c) for c in chirp],
@@ -1388,6 +1388,12 @@ def main() -> None:
         print(f"  drag         = beat {rec['drag_beat_GHz'] * 1e3:.2f} MHz, "
               f"k={rec['drag_n_pump']}, converged in {out['drag']['iters']} pass(es)")
     print(f"  transfer     = {rec['score']:.6f}")
+    abl = out["stages"].get("chirp_ablation")
+    if abl:
+        print(f"  chirp helps  = {abl['transfer_with_chirp']:.6f} (chirped) vs "
+              f"{abl['transfer_flat_carrier']:.6f} (flat carrier, same t_g/amp/offset)"
+              f" -- leakage {abl['leakage_with_chirp']:.2e} vs "
+              f"{abl['leakage_flat_carrier']:.2e}")
 
     if args.out:
         from snail_solver.paths import in_results

@@ -711,8 +711,8 @@ def plot_interaction_chart(config: Dict[str, Any], channels: Sequence[Dict[str, 
                  transform=ax2.transAxes, ha="right", va="bottom", fontsize=8,
                  color="#1b7837",
                  bbox=dict(boxstyle="round", fc="white", ec="#1b7837", alpha=0.9))
-        ax2.set_xlabel(r"channel detuning $|\delta|$ (MHz)   —   the DRAG beat")
-        ax2.set_ylabel("coupling $g$ (MHz)")
+        ax2.set_xlabel(r"Channel Detuning $|\delta|$ (MHz)")
+        ax2.set_ylabel("Interaction Coefficient (MHz)")
         ax2.set_title("Which parasites DRAG can suppress", fontsize=10)
         ax2.legend(fontsize=7.4, loc="lower left", framealpha=0.93)
         ax2.grid(alpha=0.22, which="both")

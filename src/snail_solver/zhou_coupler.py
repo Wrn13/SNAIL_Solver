@@ -999,8 +999,8 @@ class ZhouCoupler:
         pump_tones = list(self._pump_tones)
 
         def make_coeff(omega: float, pump_signature: Tuple[Tuple[int, bool], ...]
-                       ) -> Callable[[float, Any], complex]:
-            def coeff(t: float, args: Any = None) -> complex:
+                       ) -> Callable[[float], complex]:
+            def coeff(t: float, **kwargs: Any) -> complex:
                 value = cmath.exp(-1j * omega * t)
                 for tone_index, is_conjugate in pump_signature:
                     eta = self._eta(pump_tones[tone_index], t)
