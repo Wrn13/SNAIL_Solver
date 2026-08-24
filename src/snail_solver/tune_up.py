@@ -1366,11 +1366,20 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog="python -m snail_solver.tune_up", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--device", required=True)
-    ap.add_argument("--target-eta", type=float, required=True,
+    ap.add_argument("--device", default=None,
+                    help="required unless --replot is given (or --save-point, which "
+                         "needs it to know which device JSON to write into)")
+    ap.add_argument("--target-eta", type=float, default=None,
                     help="peak |eta| to FIX for the whole tune-up. This is the one "
                          "number you choose: it sets the drive and hence the nominal "
-                         "length t_g0 = 2A/eta*. Larger -> shorter gate, more leakage")
+                         "length t_g0 = 2A/eta*. Larger -> shorter gate, more leakage. "
+                         "Required unless --replot is given")
+    ap.add_argument("--replot", metavar="JSON", default=None,
+                    help="skip the run entirely and regenerate --plot/--plot-ridge "
+                         "from a previously written --out JSON -- no new solves, so "
+                         "this is the way to re-render a plot (e.g. after a "
+                         "plot_chirp_ridge change) without repeating an expensive "
+                         "cluster run")
     ap.add_argument("--drag-beat-GHz", type=float, default=None,
                     help="calibrate with DRAG on at this beat; enables the "
                          "chirp<->DRAG iteration")
@@ -1437,39 +1446,55 @@ def main() -> None:
                     help="save the result into the device JSON under this name")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
+    if args.replot is None and (args.device is None or args.target_eta is None):
+        ap.error("--device and --target-eta are required unless --replot is given")
+    if args.save_point and args.device is None:
+        ap.error("--save-point needs --device (to know which device JSON to write)")
 
-    from snail_solver.device_utils import load_device
-    from snail_solver.log_utils import setup_run_logger
     from snail_solver.paths import resolve_device
 
-    logger = setup_run_logger(None, "tune_up")
-    device_path = resolve_device(args.device)
-    config = load_device(device_path)
-    if args.coupler_levels is not None:
-        config = {**config, "coupler_levels": int(args.coupler_levels)}
+    device_path = resolve_device(args.device) if args.device else None
 
-    try:
-        out = run_tune_up(
-            config, args.target_eta, drag_beat_GHz=args.drag_beat_GHz,
-            drag_n_pump=args.drag_n_pump, spec_abs_GHz=args.spec_abs_GHz,
-            chirp_degree=args.chirp_degree,
-            window_tg=args.window_tg, n_time=args.n_time,
-            span_linewidths=args.span_linewidths,
-            drag_shift_points=args.drag_shift_points,
-            eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
-            contrast_min=args.contrast_min,
-            wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
-            tg_points=args.tg_points, max_drag_iters=args.max_drag_iters,
-            do_time_rabi=not args.skip_time_rabi, jobs=args.jobs,
-            solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},
-            logger=logger)
-    except RabiFitError as exc:
-        # The measurement succeeded; only the interpretation failed. Save and draw it
-        # before dying, so the "inspect the chevrons" instruction is actionable.
-        if args.plot:
-            print(f"  wrote {plot_rabi_table(exc.table, args.plot)} "
-                  f"(the sweep that failed)")
-        raise
+    if args.replot:
+        # Everything plot_rabi_table/plot_chirp_ridge need is already in a JSON
+        # written by a previous --out: no config, no device, no new solves. This
+        # is the fast path back to a figure after e.g. a plotting-code change.
+        with open(args.replot) as fh:
+            saved = json.load(fh)
+        out = {"operating_point": saved["operating_point"], "stages": saved["stages"],
+              "t_g0_ns": saved["t_g0_ns"],
+              "drag": saved["stages"].get("drag_loop")}
+    else:
+        from snail_solver.device_utils import load_device
+        from snail_solver.log_utils import setup_run_logger
+
+        logger = setup_run_logger(None, "tune_up")
+        config = load_device(device_path)
+        if args.coupler_levels is not None:
+            config = {**config, "coupler_levels": int(args.coupler_levels)}
+
+        try:
+            out = run_tune_up(
+                config, args.target_eta, drag_beat_GHz=args.drag_beat_GHz,
+                drag_n_pump=args.drag_n_pump, spec_abs_GHz=args.spec_abs_GHz,
+                chirp_degree=args.chirp_degree,
+                window_tg=args.window_tg, n_time=args.n_time,
+                span_linewidths=args.span_linewidths,
+                drag_shift_points=args.drag_shift_points,
+                eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
+                contrast_min=args.contrast_min,
+                wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
+                tg_points=args.tg_points, max_drag_iters=args.max_drag_iters,
+                do_time_rabi=not args.skip_time_rabi, jobs=args.jobs,
+                solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},
+                logger=logger)
+        except RabiFitError as exc:
+            # The measurement succeeded; only the interpretation failed. Save and draw
+            # it before dying, so the "inspect the chevrons" instruction is actionable.
+            if args.plot:
+                print(f"  wrote {plot_rabi_table(exc.table, args.plot)} "
+                      f"(the sweep that failed)")
+            raise
 
     rec = out["operating_point"]
     print("\n=== tune-up result ===")

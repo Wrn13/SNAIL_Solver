@@ -1,5 +1,4 @@
 .vscode
-
 .DS_Store
 
 #ruff
@@ -142,6 +141,7 @@ dmypy.json
 *results*/
 figs/
 *.npz
+*.png
 
 # SLURM job logs, which land in the submit directory because #SBATCH --output
 # cannot reference a runtime variable (see the note in slurm/snail_sweep.slurm)
