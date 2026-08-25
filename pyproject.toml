@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["jax[cuda12]>=0.4.30"]
+gpu-rocm = ["jax-rocm7-pjrt", "jax-rocm7-plugin"]
 dev = ["ipykernel", "pre-commit", "pylatexenc", "ipywidgets", "ipympl"]
 format = [
     "pre-commit",
