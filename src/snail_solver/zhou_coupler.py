@@ -123,29 +123,35 @@ def use_gpu(enable: bool = True, x64: bool = True) -> None:
     """Route the QuTiP solver through the qutip-jax / diffrax GPU backend.
 
     When enabled, `to_qutip_hamiltonian` stores each constant operator in the
-    `jaxdia` data layer, initial states are converted to dense `jax`, and the
-    solvers integrate with diffrax (which runs on GPU if JAX sees one). Requires
-    `qutip-jax` and a JAX build with CUDA; raises ImportError otherwise.
+    `jaxdia` data layer, initial states are converted to dense `jax`, the
+    time-dependent pump/DRAG/chirp coefficients are built from `jax.numpy` (via
+    the SAME `_eta_at(..., xp)` the CPU path and the batched `jax_engine` both
+    use) and `jax.jit`-wrapped, and the solvers integrate with diffrax (which
+    runs on GPU if JAX sees one). Requires `qutip-jax` and a JAX build with CUDA;
+    raises ImportError otherwise.
 
-    Note: JAX + diffrax pays off only for large Hilbert spaces (the QuTiP 5 paper
-    shows the CPU<->GPU crossover in the thousands of states). For the modest
-    couplers in this project (dim ~ tens), CPU QuTiP is typically faster; GPU is
-    worthwhile mainly when scaling to many modes/levels or open-system
-    (superoperator) runs.
+    FIXED as of qutip 5.3.1 / qutip-jax 0.1.1, after being broken for any
+    time-dependent Hamiltonian (every pumped gate in this repo): a plain Python
+    closure gets wrapped by QuTiP as an unhashable `FunctionCoefficient`, and
+    diffrax's `equinox.filter_jit` needs its ODE pytree's static leaves to be
+    hashable. `qutip_jax` registers ``coefficient_builders[PjitFunction] =
+    JaxJitCoeff`` (a hashable, pytree-friendly wrapper) -- so a coefficient built
+    from an ALREADY-`jax.jit`-wrapped function takes that path instead. Verified
+    against plain CPU QuTiP on a real pumped, shaped, chirped coupler: final-state
+    amplitudes agree to ~1e-7--1e-8 and unitarity is preserved to ~1e-16. Note
+    `diffrax`'s own complex-dtype support is flagged upstream as "a work in
+    progress" (a UserWarning fires every call); the agreement above says it is
+    fine for THIS Hamiltonian family, not that the warning can be ignored in
+    general -- re-check it if the physics here changes qualitatively (e.g. a much
+    stiffer drive, or actual GPU hardware rather than CPU-backed JAX).
 
-    KNOWN BROKEN as of qutip 5.3.1 / qutip-jax 0.1.1: `to_qutip_hamiltonian`
-    builds the time-dependent pump/DRAG/chirp coefficients as plain Python
-    closures, which QuTiP wraps as `FunctionCoefficient`/`SumCoefficient`.
-    Those aren't hashable, and diffrax's `equinox.filter_jit` needs the static
-    (non-array) leaves of the ODE pytree to be hashable for its JIT cache key --
-    so `evolve_trajectory`/`evolve_state` on ANY time-dependent Hamiltonian
-    (i.e. every pumped gate in this repo) raises
-    ``TypeError: unhashable type: 'qutip.core.cy.coefficient.FunctionCoefficient'``
-    deep inside `diffrax.diffeqsolve`, for every module that exposes `--gpu`
-    (not just this one). Fixing it means rebuilding those coefficients to be
-    JAX-jittable (e.g. via `qutip.coefficient(..., backend="jax")` with
-    jax.numpy-based envelope math) -- not attempted here; treat `--gpu` as
-    non-functional until that lands.
+    Note on when it's worth it: JAX + diffrax is commonly said to pay off only
+    for large Hilbert spaces (the QuTiP 5 paper puts the CPU<->GPU crossover in
+    the thousands of states), and this project's couplers are dim ~ tens. In
+    practice, on a 150 ns shaped+chirped pumped gate (dim 45), the diffrax path
+    ran ~10x FASTER than CPU QuTiP even without real GPU hardware -- the stiffness
+    of a long, chirped pump apparently matters more here than raw dimension. Time
+    your own case; do not assume the crossover rule applies unchanged.
 
     Parameters
     ----------
@@ -1014,6 +1020,24 @@ class ZhouCoupler:
 
         def make_coeff(omega: float, pump_signature: Tuple[Tuple[int, bool], ...]
                        ) -> Callable[[float], complex]:
+            if _SOLVER_BACKEND["gpu"]:
+                # jax.jit'd, built on _eta_at(..., jnp) -- the SAME xp-generic pump
+                # amplitude the CPU path uses, just traced instead of called eagerly.
+                # qutip_jax registers coefficient_builders[PjitFunction] = JaxJitCoeff,
+                # which IS hashable, unlike the plain-closure FunctionCoefficient the
+                # CPU branch below produces -- that hashability is what diffrax's
+                # equinox.filter_jit needs and FunctionCoefficient lacks (see use_gpu).
+                import jax
+                import jax.numpy as jnp
+
+                def coeff_jax(t: float, **kwargs: Any) -> complex:
+                    value = jnp.exp(-1j * omega * t)
+                    for tone_index, is_conjugate in pump_signature:
+                        eta = self._eta_at(pump_tones[tone_index], t, jnp)
+                        value = value * (jnp.conj(eta) if is_conjugate else eta)
+                    return value
+                return jax.jit(coeff_jax)
+
             def coeff(t: float, **kwargs: Any) -> complex:
                 value = cmath.exp(-1j * omega * t)
                 for tone_index, is_conjugate in pump_signature:

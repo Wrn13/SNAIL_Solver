@@ -129,6 +129,24 @@ def nominal_t_g(config: Dict[str, Any], target_eta: float) -> float:
                     float(config["lam_b"]), float(target_eta))
 
 
+def fixed_span_MHz(config: Dict[str, Any], target_eta: float, eta_hi: float = 1.0,
+                   span_linewidths: float = 4.0) -> float:
+    """A single ``wp_span_MHz`` wide enough for every row in a Rabi sweep.
+
+    Linewidth is the exchange rate, ``Omega ~ 1/(2 t_g(|eta|))``, and ``t_g`` SHRINKS
+    as the drive strengthens -- so the STRONGEST row (``eta_hi * target_eta``) needs
+    the widest span, and a span picked for any weaker row would rail it. Pass this
+    to ``rabi_shift_table``/``run_tune_up`` as ``wp_span_MHz`` to put every row on
+    the SAME frequency grid -- no per-row resizing, no resampling needed to plot
+    them together -- at the cost of oversampling the weaker rows' much narrower
+    peaks. This is what :func:`plot_chirp_ridge` requires: it does not interpolate,
+    so every chevron in the table must already share one offset axis.
+    """
+    e_max = float(eta_hi) * float(target_eta)
+    linewidth_MHz = 1e3 / (2.0 * nominal_t_g(config, e_max))
+    return 2.0 * float(span_linewidths) * linewidth_MHz
+
+
 # ===========================================================================
 # Step 1 -- the Rabi experiment: resonance vs drive strength
 # ===========================================================================
@@ -750,27 +768,34 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
                      title: Optional[str] = None) -> str:
     """Overlay the chirp's pump trajectory on the Rabi map itself, not just its fit.
 
-    This is the Fig. 4b picture from Qiu et al. 2023 (arXiv:2306.10162): drive
-    strength on x, pump frequency on y, and the Rabi signal itself as the color --
+    This is the Fig. 4b picture from Qiu et al. 2023 (arXiv:2306.10162): pump
+    frequency on x, drive strength on y, and the Rabi signal itself as the color --
     the SAME per-row ``offsets_GHz``/``metric`` data :func:`plot_rabi_table` draws
-    as separate per-amplitude panels, here stitched into one map (each row
-    resampled onto a common frequency grid, since the offset span is adaptive and
-    differs row to row). The ac-Stark-shifted ridge is the bright band curving
-    through it. A frequency-modulated drive tracks that band through the pulse
-    instead of crossing it at one fixed frequency: as the Hann/raised-cosine
-    envelope |eta(t)| rises from 0 to the peak and back down, the chirp's
-    instantaneous frequency traces along the ridge almost exactly -- by
-    construction, since that's the curve the chirp was Legendre-projected from
-    (:func:`chirp_from_measured_shift`). A flat, unchirped carrier at the same mean
-    offset is drawn for contrast: the gap that opens up between it and the ridge as
-    |eta(t)| rises is exactly the resonance error a chirp removes.
+    as separate per-amplitude panels, here stitched into one map. The ac-Stark-
+    shifted ridge is the bright band curving through it. A frequency-modulated
+    drive tracks that band through the pulse instead of crossing it at one fixed
+    frequency: as the Hann/raised-cosine envelope |eta(t)| rises from 0 to the peak
+    and back down, the chirp's instantaneous frequency traces along the ridge
+    almost exactly -- by construction, since that's the curve the chirp was
+    Legendre-projected from (:func:`chirp_from_measured_shift`). A flat, unchirped
+    carrier at the same mean offset is drawn for contrast: the gap that opens up
+    between it and the ridge as |eta(t)| rises is exactly the resonance error a
+    chirp removes.
+
+    NO INTERPOLATION: every row is stacked at its own real, measured offsets, with
+    no resampling in either direction. That means every chevron in `table` MUST
+    already share the identical offset axis -- which only happens when the sweep
+    was run with a FIXED ``wp_span_MHz`` (:func:`fixed_span_MHz` picks one wide
+    enough for the whole drive range), not the per-row adaptive default. A "high
+    definition" map is a resolution problem, solved by running the sweep with more
+    ``amp_points``/``wp_points`` on a fixed span, not by rendering trickery.
 
     This is a DEFINITIONAL check, not an independent measurement -- it shows the
     calibration is self-consistent, not that the assembled gate actually achieves
     it. For that, see the shaped-chevron residual in `run_tune_up` step 3, or the
     ``chirp_ablation`` transfer-probability comparison.
 
-    Past `measured_eta_max` (marked with a vertical line) the ridge itself is
+    Past `measured_eta_max` (marked with a horizontal line) the ridge itself is
     extrapolated past where the Rabi sweep measured it -- the chirp there is
     tracking a fit, not data.
 
@@ -800,21 +825,18 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     target_eta = float(proj["target_eta"])
     measured_eta_max = float(proj.get("measured_eta_max", np.nanmax(eta)))
 
-    # Each row's offset span is sized from its own linewidth (see rabi_shift_table),
-    # so the rows do not share a frequency axis -- resample every row onto one
-    # common grid spanning the union of all of them before stitching into a map.
     row_eta = np.array([float(c["eta"]) for c in chevrons])
-    all_off_MHz = np.concatenate([np.asarray(c["offsets_GHz"], dtype=float) * 1e3
-                                  for c in chevrons])
-    common_MHz = np.linspace(float(np.nanmin(all_off_MHz)),
-                            float(np.nanmax(all_off_MHz)), 300)
-    Z = np.full((row_eta.size, common_MHz.size), np.nan)
-    for i, c in enumerate(chevrons):
-        off = np.asarray(c["offsets_GHz"], dtype=float) * 1e3
-        m = np.asarray(c["metric"], dtype=float)
-        order = np.argsort(off)
-        Z[i, :] = np.interp(common_MHz, off[order], m[order],
-                            left=np.nan, right=np.nan)
+    off_MHz = np.asarray(chevrons[0]["offsets_GHz"], dtype=float) * 1e3
+    for c in chevrons[1:]:
+        other = np.asarray(c["offsets_GHz"], dtype=float) * 1e3
+        if other.shape != off_MHz.shape or not np.allclose(other, off_MHz):
+            raise ValueError(
+                "plot_chirp_ridge does not interpolate, so every row needs the "
+                "SAME offsets -- this table was swept with a per-row adaptive "
+                "span. Rerun rabi_shift_table/run_tune_up with "
+                "wp_span_MHz=fixed_span_MHz(config, target_eta) so every row "
+                "shares one grid, then replot.")
+    Z = np.stack([np.asarray(c["metric"], dtype=float) for c in chevrons], axis=0)
 
     ts = np.linspace(0.0, float(t_g), 400)
     eta_t = np.asarray(RaisedCosine(target_eta, float(t_g)).value_at(ts))
@@ -824,27 +846,27 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     flat_MHz = np.full_like(ts, 1e3 * float(wp_offset_GHz))
 
     fig, ax = plt.subplots(figsize=(7.2, 5.2), layout="constrained")
-    mesh = ax.pcolormesh(row_eta, common_MHz, Z.T, shading="nearest", cmap="viridis",
+    mesh = ax.pcolormesh(off_MHz, row_eta, Z, shading="nearest", cmap="viridis",
                         vmin=0.0, vmax=1.0)
     fig.colorbar(mesh, ax=ax, label=r"$P(|10\rangle)$ (max over time)", pad=0.02)
 
-    xs = np.linspace(float(row_eta.min()), float(max(row_eta.max(), target_eta)) * 1.02,
+    ys = np.linspace(float(row_eta.min()), float(max(row_eta.max(), target_eta)) * 1.02,
                      300)
     if target_eta > measured_eta_max:
-        ax.axvline(measured_eta_max, color=_C_VERTEX, ls=":", lw=1.6,
+        ax.axhline(measured_eta_max, color=_C_VERTEX, ls=":", lw=1.6,
                   label=f"measured up to |eta|={measured_eta_max:.2f}")
-    ax.plot(xs, fit["delta0"] + fit["k2"] * xs ** 2 + fit["k4"] * xs ** 4,
+    ax.plot(fit["delta0"] + fit["k2"] * ys ** 2 + fit["k4"] * ys ** 4, ys,
            "-", lw=1.4, color="white", alpha=0.85, label="fitted ridge")
-    ax.plot(eta, ridge, "o", ms=6, color="white", mec=_C_INK, mew=1.0,
+    ax.plot(ridge, eta, "o", ms=6, color="white", mec=_C_INK, mew=1.0,
            label="measured ridge")
-    ax.plot(eta_t, chirp_MHz, "-", lw=2.6, color=_C_LORENTZ,
+    ax.plot(chirp_MHz, eta_t, "-", lw=2.6, color=_C_LORENTZ,
            label="chirped pump (rides the ridge)")
-    ax.plot(eta_t, flat_MHz, "--", lw=2.0, color=_C_VERTEX,
+    ax.plot(flat_MHz, eta_t, "--", lw=2.0, color=_C_VERTEX,
            label="flat carrier (same mean offset)")
-    ax.set_xlim(row_eta.min(), xs.max())
-    ax.set_ylim(common_MHz.min(), common_MHz.max())
-    ax.set_xlabel(r"drive strength $|\eta|$ (the amplitude/voltage axis)")
-    ax.set_ylabel("pump frequency offset (MHz)")
+    ax.set_ylim(row_eta.min(), ys.max())
+    ax.set_xlim(off_MHz.min(), off_MHz.max())
+    ax.set_ylabel(r"drive strength $|\eta|$ (the amplitude/voltage axis)")
+    ax.set_xlabel("pump frequency offset (MHz)")
     ax.set_title(title or (rf"Rabi map with the chirp riding the ridge, "
                           rf"$\eta^*$ = {target_eta:.2f}"), fontsize=11)
     ax.legend(fontsize=7.5, framealpha=0.9, loc="best")
