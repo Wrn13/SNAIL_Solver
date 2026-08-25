@@ -18,6 +18,11 @@
 # #SBATCH --partition=cpu
 # #SBATCH --account=YOUR_ALLOC
 #
+# For GPU (qutip-jax/diffrax): set GPU=1 below, request a device, load CUDA, and
+# note GPU forces --jobs 1 (one big solve, not a CPU offset-pool):
+# #SBATCH --gres=gpu:1
+# module load cuda   # and: uv pip install qutip-jax diffrax jax[cuda]
+#
 # =============================================================================
 # Hardware-style gate tune-up for the SNAIL iSWAP  (snail_solver.tune_up)
 # =============================================================================
@@ -117,6 +122,8 @@
 #   COUPLER_LEVELS  coupler truncation override                    [device]
 #   SKIP_TIME_RABI  set to 1 to skip the constant-drive cross-check    [0]
 #   JOBS        parallel workers (default: --cpus-per-task)
+#   GPU         set to 1 to run via qutip-jax/diffrax (forces --jobs 1; also
+#               uncomment #SBATCH --gres=gpu:1 above and load CUDA)      [0]
 #   OUT         JSON path for the full record + per-stage data  [tuneup_<dev>.json]
 #   PLOT        set to 0 to skip rendering the Rabi sweep                  [1]
 #   PLOT_OUT    figure path; defaults to its OWN folder per device+eta so
@@ -168,6 +175,7 @@ CHIRP_DEGREE="${CHIRP_DEGREE:-4}"
 DRAG_N_PUMP="${DRAG_N_PUMP:-1}"
 MAX_DRAG_ITERS="${MAX_DRAG_ITERS:-4}"
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-1}}"
+GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax (forces --jobs 1)
 OUT="${OUT:-tuneup_${DEVICE%.json}.json}"
 PLOT="${PLOT:-1}"
 # Own folder per device+eta, so DEVICE/TARGET_ETA alone -- with no other override --
@@ -182,6 +190,7 @@ OPTS=""
 [ -n "${WP_SPAN:-}"        ] && OPTS="${OPTS} --wp-span-MHz ${WP_SPAN}"
 [ -n "${DRAG_BEAT:-}"      ] && OPTS="${OPTS} --drag-beat-GHz ${DRAG_BEAT}"
 [ -n "${COUPLER_LEVELS:-}" ] && OPTS="${OPTS} --coupler-levels ${COUPLER_LEVELS}"
+[ -n "${GPU_FLAG}"         ] && OPTS="${OPTS} ${GPU_FLAG}"
 [ "${SKIP_TIME_RABI:-0}" = "1" ] && OPTS="${OPTS} --skip-time-rabi"
 [ "${PLOT}" = "1"          ] && OPTS="${OPTS} --plot ${PLOT_OUT}"
 [ "${PLOT_RIDGE}" = "1"    ] && OPTS="${OPTS} --plot-ridge ${PLOT_RIDGE_OUT}"
@@ -198,7 +207,7 @@ export MPLBACKEND=Agg PYTHONUNBUFFERED=1
 cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} device=${DEVICE} target_eta=${TARGET_ETA}"
-echo "all-exact QuTiP; jobs=${JOBS}"
+echo "all-exact QuTiP; jobs=${JOBS}  gpu=${GPU:-0}"
 echo "rabi ${AMP_POINTS} chevrons x ${WP_POINTS} offsets over |eta|/eta* in "\
 "[${ETA_LO},${ETA_HI}]; span=${WP_SPAN:-${SPAN_LINEWIDTHS} linewidths}; "\
 "window=${WINDOW_TG} swaps @ ${N_TIME} times; length grid=${TG_POINTS}"

@@ -133,6 +133,20 @@ def use_gpu(enable: bool = True, x64: bool = True) -> None:
     worthwhile mainly when scaling to many modes/levels or open-system
     (superoperator) runs.
 
+    KNOWN BROKEN as of qutip 5.3.1 / qutip-jax 0.1.1: `to_qutip_hamiltonian`
+    builds the time-dependent pump/DRAG/chirp coefficients as plain Python
+    closures, which QuTiP wraps as `FunctionCoefficient`/`SumCoefficient`.
+    Those aren't hashable, and diffrax's `equinox.filter_jit` needs the static
+    (non-array) leaves of the ODE pytree to be hashable for its JIT cache key --
+    so `evolve_trajectory`/`evolve_state` on ANY time-dependent Hamiltonian
+    (i.e. every pumped gate in this repo) raises
+    ``TypeError: unhashable type: 'qutip.core.cy.coefficient.FunctionCoefficient'``
+    deep inside `diffrax.diffeqsolve`, for every module that exposes `--gpu`
+    (not just this one). Fixing it means rebuilding those coefficients to be
+    JAX-jittable (e.g. via `qutip.coefficient(..., backend="jax")` with
+    jax.numpy-based envelope math) -- not attempted here; treat `--gpu` as
+    non-functional until that lands.
+
     Parameters
     ----------
     enable : bool, default True
@@ -1035,7 +1049,13 @@ class ZhouCoupler:
         diffrax integrator when the GPU backend is active)."""
         import qutip as qt
         if _SOLVER_BACKEND["gpu"]:
-            return {"method": _SOLVER_BACKEND["method"], "atol": atol, "rtol": rtol}
+            # qutip_jax's DiffraxIntegrator takes a diffrax stepsize controller and
+            # max_steps, not flat atol/rtol/nsteps -- those raise KeyError as "not
+            # supported" against integrator.integrator_options.
+            import diffrax
+            return {"method": _SOLVER_BACKEND["method"],
+                    "stepsize_controller": diffrax.PIDController(rtol=rtol, atol=atol),
+                    "max_steps": int(nsteps)}
         try:
             return qt.Options(atol=atol, rtol=rtol, nsteps=nsteps)     # QuTiP 4
         except (AttributeError, TypeError):

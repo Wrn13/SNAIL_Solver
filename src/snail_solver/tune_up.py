@@ -1429,6 +1429,8 @@ def main() -> None:
     ap.add_argument("--skip-time-rabi", action="store_true")
     ap.add_argument("--coupler-levels", type=int, default=None)
     ap.add_argument("--jobs", type=int, default=0)
+    ap.add_argument("--gpu", action="store_true",
+                    help="run via qutip-jax/diffrax (forces --jobs 1)")
     ap.add_argument("--atol", type=float, default=1e-10)
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
@@ -1446,6 +1448,10 @@ def main() -> None:
                     help="save the result into the device JSON under this name")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
+    if args.gpu:
+        from snail_solver import zhou_coupler
+        zhou_coupler.use_gpu(True)
+        args.jobs = 1
     if args.replot is None and (args.device is None or args.target_eta is None):
         ap.error("--device and --target-eta are required unless --replot is given")
     if args.save_point and args.device is None:
@@ -1472,6 +1478,10 @@ def main() -> None:
         config = load_device(device_path)
         if args.coupler_levels is not None:
             config = {**config, "coupler_levels": int(args.coupler_levels)}
+
+        from snail_solver import find_stark_resonance as FSR
+        print(f"device={args.device}  target_eta={args.target_eta}  "
+              f"jobs={FSR._resolve_jobs(args.jobs)}{' GPU' if args.gpu else ''}")
 
         try:
             out = run_tune_up(

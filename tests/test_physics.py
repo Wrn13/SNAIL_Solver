@@ -1596,5 +1596,49 @@ class TestTuneUpSwapFit(unittest.TestCase):
             fit_swap_period(np.arange(4.0), np.zeros(4))
 
 
+class TestTuneUpGpuFlag(unittest.TestCase):
+    """--gpu must flip the global qutip-jax backend and force jobs=1.
+
+    run_tune_up and zhou_coupler.use_gpu are mocked out, so this never imports
+    QuTiP/JAX -- it only checks that tune_up.main() wires the CLI flag to the
+    right calls, keeping this file QuTiP-free and fast.
+    """
+
+    def _run_main(self, extra_argv):
+        from unittest import mock
+        from snail_solver import tune_up
+
+        fake_out = {
+            "operating_point": {
+                "target_eta": 1.0, "t_g_ns": 100.0, "amp_scale": 1.0,
+                "wp_offset_GHz": 0.0, "chirp_coeffs_GHz": [0.0, 0.0],
+                "drag_beat_GHz": None, "drag_n_pump": 1, "score": 1.0,
+            },
+            "t_g0_ns": 100.0, "drag": None, "stages": {},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            device_path = os.path.join(d, "dev.json")
+            with open(device_path, "w") as fh:
+                json.dump({}, fh)
+            argv = ["tune_up", "--device", device_path, "--target-eta", "1.0",
+                   *extra_argv]
+            with mock.patch("snail_solver.zhou_coupler.use_gpu") as m_gpu, \
+                 mock.patch("snail_solver.tune_up.run_tune_up",
+                           return_value=fake_out) as m_run, \
+                 mock.patch.object(sys, "argv", argv):
+                tune_up.main()
+        return m_gpu, m_run
+
+    def test_gpu_flag_calls_use_gpu_and_forces_jobs_one(self):
+        m_gpu, m_run = self._run_main(["--gpu", "--jobs", "8"])
+        m_gpu.assert_called_once_with(True)
+        self.assertEqual(m_run.call_args.kwargs["jobs"], 1)
+
+    def test_no_gpu_flag_leaves_use_gpu_and_jobs_alone(self):
+        m_gpu, m_run = self._run_main([])
+        m_gpu.assert_not_called()
+        self.assertEqual(m_run.call_args.kwargs["jobs"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
