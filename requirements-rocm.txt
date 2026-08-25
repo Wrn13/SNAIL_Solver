@@ -1,0 +1,45 @@
+# Isolated environment for GPU (AMD ROCm7) work on tune_up.py / jax_engine.py /
+# zhou_coupler.py / find_stark_resonance.py.
+#
+# Why this file exists instead of a `uv sync --extra gpu-rocm`: AMD's
+# jax-rocm7-plugin/jax-rocm7-pjrt are version-locked 1:1 with jax/jaxlib (see
+# https://rocm.docs.amd.com/en/latest/compatibility/ml-compatibility/jax-compatibility.html),
+# and any jax new enough to have a ROCm7 build requires numpy>=2.0. This
+# project's base dependencies unconditionally require qutip-qoc==0.2.0 (its
+# only release), which pins numpy<2.0. Those two constraints can never be
+# satisfied in one `uv`-managed resolution of pyproject.toml, so this
+# environment is deliberately built OUTSIDE that resolution, skipping
+# qutip-qoc entirely -- it's only used by grape.py / run_sweep_zhou.py /
+# sweep_common.py, none of which the GPU-batched path touches.
+#
+# Setup (run once per machine):
+#   python3.12 -m venv .venv-rocm
+#   source .venv-rocm/bin/activate
+#   pip install -r requirements-rocm.txt
+#   pip install -e . --no-deps    # installs the snail_solver package itself,
+#                                  # WITHOUT letting pip re-resolve pyproject.toml's
+#                                  # dependencies (which would pull qutip-qoc back in)
+#
+# Then verify the GPU is visible:
+#   python -c "import jax; print(jax.devices())"
+
+numpy
+qutip
+tqdm
+matplotlib
+scienceplots
+lovelyplots
+joblib>=1.5.3
+qutip-jax>=0.0.1
+scipy
+diffrax>=0.6
+
+# Matched jax/ROCm7 set -- keep these four in lockstep; bumping one without
+# the others reproduces the "AttributeError: module 'jax._src.hardware_utils'
+# has no attribute 'num_available_amd_gpus'" failure this file was written to
+# avoid. Re-check https://rocm.docs.amd.com/en/latest/compatibility/ml-compatibility/jax-compatibility.html
+# for the current matched version before bumping.
+jax==0.11.1
+jaxlib==0.11.1
+jax-rocm7-pjrt==0.11.1
+jax-rocm7-plugin==0.11.1

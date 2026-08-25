@@ -27,16 +27,14 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["jax[cuda12]>=0.4.30"]
-gpu-rocm = [
-    # AMD's ROCm JAX plugin packages are version-locked 1:1 with jax/jaxlib
-    # (e.g. jax==0.11.1 requires jax-rocm7-plugin==0.11.1 exactly) -- pin all
-    # four together here, or `uv sync` will resolve the plugin to its latest
-    # release independently of jax/jaxlib and the two will drift apart.
-    "jax==0.11.1",
-    "jaxlib==0.11.1",
-    "jax-rocm7-pjrt==0.11.1",
-    "jax-rocm7-plugin==0.11.1",
-]
+# There is deliberately no `gpu-rocm` extra: AMD's jax-rocm7-plugin/pjrt track
+# jax/jaxlib version-for-version, and any jax new enough to have a ROCm7 build
+# requires numpy>=2.0, which is incompatible with qutip-qoc==0.2.0 (its only
+# release, numpy<2.0 pinned) above -- an unconditional dependency of this
+# project. That makes "jax new enough for ROCm7" and "this project's base
+# deps" mutually unsatisfiable in one `uv`-managed environment. ROCm7 users
+# should install into a separate, isolated venv instead -- see
+# requirements-rocm.txt.
 dev = ["ipykernel", "pre-commit", "pylatexenc", "ipywidgets", "ipympl"]
 format = [
     "pre-commit",
