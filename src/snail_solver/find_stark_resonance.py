@@ -222,17 +222,93 @@ def _resolve_jobs(n_jobs: Optional[int]) -> int:
     return int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
 
 
+#: Population channels reported per time by :func:`population_channels`, in the
+#: order they are stacked. Flat names (not a nested dict) so a scan result stays
+#: np.savez-able -- see main().
+CHANNELS: Tuple[str, ...] = ("P01", "P10", "P_leak", "P_f_a", "P_f_b",
+                             "P_coupler", "P_double", "P_spectator", "norm_defect")
+
+
+def population_channels(cpl, states: np.ndarray, init: Sequence[int],
+                        tgt: Sequence[int]) -> np.ndarray:
+    """Where the population actually is, per output time. Shape ``[len(CHANNELS), n_time]``.
+
+    The chevron's two-level lineshape is an ASSUMPTION: peak transfer
+    ``Omega^2/(Omega^2+delta^2)`` holds only if population leaving ``|01>`` can
+    only arrive at ``|10>``. Every trajectory here is already a full multi-mode
+    Fock-space solve, so the population that violates that assumption is sitting
+    unread in the state vector. This reads it. No new physics, no new solve.
+
+    ``P01``/``P10`` are the intended exchange. ``P_leak = norm - P01 - P10`` is the
+    EXCLUSIVE complement -- the one honest number, everything a two-level fit
+    cannot account for. ``norm_defect = 1 - norm`` is a solver/truncation health
+    check, not itself leakage: it should stay ~1e-9 for a closed system: a
+    non-trivial value means the Fock truncation (``coupler_levels``, etc.) is
+    being pushed and the other channels here are suspect. ``P_f_a``/``P_f_b``
+    (qutrit ``|2>`` of each qubit mode), ``P_coupler`` (any coupler excitation),
+    ``P_double`` (the ``|11>`` state) and ``P_spectator`` (any excitation of a
+    4th spectator mode, if configured) are diagnostic and deliberately
+    OVERLAPPING -- they attribute where leakage is going, they do not partition
+    ``P_leak``.
+
+    Parameters
+    ----------
+    cpl : ZhouCoupler
+        The coupler the trajectory was evolved on.
+    states : ndarray, shape (n_time, dim)
+        State vectors at each output time, as returned by ``evolve_trajectory``.
+    init, tgt : sequence of int
+        Per-mode occupations of the two computational states (e.g. ``|01...>``
+        and ``|10...>``).
+
+    Returns
+    -------
+    ndarray, shape (len(CHANNELS), n_time)
+    """
+    from snail_solver.spectroscopy import marginal_population
+
+    probs = np.abs(np.asarray(states)) ** 2
+    dims = cpl.dims
+    n_time = probs.shape[0]
+
+    norm = probs.sum(axis=1)
+    P01 = probs[:, cpl.fock_index(list(init))]
+    P10 = probs[:, cpl.fock_index(list(tgt))]
+    P_leak = norm - P01 - P10
+
+    def _level(mode: int, level: int) -> np.ndarray:
+        if level >= dims[mode]:
+            return np.zeros(n_time)
+        return np.array([marginal_population(row, dims, mode, level) for row in probs])
+
+    P_f_a = _level(0, 2)
+    P_f_b = _level(1, 2)
+    P_coupler = 1.0 - np.array([marginal_population(row, dims, cpl.coupler_index, 0)
+                                for row in probs])
+    double_occ = [0] * cpl.n_modes
+    double_occ[0] = 1
+    double_occ[1] = 1
+    P_double = probs[:, cpl.fock_index(double_occ)]
+    P_spectator = (1.0 - np.array([marginal_population(row, dims, 3, 0) for row in probs])
+                  if cpl.n_modes > 3 else np.zeros(n_time))
+    norm_defect = 1.0 - norm
+
+    return np.stack([P01, P10, P_leak, P_f_a, P_f_b, P_coupler, P_double,
+                     P_spectator, norm_defect], axis=0)
+
+
 def _chevron_worker(args: Tuple) -> np.ndarray:
-    """One pump-offset column: P(|01>->|10>) over the time grid. Works for the
-    3-mode bare pair or the 4-mode pair+spectator (state/index built from n_modes),
-    and for constant or shaped(+DRAG) probe pulses (``build_kw``)."""
+    """One pump-offset column: the full population-channel stack over the time
+    grid (see :func:`population_channels`). Works for the 3-mode bare pair or the
+    4-mode pair+spectator (state/index built from n_modes), and for constant or
+    shaped(+DRAG) probe pulses (``build_kw``)."""
     config, eta_op, wp_offset, times, solver, spec_abs_GHz, build_kw = args
     cpl, _w_p = build_chevron_coupler(config, eta_op, wp_offset, float(times[-1]),
                                       spec_abs_GHz=spec_abs_GHz, **build_kw)
     init = [0] * cpl.n_modes; init[1] = 1          # |01...> : qubit b excited
     tgt = [0] * cpl.n_modes; tgt[0] = 1            # |10...> : qubit a excited
     states = cpl.evolve_trajectory(init, times, **solver)
-    return np.abs(states[:, cpl.fock_index(tgt)]) ** 2
+    return population_channels(cpl, states, init, tgt)
 
 
 def _parabolic_vertex(x: Sequence[float], y: Sequence[float]) -> float:
@@ -260,6 +336,40 @@ def _parabolic_vertex(x: Sequence[float], y: Sequence[float]) -> float:
         return float(x1)
     # vertex of the parabola through the three points (uniform spacing not required)
     return float(x1 + 0.25 * (x2 - x0) * (y0 - y2) / denom)
+
+
+def coupler_number_trace(cpl, states: np.ndarray) -> np.ndarray:
+    """Coupler-mode photon-number expectation ``<n_s(t)>`` along a trajectory.
+
+    The pump amplitude ``eta`` used throughout this module is, by construction
+    (``is_eta=True`` in :func:`build_chevron_coupler`), a classical drive-amplitude
+    LABEL on the envelope -- it is never derived from the coupler mode's actual
+    occupation. In ``ZhouCoupler.dressed_flux``, the coupler is one more dynamical
+    mode at its own bare frequency ``w_s``, and ``eta_p(t)`` is a SEPARATE
+    classical term at the pump frequency ``w_p``; whether this mode's real Fock
+    occupation is the same quantity as McKinney et al.'s ``eta = sqrt(n_s))``
+    (arXiv:2409.18262, Eq. 9 -- a different paper, about the coupler mode's own
+    coherent response) is UNRESOLVED (see the caveat in
+    ``tune_up.verify_eta_matches_ns``). Treat the returned trace as "how much the
+    coupler mode itself gets incidentally populated" -- a real, useful diagnostic
+    on its own terms, not a validated cross-check of a labelling identity.
+
+    Parameters
+    ----------
+    cpl : ZhouCoupler
+        The coupler the trajectory was evolved on (for ``dims``/``coupler_index``).
+    states : ndarray, shape (n_time, dim)
+        State vectors at each output time, as returned by ``evolve_trajectory``.
+
+    Returns
+    -------
+    ndarray, shape (n_time,)
+        ``<n_s(t)>``.
+    """
+    from snail_solver.spectroscopy import expected_number
+
+    probs = np.abs(np.asarray(states)) ** 2
+    return np.array([expected_number(row, cpl.dims, cpl.coupler_index) for row in probs])
 
 
 def locate_resonance(offsets_GHz: np.ndarray, max_transfer: np.ndarray) -> float:
@@ -290,7 +400,8 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
          drag_beat_GHz: Optional[float] = None,
          chirp_coeffs_GHz: Optional[Sequence[float]] = None,
          drag_n_pump: int = 1,
-         eta_op: Optional[float] = None) -> Dict[str, Any]:
+         eta_op: Optional[float] = None,
+         keep_full_channels: bool = False) -> Dict[str, Any]:
     """Run the pump-frequency chevron and locate the Stark-shifted resonance.
 
     Parameters
@@ -325,13 +436,26 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
         drive-strength sweep possible: the caller picks the physical drive directly
         rather than reaching it indirectly through a gate length it does not mean.
         Ignored by ``shape='raised_cosine'``, whose amplitude comes from the gate.
+    keep_full_channels : bool, default False
+        Also return the full ``[n_off, n_time]`` ``P01``/``P_leak`` rasters (see
+        :func:`population_channels`). Off by default so callers that keep whole
+        result dicts (``sweep_common``, ``calibrate_gate``) don't silently bloat;
+        the scalar per-offset leakage summaries (``leak_at_metric``, ``leak_max``,
+        the per-channel breakdown, ``leak_on_resonance``, ``norm_defect_max``) are
+        always computed and returned regardless, at negligible extra cost.
 
     Returns
     -------
     dict
         offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer [n_off],
-        eta_op, w_p_bare_GHz, resonance_offset_GHz, resonance_w_p_GHz, and the
-        probe metadata shape, drag_beat_GHz, spec_abs_GHz, chirp_coeffs_GHz.
+        eta_op, w_p_bare_GHz, resonance_offset_GHz, resonance_w_p_GHz, the probe
+        metadata shape, drag_beat_GHz, spec_abs_GHz, chirp_coeffs_GHz, plus the
+        leakage diagnostics from :func:`population_channels`: ``metric_time_index``
+        [n_off], ``leak_at_metric``/``leak_max``/``leak_f_a``/``leak_f_b``/
+        ``leak_coupler``/``leak_double``/``leak_spectator`` [n_off],
+        ``leak_on_resonance`` (scalar, at the offset nearest the located
+        resonance), ``norm_defect_max`` (scalar), and (if `keep_full_channels`)
+        ``P01``/``P_leak`` [n_off, n_time].
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     eta_op = (float(eta_op) if eta_op is not None
@@ -354,7 +478,8 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
         with ProcessPoolExecutor(max_workers=jobs) as pool:
             cols = list(pool.map(_chevron_worker, args))
 
-    P10 = np.array(cols)                       # [n_off, n_time]
+    stack = np.array(cols)                      # [n_off, len(CHANNELS), n_time]
+    P10 = stack[:, CHANNELS.index("P10"), :]    # [n_off, n_time]
     max_transfer = P10.max(axis=1)
     # Resonance criterion: for the CONSTANT probe, max-over-time = max Rabi contrast.
     # For the SHAPED full-iSWAP the gate is evaluated at t_g (the pump is off after),
@@ -365,23 +490,54 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
         k_tg = int(np.argmin(np.abs(np.asarray(times, dtype=float) - float(t_g))))
         metric = P10[:, k_tg]
         metric_label = f"P(|10>) at t_g={float(t_g):.0f} ns"
+        metric_time_index = np.full(P10.shape[0], k_tg, dtype=int)
     else:
         metric = max_transfer
         metric_label = "max-over-time P(|10>)"
+        metric_time_index = np.argmax(P10, axis=1)
     res_off = locate_resonance(np.asarray(offsets_GHz, dtype=float), metric)
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     w_p_bare = abs(wb - wa)
-    return {"offsets_GHz": np.asarray(offsets_GHz, dtype=float), "times_ns": times,
-            "P10": P10, "max_transfer": max_transfer,
-            "resonance_metric": metric, "metric_label": metric_label,
-            "eta_op": float(eta_op),
-            "w_p_bare_GHz": float(w_p_bare),
-            "resonance_offset_GHz": float(res_off),
-            "resonance_w_p_GHz": float(w_p_bare + res_off),
-            "shape": shape,
-            "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else np.nan),
-            "spec_abs_GHz": (float(spec_abs_GHz) if spec_abs_GHz is not None else np.nan),
-            "chirp_coeffs_GHz": chirp_list}
+
+    # Leakage diagnostics (see population_channels): scalar per-offset summaries are
+    # always computed -- cheap post-processing on `stack`, already in hand -- and only
+    # the full P01/P_leak rasters are gated behind `keep_full_channels`.
+    rows = np.arange(stack.shape[0])
+
+    def _at_metric(channel: str) -> np.ndarray:
+        return stack[rows, CHANNELS.index(channel), metric_time_index]
+
+    leak_at_metric = _at_metric("P_leak")
+    leak_max = stack[:, CHANNELS.index("P_leak"), :].max(axis=1)
+    leak_f_a = _at_metric("P_f_a")
+    leak_f_b = _at_metric("P_f_b")
+    leak_coupler = _at_metric("P_coupler")
+    leak_double = _at_metric("P_double")
+    leak_spectator = _at_metric("P_spectator")
+    norm_defect_max = float(stack[:, CHANNELS.index("norm_defect"), :].max())
+    j_res = int(np.argmin(np.abs(np.asarray(offsets_GHz, dtype=float) - res_off)))
+    leak_on_resonance = float(leak_at_metric[j_res])
+
+    out = {"offsets_GHz": np.asarray(offsets_GHz, dtype=float), "times_ns": times,
+           "P10": P10, "max_transfer": max_transfer,
+           "resonance_metric": metric, "metric_label": metric_label,
+           "eta_op": float(eta_op),
+           "w_p_bare_GHz": float(w_p_bare),
+           "resonance_offset_GHz": float(res_off),
+           "resonance_w_p_GHz": float(w_p_bare + res_off),
+           "shape": shape,
+           "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else np.nan),
+           "spec_abs_GHz": (float(spec_abs_GHz) if spec_abs_GHz is not None else np.nan),
+           "chirp_coeffs_GHz": chirp_list,
+           "metric_time_index": metric_time_index,
+           "leak_at_metric": leak_at_metric, "leak_max": leak_max,
+           "leak_f_a": leak_f_a, "leak_f_b": leak_f_b, "leak_coupler": leak_coupler,
+           "leak_double": leak_double, "leak_spectator": leak_spectator,
+           "leak_on_resonance": leak_on_resonance, "norm_defect_max": norm_defect_max}
+    if keep_full_channels:
+        out["P01"] = stack[:, CHANNELS.index("P01"), :]
+        out["P_leak"] = stack[:, CHANNELS.index("P_leak"), :]
+    return out
 
 
 # ---------------------------------------------------------------------------

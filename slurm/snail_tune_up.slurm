@@ -107,10 +107,12 @@
 #   N_TIME      chevron readout times (one solve covers all)          [161]
 #   TG_POINTS   length-scan grid points                              [13]
 #   CHIRP_DEGREE  Legendre truncation (even terms only matter). delta(u) is an
-#               EXACT degree-8 polynomial in cos(pi u/2), so 8 reconstructs it
-#               exactly for free (algebra on the already-fit k2/k4, not a new fit);
-#               below that, PLOT_RIDGE will show the chirp overshoot the ridge
-#               near |eta| -> 0                                            [4]
+#               EXACT degree-8 polynomial in cos(pi u/2), so the default of 8
+#               reconstructs it exactly for free (algebra on the already-fit
+#               k2/k4, not a new fit); below that, PLOT_RIDGE will show the
+#               chirp overshoot the ridge near |eta| -> 0                  [8]
+#   QUARTIC_WARN  warn (never raise) when the fitted quartic term exceeds this
+#               fraction of the quadratic term at TARGET_ETA               [0.25]
 #   DRAG_BEAT   beat of the process DRAG suppresses, in GHz; enables the
 #               chirp<->DRAG iteration                             [none]
 #   DRAG_N_PUMP pump quanta of that process: 1 one-pump, 2 subharmonic,
@@ -171,7 +173,8 @@ DRAG_SHIFT_POINTS="${DRAG_SHIFT_POINTS:-0}"
 WINDOW_TG="${WINDOW_TG:-2.0}"
 N_TIME="${N_TIME:-161}"
 TG_POINTS="${TG_POINTS:-13}"
-CHIRP_DEGREE="${CHIRP_DEGREE:-4}"
+CHIRP_DEGREE="${CHIRP_DEGREE:-8}"
+QUARTIC_WARN="${QUARTIC_WARN:-0.25}"
 DRAG_N_PUMP="${DRAG_N_PUMP:-1}"
 MAX_DRAG_ITERS="${MAX_DRAG_ITERS:-4}"
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-1}}"
@@ -222,6 +225,7 @@ srun ${LAUNCHER} -m snail_solver.tune_up \
     --wp-points "${WP_POINTS}" --span-linewidths "${SPAN_LINEWIDTHS}" \
     --drag-shift-points "${DRAG_SHIFT_POINTS}" \
     --tg-points "${TG_POINTS}" --chirp-degree "${CHIRP_DEGREE}" \
+    --quartic-warn "${QUARTIC_WARN}" \
     --drag-n-pump "${DRAG_N_PUMP}" --max-drag-iters "${MAX_DRAG_ITERS}" \
     --jobs "${JOBS}" --out "${OUT}" \
     ${OPTS}

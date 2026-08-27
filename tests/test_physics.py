@@ -1243,6 +1243,21 @@ class TestTuneUpAlgebra(unittest.TestCase):
         np.testing.assert_allclose(shapes[0], shapes[1], rtol=1e-10, atol=1e-12)
         self.assertAlmostEqual(float(np.max(shapes[0])), eta, places=6)
 
+    def test_post_chirp_row_scaling_reproduces_target_eta(self):
+        """post_chirp_table's row algebra: t_g_i carries the calibrated length
+        correction, and amp_scale_i must still hit the row's own target |eta| --
+        checked without any solve, mirroring the formula inside the function."""
+        from snail_solver.tune_up import fixed_eta_amp_scale, nominal_t_g, peak_eta_of
+        cfg = _cfg()
+        target_eta, t_g_star = 1.8, 79.0182       # a plausible fitted length != t_g0
+        t_g0_at_target = nominal_t_g(cfg, target_eta)
+        for frac in (0.5, 0.75, 1.0, 1.1):
+            e = frac * target_eta
+            t_g_i = nominal_t_g(cfg, e) * (t_g_star / t_g0_at_target)
+            amp_scale_i = fixed_eta_amp_scale(cfg, t_g_i, e)
+            self.assertAlmostEqual(peak_eta_of(cfg, t_g_i, amp_scale_i), e, places=10,
+                                   msg=f"frac={frac}")
+
 
 class TestTuneUpShiftFit(unittest.TestCase):
     """delta(|eta|) = delta0 + k2|eta|^2 + k4|eta|^4, split into static + Stark.
@@ -1476,6 +1491,28 @@ class TestTuneUpChirpProjection(unittest.TestCase):
         b = chirp_from_measured_shift(self._table(-0.9, 0.2), t_g=120.0)
         np.testing.assert_array_equal(a["coeffs_GHz"], b["coeffs_GHz"])
 
+    def test_perturbative_ok_flags_a_non_converging_law(self):
+        """perturbative_ok = quartic_fraction < quartic_warn (default 0.25).
+
+        Uses the same (k2=-0.9, k4=0.3, eta*=1.8) fixture as
+        test_quartic_term_moves_the_chirp, where quartic_fraction ~= 1.08 --
+        the quartic term is now LARGER than the quadratic one, i.e. exactly the
+        "law is not converging" case the flag exists to catch.
+        """
+        from snail_solver.tune_up import chirp_from_measured_shift
+        res = chirp_from_measured_shift(self._table(-0.9, 0.3), degree=4)
+        self.assertGreater(res["quartic_fraction"], 0.25)
+        self.assertFalse(res["perturbative_ok"])
+
+        small = chirp_from_measured_shift(self._table(-0.9, 0.01), degree=4)
+        self.assertLess(small["quartic_fraction"], 0.25)
+        self.assertTrue(small["perturbative_ok"])
+
+        # the threshold itself is a caller knob, not hardcoded
+        lenient = chirp_from_measured_shift(self._table(-0.9, 0.3), degree=4,
+                                            quartic_warn=2.0)
+        self.assertTrue(lenient["perturbative_ok"])
+
 
 class TestTuneUpDragCoupledChirp(unittest.TestCase):
     """DRAG's quadrature and the chirp are a fixed point, not a formula.
@@ -1638,6 +1675,236 @@ class TestTuneUpGpuFlag(unittest.TestCase):
         m_gpu, m_run = self._run_main([])
         m_gpu.assert_not_called()
         self.assertEqual(m_run.call_args.kwargs["jobs"], 0)
+
+
+class TestExpectedNumber(unittest.TestCase):
+    """spectroscopy.expected_number: the number-operator expectation of one mode,
+    marginalised over the others -- the un-thresholded generalisation of
+    marginal_population, used to check a mode's real photon occupation."""
+
+    def test_matches_a_hand_computed_expectation(self):
+        from snail_solver.spectroscopy import expected_number
+        dims = [3, 3, 5]
+        probs = np.zeros(np.prod(dims))
+        # mode 2 (the "coupler") in level 3 with weight 0.4, level 1 with weight 0.1,
+        # spread over arbitrary states of modes 0/1 -- <n> = 3*0.4 + 1*0.1 = 1.3
+        t = probs.reshape(dims)
+        t[0, 0, 3] = 0.4
+        t[1, 2, 1] = 0.1
+        t[0, 0, 0] = 0.5                                   # remainder, level 0
+        self.assertAlmostEqual(expected_number(t.ravel(), dims, 2), 1.3, places=12)
+
+    def test_zero_occupation_gives_zero(self):
+        from snail_solver.spectroscopy import expected_number
+        dims = [3, 3, 5]
+        t = np.zeros(dims)
+        t[0, 0, 0] = 1.0                                   # all population in vacuum
+        self.assertEqual(expected_number(t.ravel(), dims, 2), 0.0)
+
+
+class TestPopulationChannels(unittest.TestCase):
+    """find_stark_resonance.population_channels: where the population that isn't
+    P01/P10 actually is, read straight from the (already-computed) state vector."""
+
+    @staticmethod
+    def _cpl():
+        from snail_solver.zhou_coupler import ZhouCoupler
+        return ZhouCoupler(mode_freqs_GHz=[4.7, 5.7, 4.2], coupler_index=2,
+                           participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                           levels=[3, 3, 5], anharmonicities_GHz={0: -0.12, 1: -0.12})
+
+    def test_exclusive_leak_matches_a_hand_built_state(self):
+        from snail_solver.find_stark_resonance import population_channels, CHANNELS
+        cpl = self._cpl()
+        init = [0, 1, 0]                      # |01,0>
+        tgt = [1, 0, 0]                        # |10,0>
+        dim = cpl.dim
+
+        psi0 = np.zeros(dim, dtype=complex)
+        psi0[cpl.fock_index(init)] = 1.0       # t=0: pure |01,0>
+
+        # t=1: disjoint-by-construction so P_leak decomposes exactly into the
+        # diagnostic channels below (in general they OVERLAP -- see the docstring).
+        psi1 = np.zeros(dim, dtype=complex)
+        psi1[cpl.fock_index(tgt)] = np.sqrt(0.6)            # P10
+        psi1[cpl.fock_index(init)] = np.sqrt(0.1)           # residual P01
+        psi1[cpl.fock_index([0, 0, 1])] = np.sqrt(0.2)      # coupler excited
+        psi1[cpl.fock_index([0, 2, 0])] = np.sqrt(0.05)     # qubit b -> |f>
+        psi1[cpl.fock_index([1, 1, 0])] = np.sqrt(0.05)     # |11>
+
+        states = np.stack([psi0, psi1], axis=0)
+        ch = population_channels(cpl, states, init, tgt)
+        self.assertEqual(ch.shape, (len(CHANNELS), 2))
+
+        idx = {name: i for i, name in enumerate(CHANNELS)}
+        self.assertAlmostEqual(ch[idx["P01"], 0], 1.0, places=12)
+        self.assertAlmostEqual(ch[idx["P10"], 0], 0.0, places=12)
+        self.assertAlmostEqual(ch[idx["P_leak"], 0], 0.0, places=12)
+
+        self.assertAlmostEqual(ch[idx["P01"], 1], 0.1, places=12)
+        self.assertAlmostEqual(ch[idx["P10"], 1], 0.6, places=12)
+        self.assertAlmostEqual(ch[idx["P_leak"], 1], 0.3, places=12)
+        self.assertAlmostEqual(ch[idx["P_coupler"], 1], 0.2, places=12)
+        self.assertAlmostEqual(ch[idx["P_f_b"], 1], 0.05, places=12)
+        self.assertAlmostEqual(ch[idx["P_f_a"], 1], 0.0, places=12)
+        self.assertAlmostEqual(ch[idx["P_double"], 1], 0.05, places=12)
+        self.assertAlmostEqual(ch[idx["P_spectator"], 1], 0.0, places=12)
+        # by construction these three exhaust P_leak here (they need not in general)
+        self.assertAlmostEqual(ch[idx["P_coupler"], 1] + ch[idx["P_f_b"], 1]
+                               + ch[idx["P_double"], 1], ch[idx["P_leak"], 1], places=12)
+        np.testing.assert_allclose(ch[idx["norm_defect"]], [0.0, 0.0], atol=1e-12)
+
+    def test_norm_defect_reports_a_non_unit_norm_state(self):
+        """A non-normalized state (e.g. a truncated basis losing weight) must show
+        up as norm_defect, not be silently folded into P_leak."""
+        from snail_solver.find_stark_resonance import population_channels
+        cpl = self._cpl()
+        init, tgt = [0, 1, 0], [1, 0, 0]
+        psi = np.zeros(cpl.dim, dtype=complex)
+        psi[cpl.fock_index(init)] = np.sqrt(0.9)            # norm^2 = 0.9, not 1.0
+        ch = population_channels(cpl, psi[None, :], init, tgt)
+        from snail_solver.find_stark_resonance import CHANNELS
+        idx = {name: i for i, name in enumerate(CHANNELS)}
+        self.assertAlmostEqual(ch[idx["norm_defect"], 0], 0.1, places=12)
+        self.assertAlmostEqual(ch[idx["P01"], 0], 0.9, places=12)
+
+
+class TestChevronQuality(unittest.TestCase):
+    """Five independent, cheap checks on whether a chevron is really a two-level
+    Lorentzian -- promoted from what fit_chevron_center already computes."""
+
+    def test_clean_chevron_is_kept_at_close_to_its_own_contrast(self):
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        off, m = TestChevronCentreFit._chevron(-0.4)
+        cen = fit_chevron_center(off, m)
+        q = chevron_quality(cen, off, m, span_MHz=13.0, leak=0.0)
+        self.assertIsNone(q["reject"])
+        contrast = float(np.nanmax(m) - np.nanmin(m))
+        self.assertAlmostEqual(q["weight"], contrast, delta=0.05)
+        self.assertEqual(q["secondary"], 0.0)
+
+    def test_bimodal_chevron_is_flagged_multi_peak(self):
+        """This is the failure mode a raw centre/vertex gap MISSES: when the
+        Lorentzian fit fails outright, fit_chevron_center falls back to vertex_GHz
+        for BOTH fields, so the gap collapses to 0 even though the chevron is
+        clearly not a single resonance. secondary catches it directly."""
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        off, m1 = TestChevronCentreFit._chevron(-4.0, hwhm_GHz=1e-3, n_off=61,
+                                                span_MHz=13.0)
+        _, m2 = TestChevronCentreFit._chevron(+4.0, hwhm_GHz=1e-3, n_off=61,
+                                              span_MHz=13.0)
+        m = np.maximum(m1, m2)                # two comparable, well-separated peaks
+        cen = fit_chevron_center(off, m)
+        q = chevron_quality(cen, off, m, span_MHz=13.0, leak=0.0)
+        self.assertGreater(q["secondary"], 0.4)
+        self.assertEqual(q["reject"], "multi_peak")
+
+    def test_low_contrast_is_dropped(self):
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        off, m = TestChevronCentreFit._chevron(-0.4)
+        m = m * 0.1                            # scale below contrast_min
+        cen = fit_chevron_center(off, m)
+        q = chevron_quality(cen, off, m, span_MHz=13.0, leak=0.0, contrast_min=0.35)
+        self.assertEqual(q["reject"], "low_contrast")
+
+    def test_high_leakage_is_dropped_even_with_good_contrast(self):
+        """contrast_min alone cannot see this -- leak is an independent channel."""
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        off, m = TestChevronCentreFit._chevron(-0.4)
+        cen = fit_chevron_center(off, m)
+        ok = chevron_quality(cen, off, m, span_MHz=13.0, leak=0.0, leak_max=0.35)
+        self.assertIsNone(ok["reject"])
+        bad = chevron_quality(cen, off, m, span_MHz=13.0, leak=0.9, leak_max=0.35)
+        self.assertEqual(bad["reject"], "high_leakage")
+        self.assertLess(bad["weight"], ok["weight"])
+
+
+class TestShiftCurveStability(unittest.TestCase):
+    """shift_curve_stability catches contamination of an INTERPOLATING fit, which
+    extrapolation_ratio (measured |eta| vs target_eta) structurally cannot: a
+    sweep that measured up to or past target_eta looks fine by that guard alone
+    even when its own top rows are not resonances."""
+
+    def test_clean_law_is_stable_under_row_cutoffs(self):
+        from snail_solver.tune_up import shift_curve_stability
+        eta = np.linspace(0.5, 2.0, 12)
+        y = -0.7 - 0.3 * eta ** 2 + 0.05 * eta ** 4
+        res = shift_curve_stability(eta, y, target_eta=2.0)
+        self.assertLess(res["delta_spread"], 0.05)
+
+    def test_contaminated_top_row_is_unstable(self):
+        from snail_solver.tune_up import shift_curve_stability
+        eta = np.linspace(0.5, 2.0, 12)
+        y = -0.7 - 0.3 * eta ** 2 + 0.05 * eta ** 4
+        y[-1] += 20.0                          # one bad high-drive row
+        res = shift_curve_stability(eta, y, target_eta=2.0)
+        self.assertGreater(res["delta_spread"], 0.3)
+
+    def test_too_few_rows_reports_nan_not_an_error(self):
+        from snail_solver.tune_up import shift_curve_stability
+        eta = np.array([1.0, 1.5, 2.0])
+        y = -0.7 - 0.3 * eta ** 2
+        res = shift_curve_stability(eta, y, target_eta=2.0)
+        self.assertTrue(all(int(n) <= 3 for n in res["n_used_by_cutoff"]))
+
+
+class TestPlotPostChirpSmoke(unittest.TestCase):
+    """plot_post_chirp_table must render from a hand-built dict, both with and
+    without the flat-carrier comparison -- mirrors TestRabiPlot."""
+
+    @staticmethod
+    def _row(eta, wp_offset_GHz=0.0):
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        off, m = TestChevronCentreFit._chevron(-0.4)
+        n_t = 41
+        P10 = np.tile(m[:, None], (1, n_t))
+        P_leak = 1.0 - P10
+        cen = fit_chevron_center(off, m)
+        q = chevron_quality(cen, off, m, span_MHz=13.0, leak=0.1)
+        chirped = {"metric": m, "P10": P10, "P_leak": P_leak,
+                  "leak_at_metric": np.full_like(m, 0.1), "fit": cen, "quality": q,
+                  "transfer_at_wp_offset": float(m[len(m) // 2])}
+        return {"eta": eta, "offsets_GHz": off, "chirped": chirped}, chirped
+
+    def test_renders_without_flat_comparison(self):
+        from snail_solver.tune_up import plot_post_chirp_table
+        row, chirped = self._row(1.0)
+        post = {"eta": np.array([1.0]), "rows": [row],
+               "transfer_chirped": np.array([chirped["transfer_at_wp_offset"]]),
+               "transfer_flat": np.array([np.nan]),
+               "leak_chirped": np.array([0.1]), "leak_flat": np.array([np.nan]),
+               "residual_MHz": np.array([0.0]),
+               "record": {"wp_offset_GHz": 0.0, "target_eta": 1.0},
+               "compare_flat": False, "reproject_chirp": False}
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_post_chirp_table(post, out=os.path.join(d, "p.png"))
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_renders_with_flat_comparison_and_rabi_table_overlay(self):
+        from snail_solver.tune_up import plot_post_chirp_table
+        row, chirped = self._row(1.0)
+        flat = dict(chirped)
+        flat["transfer_at_wp_offset"] = 0.5
+        row["flat"] = flat
+        post = {"eta": np.array([1.0]), "rows": [row],
+               "transfer_chirped": np.array([chirped["transfer_at_wp_offset"]]),
+               "transfer_flat": np.array([0.5]),
+               "leak_chirped": np.array([0.1]), "leak_flat": np.array([0.2]),
+               "residual_MHz": np.array([0.1]),
+               "record": {"wp_offset_GHz": 0.0, "target_eta": 1.0},
+               "compare_flat": True, "reproject_chirp": False}
+        rabi_table = {"eta": np.array([0.5, 1.0]), "delta_MHz": np.array([1.0, 2.0])}
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_post_chirp_table(post, out=os.path.join(d, "p.png"),
+                                        rabi_table=rabi_table)
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_empty_rows_raises(self):
+        from snail_solver.tune_up import plot_post_chirp_table
+        with self.assertRaises(ValueError):
+            plot_post_chirp_table({"eta": np.array([]), "rows": [],
+                                  "record": {"wp_offset_GHz": 0.0, "target_eta": 1.0},
+                                  "compare_flat": False}, "unused.png")
 
 
 if __name__ == "__main__":

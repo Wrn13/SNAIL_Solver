@@ -96,6 +96,33 @@ def marginal_population(probs: np.ndarray, dims: Sequence[int], mode: int,
     return float(np.take(t, level, axis=mode).sum())
 
 
+def expected_number(probs: np.ndarray, dims: Sequence[int], mode: int) -> float:
+    """Number-operator expectation ``<n>`` of ``mode``, marginalised over all others.
+
+    ``sum_level level * marginal_population(probs, dims, mode, level)`` -- the real
+    photon-number occupation of a mode (e.g. the SNAIL/coupler), as opposed to
+    ``marginal_population``'s single-level readout. Used to check whether a pump
+    amplitude label (``eta``, nominally ``sqrt(n_s)``) still matches the coupler
+    mode's actual occupation once multi-photon channels start populating it.
+
+    Parameters
+    ----------
+    probs : ndarray
+        Probabilities over the full product basis, ordered as ``dims``.
+    dims : sequence of int
+        Per-mode truncation levels.
+    mode : int
+        Mode whose number expectation is wanted.
+
+    Returns
+    -------
+    float
+        ``<n>`` for ``mode``.
+    """
+    return float(sum(level * marginal_population(probs, dims, mode, level)
+                     for level in range(1, int(dims[mode]))))
+
+
 def _reduce_populations(pops: np.ndarray, reduce: str) -> float:
     """Reduce a population time series to one number (see ``reduce`` in scan_ge)."""
     if reduce == "max":
