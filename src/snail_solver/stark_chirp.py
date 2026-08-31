@@ -91,6 +91,47 @@ HANN_STARK_LEGENDRE: np.ndarray = np.array([
 HANN_MEAN_FACTOR: float = 0.375
 
 
+def shape_stark_legendre(shape_fn, degree: int = 8) -> np.ndarray:
+    """Legendre coefficients of an ARBITRARY normalized Stark-tracking shape.
+
+    The generalization of :data:`HANN_STARK_LEGENDRE`, which is the special case
+    ``shape_fn(u) = cos^4(pi u / 2)`` -- the Hann envelope squared. Recursive DRAG
+    needs a base shape with more vanishing end derivatives than a Hann has
+    (:class:`envelope.SinePowerRamp`), and its ``|eta(u)|^2`` is a different function,
+    so the tabulated Hann array stops applying the moment that shape is selected.
+
+    The quadrature is exact for any smooth `shape_fn`; the TRUNCATION at `degree` is
+    the only approximation, and it is the same one the Hann table makes.
+
+    Parameters
+    ----------
+    shape_fn : callable
+        ``u -> |eta(u)|^2 / eta_peak^2`` on ``[-1, 1]``, vectorized over `u`.
+    degree : int, default 8
+        Highest Legendre order to keep.
+
+    Returns
+    -------
+    ndarray
+        ``a_0 .. a_degree``, with odd terms zeroed (the envelope is symmetric about
+        mid-gate, so they vanish by parity; zeroing keeps that exact rather than
+        leaving quadrature dust).
+    """
+    from numpy.polynomial import legendre as L
+    n_quad = max(2 * int(degree) + 8, 32)
+    u, w = np.polynomial.legendre.leggauss(n_quad)
+    y = np.asarray(shape_fn(u), dtype=float)
+    a = np.array([(2 * k + 1) / 2.0 * np.sum(w * y * L.legval(u, np.eye(k + 1)[k]))
+                  for k in range(int(degree) + 1)])
+    a[1::2] = 0.0
+    return a
+
+
+def shape_mean_factor(shape_fn) -> float:
+    """Pulse-averaged ``shape_fn``, i.e. its ``a_0``. 0.375 for a Hann."""
+    return float(shape_stark_legendre(shape_fn, degree=0)[0])
+
+
 def hann_stark_legendre(degree: int = 4) -> np.ndarray:
     """Legendre coefficients of the Hann Stark-tracking shape, truncated at `degree`.
 

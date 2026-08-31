@@ -64,6 +64,25 @@ def _drag_ok_with_chirp(config: Dict[str, Any], beat_GHz: float, n_pump: int,
     delta = np.asarray(Chirp(chirp_coeffs_GHz, float(t_g)).detuning(ts, np)) / TWO_PI
     return bool(np.min(np.abs(float(beat_GHz) - int(n_pump) * delta)) >= skip)
 
+
+def _drag_channels_filtered(config: Dict[str, Any], channels: Sequence[Any],
+                            chirp_coeffs_GHz: Optional[Sequence[float]],
+                            t_g: float) -> tuple:
+    """The subset of `channels` that is safe for this (chirp, t_g); may be empty.
+
+    Recursive DRAG makes the sweeps' disable-don't-raise policy finer-grained. With a
+    single beat there was nothing to do but turn DRAG off; with several, one channel
+    swept onto its collision is no reason to throw away the other two -- the
+    composition is still well defined on whatever survives. Dropping only the
+    offender keeps the suppression the remaining channels provide.
+
+    Companion to :func:`_drag_ok_with_chirp`, which keeps its exact one-channel
+    signature and semantics for every existing caller.
+    """
+    return tuple(c for c in channels
+                 if _drag_ok_with_chirp(config, float(c.beat_GHz), int(c.n_pump),
+                                        chirp_coeffs_GHz, t_g))
+
 DEFAULT_CONFIG = {
     # target qubits a, b
     "qubit_freqs_GHz": [5.00, 4.60],

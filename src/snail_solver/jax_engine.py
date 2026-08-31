@@ -59,9 +59,12 @@ offered, and float16 is not implementable at all (near t = 77 its spacing is
 """
 from __future__ import annotations
 
+from math import comb as _comb
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
+
+from snail_solver import drag
 
 TWO_PI = 2.0 * np.pi
 
@@ -246,6 +249,16 @@ def pulse_spec(cpl) -> Dict[str, Any]:
             # `eta_at` from `params["chirp"]` -- see the note there.
             "drag_rad": float((tone.delta_drag_GHz or 0.0) * TWO_PI),
             "drag_n_pump": int(getattr(tone, "drag_n_pump", 1)),
+            # STATIC: the channel list controls unrolled Python loops (n_photon,
+            # mode, quotient_rule) and must never be traced. `DragChannel` is a
+            # frozen dataclass of plain floats/ints/strs/bools, so it is hashable and
+            # safe as a jit static, exactly like `drag_rad` beside it. Only the beats
+            # are frozen here; their CHIRP-dependent part is rebuilt in `eta_at`.
+            "drag_channels": tone.drag_channels_resolved(),
+            "legacy_drag": bool(tone.is_legacy_drag),
+            # SinePowerRamp shape parameters (static; the shape has no free params)
+            "shape_m": int(getattr(env, "m", 0)),
+            "shape_t_rise": float(getattr(env, "t_rise", 0.0)) or None,
         })
     return {"n_tones": len(tones), "tones": tones}
 
@@ -287,6 +300,94 @@ def _shape_at(spec_tone: Dict[str, Any], params: Dict[str, Any], t: Any,
     dM = ((xp.sum(c * (sI * freqs), axis=-1) - xp.sum(s * (cI * freqs), axis=-1))
           + 1j * (xp.sum(c * (sQ * freqs), axis=-1) - xp.sum(s * (cQ * freqs), axis=-1)))
     return (dS * M + S * dM) * support
+
+
+def _hann_derivs(t: Any, t_g: float, order: int, xp: Any) -> list:
+    """``S, S', ..., S^(order)`` of the Hann shape; mirrors ``RaisedCosine.jet_at``."""
+    W = TWO_PI / t_g
+    return [0.5 * (1.0 - xp.cos(W * t))] + [
+        -0.5 * W ** n * xp.cos(W * t + n * (np.pi / 2.0))
+        for n in range(1, int(order) + 1)]
+
+
+def _iq_mod_derivs(freqs: Any, q: Any, t: Any, order: int, xp: Any) -> list:
+    """``M, M', ..., M^(order)`` of the Fourier modulation; mirrors
+    ``IQFourierEnvelope._mod_derivs``. Reads the coefficients from `q` (a `params`
+    slice) so they stay a grad axis."""
+    n = freqs.size
+    sI, sQ, cI, cQ = q[:n], q[n:2 * n], q[2 * n:3 * n], q[3 * n:]
+    arg = xp.asarray(t)[..., None] * freqs
+    out = []
+    for m in range(int(order) + 1):
+        s, c = xp.sin(arg + m * (np.pi / 2.0)), xp.cos(arg + m * (np.pi / 2.0))
+        wm = freqs ** m
+        term = ((xp.sum(s * (sI * wm), axis=-1) + xp.sum(c * (cI * wm), axis=-1))
+                + 1j * (xp.sum(s * (sQ * wm), axis=-1) + xp.sum(c * (cQ * wm), axis=-1)))
+        out.append(1.0 + term if m == 0 else term)
+    return out
+
+
+def _constant_shape_jet(st, params, t, p, xp, order, support):
+    """Flat pulse: the value, then zeros."""
+    z = 0.0 * xp.asarray(t)
+    return (support,) + tuple(z for _ in range(int(order)))
+
+
+def _hann_shape_jet(st, params, t, p, xp, order, support):
+    """Hann, optionally times a Fourier modulation (Leibniz over the product)."""
+    order = int(order)
+    S = _hann_derivs(t, st["t_g"], order, xp)
+    freqs = st["freqs"]
+    if freqs.size == 0:
+        return tuple(S[n] * support for n in range(order + 1))
+    M = _iq_mod_derivs(freqs, params["iq"][p], t, order, xp)
+    return tuple(support * sum(_comb(n, j) * S[j] * M[n - j] for j in range(n + 1))
+                 for n in range(order + 1))
+
+
+def _sine_power_shape_jet(st, params, t, p, xp, order, support):
+    """Li/Calarco/Motzoi Eq. (13) ramp.
+
+    Unlike the Hann family this delegates straight to the envelope class rather than
+    re-deriving the series. That is safe here precisely BECAUSE the shape carries no
+    free parameters (``n_params == 0``): there is nothing that would have to come
+    from `params` to stay a grad axis, so rebuilding the object from static spec
+    fields cannot break differentiation. `jet_at` is already xp-generic, so it traces.
+    """
+    from snail_solver.envelope import SinePowerRamp
+    env = SinePowerRamp(1.0, st["t_g"], m=st["shape_m"], t_rise=st["shape_t_rise"])
+    return env.jet_at(t, order, xp)          # amp = 1, and it masks its own support
+
+
+#: Envelope kind -> derivative builder. A new :class:`envelope.Envelope` subclass needs
+#: one entry HERE and one `jet_at` override there; nothing else in either file changes.
+#: Keyed on the string `pulse_spec` writes, i.e. the class name.
+_SHAPE_JETS = {
+    "ConstantPulse": _constant_shape_jet,
+    "RaisedCosine": _hann_shape_jet,
+    "IQFourierEnvelope": _hann_shape_jet,
+    "SinePowerRamp": _sine_power_shape_jet,
+}
+
+
+def _shape_jet_at(spec_tone: Dict[str, Any], params: Dict[str, Any], t: Any,
+                  p: int, xp: Any, order: int) -> tuple:
+    """Envelope derivatives ``(S, S', ..., S^(order))`` at `t`, in units of `amp`.
+
+    The jet counterpart of :func:`_shape_at`, used only by the recursive-DRAG path;
+    `_shape_at` is left untouched so the historical first-order path stays
+    bit-identical.
+    """
+    kind = spec_tone["kind"]
+    try:
+        builder = _SHAPE_JETS[kind]
+    except KeyError:                                       # pragma: no cover
+        raise NotImplementedError(
+            f"no derivative builder for envelope kind {kind!r}; add one to "
+            f"jax_engine._SHAPE_JETS alongside its Envelope.jet_at override") from None
+    t_g = spec_tone["t_g"]
+    support = xp.where((t >= 0.0) & (t <= t_g), 1.0, 0.0)
+    return builder(spec_tone, params, t, p, xp, order, support)
 
 
 def _chirp_phase(params: Dict[str, Any], t: Any, p: int, t_g: float, xp: Any):
@@ -331,6 +432,58 @@ def _chirp_detuning(params: Dict[str, Any], t: Any, p: int, t_g: float, xp: Any)
     return TWO_PI * total
 
 
+def _chirp_detuning_jet(params: Dict[str, Any], t: Any, p: int, t_g: float,
+                        order: int, xp: Any) -> tuple:
+    """``delta, delta', ..., delta^(order)``; mirrors ``envelope.Chirp.detuning_jet``.
+
+    Duplicated here for the same reason as :func:`_chirp_detuning`: the coefficients
+    must come from `params` to stay a vmap/grad axis. That matters MORE on the
+    recursive path than it ever did on the first-order one -- a chirp now reaches the
+    amplitude through ``Delta``, ``Delta'`` and ``Delta''``, so freezing the
+    coefficients into `spec` would silently kill three gradient routes instead of one.
+    """
+    coeffs = params["chirp"][p]
+    n = coeffs.shape[0] if hasattr(coeffs, "shape") else len(coeffs)
+    order = int(order)
+    if n == 0:
+        z = 0.0 * xp.asarray(t)
+        return tuple(z for _ in range(order + 1))
+    u = xp.clip(2.0 * xp.asarray(t) / t_g - 1.0, -1.0, 1.0)
+    # P[m][k] = d^m P_k / du^m, by the Legendre recurrence differentiated in place
+    P = [[xp.ones_like(u), u]]
+    for k in range(1, n):
+        P[0].append(((2 * k + 1) * u * P[0][k] - k * P[0][k - 1]) / (k + 1))
+    zero, ones = 0.0 * u, xp.ones_like(u)
+    for m in range(1, order + 1):
+        prev, row = P[m - 1], [zero, ones if m == 1 else zero]
+        for k in range(1, n):
+            row.append(((2 * k + 1) * (u * row[k] + m * prev[k])
+                        - k * row[k - 1]) / (k + 1))
+        P.append(row)
+    support = xp.where((t >= 0.0) & (t <= t_g), 1.0, 0.0)
+    du_dt = 2.0 / t_g
+    out = [_chirp_detuning(params, t, p, t_g, xp)]
+    for m in range(1, order + 1):
+        total = P[m][0] * coeffs[0]
+        for k in range(1, n):
+            total = total + coeffs[k] * P[m][k]
+        out.append(TWO_PI * du_dt ** m * total * support)
+    return tuple(out)
+
+
+def _channel_detuning_jet(st: Dict[str, Any], params: Dict[str, Any], t: Any, p: int,
+                          ch: Any, order: int, xp: Any) -> tuple:
+    """``Delta_j = 2 pi beat - n_pump delta(t)`` and its derivatives, in rad/ns."""
+    order = int(order)
+    base = float(ch.beat_GHz) * TWO_PI
+    k = int(ch.n_pump)
+    if not k:
+        z = 0.0 * xp.asarray(t)
+        return (base + z,) + tuple(z for _ in range(order))
+    dj = _chirp_detuning_jet(params, t, p, st["t_g"], order, xp)
+    return (base - k * dj[0],) + tuple(-k * dj[m] for m in range(1, order + 1))
+
+
 def eta_at(spec: Dict[str, Any], params: Dict[str, Any], t: Any, p: int, xp: Any):
     """Pump amplitude eta_p(t) -- the traceable twin of ``ZhouCoupler._eta_at``.
 
@@ -347,12 +500,20 @@ def eta_at(spec: Dict[str, Any], params: Dict[str, Any], t: Any, p: int, xp: Any
     st = spec["tones"][p]
     amp = params["amp"][p]
     a = amp * _shape_at(st, params, t, p, xp, deriv=False)
-    if st["drag"]:
+    channels = st.get("drag_channels", ())
+    if st["legacy_drag"]:
         detuning = st["drag_rad"]
         k = st.get("drag_n_pump", 1)
         if k:
             detuning = detuning - k * _chirp_detuning(params, t, p, st["t_g"], xp)
         a = a - 1j * amp * _shape_at(st, params, t, p, xp, deriv=True) / detuning
+    elif channels:
+        order = drag.required_order(channels)
+        shape = _shape_jet_at(st, params, t, p, xp, order)
+        a = drag.apply_drag(
+            [amp * s for s in shape],
+            [_channel_detuning_jet(st, params, t, p, c, order, xp) for c in channels],
+            channels, xp)
     a = a * xp.exp(-1j * _chirp_phase(params, t, p, st["t_g"], xp))
     return st["prefactor"] * a * xp.exp(1j * st["phi_p"])
 

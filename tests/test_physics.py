@@ -1157,6 +1157,933 @@ class TestTimeDependentDrag(unittest.TestCase):
                            "objective must actually depend on the chirp")
 
 
+# ===========================================================================
+# Recursive multi-derivative DRAG (Li/Calarco/Motzoi, npj QI 10, 66 (2024))
+# ===========================================================================
+def _fd(f, t, n, h):
+    """n-th central difference of `f` at `t` with step `h` (error O(h^2))."""
+    if n == 0:
+        return f(t)
+    return (_fd(f, t + h, n - 1, h) - _fd(f, t - h, n - 1, h)) / (2 * h)
+
+
+def _fd_order(f, t, n, jet_n):
+    """Assert `jet_n` is the n-th derivative, by CONVERGENCE not by tolerance.
+
+    A finite difference of order n carries an O(h^2) truncation error that no fixed
+    tolerance can separate from a genuinely wrong formula. Halving h must shrink the
+    residual by ~4; a wrong closed form leaves a constant offset and the ratio
+    collapses to 1. Returns the observed ratios so callers can assert on them.
+    """
+    errs = []
+    for h in (0.8, 0.4, 0.2):
+        want = _fd(f, t, n, h)
+        errs.append(float(np.max(np.abs(np.asarray(jet_n) - want))))
+    return [errs[i] / max(errs[i + 1], 1e-300) for i in range(2)]
+
+
+class TestJetArithmetic(unittest.TestCase):
+    """Truncated Taylor arithmetic -- the engine under the recursion.
+
+    Everything here is checked against an independently computed ground truth, since
+    a silently-wrong jet would produce a plausible pulse that is simply not the one
+    the paper defines.
+    """
+
+    N = 4
+
+    def setUp(self):
+        from snail_solver.jet import Jet
+        self.Jet = Jet
+        self.t = np.linspace(0.3, 2.7, 7)
+        self.w = 1.7
+        t, w = self.t, self.w
+        self.S = Jet.from_derivs([w ** k * np.sin(w * t + k * np.pi / 2)
+                                  for k in range(self.N + 1)])
+        self.C = Jet.from_derivs([(2.0 + np.cos(w * t)) if k == 0
+                                  else w ** k * np.cos(w * t + k * np.pi / 2)
+                                  for k in range(self.N + 1)])
+
+    def test_mul_matches_the_product_rule(self):
+        """The convolution must reproduce hand-differentiated sin(wt)(2+cos(wt))."""
+        t, w = self.t, self.w
+        f, g = np.sin(w * t), 2 + np.cos(w * t)
+        want = [f * g,
+                w * np.cos(w * t) * g + f * (-w * np.sin(w * t)),
+                (-w ** 2 * np.sin(w * t) * g + 2 * (w * np.cos(w * t))
+                 * (-w * np.sin(w * t)) + f * (-w ** 2 * np.cos(w * t)))]
+        for k, exp in enumerate(want):
+            np.testing.assert_allclose(self.S.mul(self.C).derivs()[k], exp, atol=1e-13)
+
+    def test_div_inverts_mul(self):
+        """(S/C)*C == S to machine precision, at every order."""
+        for a, b in zip(self.S.div(self.C).mul(self.C).derivs(), self.S.derivs()):
+            np.testing.assert_allclose(a, b, atol=1e-13)
+
+    def test_powi_matches_repeated_multiplication(self):
+        for a, b in zip(self.S.powi(3).derivs(),
+                        self.S.mul(self.S).mul(self.S).derivs()):
+            np.testing.assert_allclose(a, b, atol=0, rtol=0)
+
+    def test_powf_inverts_powi(self):
+        """The fractional root is what F^(n) applies on the way out."""
+        for n in (2, 3):
+            with self.subTest(n=n):
+                for a, b in zip(self.C.powf(1.0 / n).powi(n).derivs(),
+                                self.C.derivs()):
+                    np.testing.assert_allclose(a, b, atol=1e-12)
+
+    def test_powf_on_a_complex_jet(self):
+        """The F^(2) route: sqrt of Omega^2 - 2i Omega Omega'/Delta."""
+        D = self.Jet.constant(3.0 + 0.0 * self.t, self.N - 1)
+        Z = self.S.powi(2).sub(self.S.mul(self.S.deriv()).scale(2j).div(D))
+        for a, b in zip(Z.powf(0.5).powi(2).derivs(), Z.derivs()):
+            np.testing.assert_allclose(a, b, atol=1e-12)
+
+    def test_powf_one_is_the_exact_identity(self):
+        """n_photon == 1 must not perturb a single bit.
+
+        Every pre-existing caller is single-photon, so this short-circuit is what
+        lets the general path stay numerically neutral for them.
+        """
+        for a, b in zip(self.C.powf(1.0).derivs(), self.C.derivs()):
+            np.testing.assert_allclose(a, b, atol=0, rtol=0)
+        self.assertIs(self.C.powf(1.0), self.C)
+
+    def test_deriv_shifts_and_lowers_the_order(self):
+        d = self.S.deriv()
+        self.assertEqual(d.order, self.S.order - 1)
+        for a, b in zip(d.derivs(), self.S.derivs()[1:]):
+            np.testing.assert_allclose(a, b, atol=0, rtol=0)
+        with self.assertRaises(ValueError):
+            self.Jet([np.zeros(3)]).deriv()
+
+    def test_safe_divide_is_finite_at_a_zero_denominator(self):
+        """The envelope vanishes at both gate edges, so this case is not exotic."""
+        z = np.array([-1.0, 0.0, 1.0])
+        one = np.ones_like(z)
+        out = self.Jet([one] * 3).div(self.Jet([z, one, 0.0 * z])).derivs()
+        for c in out:
+            self.assertTrue(np.all(np.isfinite(c)))
+
+    def test_safe_divide_gives_no_nan_gradient(self):
+        """A single `where` is NOT enough -- it still poisons the BACKWARD pass."""
+        try:
+            import jax
+        except ImportError:                                    # pragma: no cover
+            self.skipTest("jax not installed")
+        jax.config.update("jax_enable_x64", True)
+        import jax.numpy as jnp
+
+        def obj(a):
+            num = self.Jet([a * jnp.ones(3), jnp.ones(3)])
+            den = self.Jet([jnp.asarray([-1.0, 0.0, 1.0]), jnp.ones(3)])
+            return jnp.sum(jnp.abs(jnp.asarray(num.div(den, jnp).derivs())) ** 2)
+
+        g = float(jax.grad(obj)(2.0))
+        self.assertTrue(np.isfinite(g), f"gradient through the guard is {g}")
+
+
+class TestEnvelopeJets(unittest.TestCase):
+    """Analytic higher derivatives of every envelope, and of the chirp."""
+
+    T_G = 40.0
+    ORDER = 3
+
+    def _envelopes(self):
+        from snail_solver.envelope import (ConstantPulse, IQFourierEnvelope,
+                                           RaisedCosine)
+        return [RaisedCosine(1.3, self.T_G), ConstantPulse(0.7, self.T_G),
+                IQFourierEnvelope(1.1, self.T_G, freqs=[0.21, 0.47],
+                                  sin_I=[0.3, -0.1], sin_Q=[0.2, 0.05],
+                                  cos_I=[-0.15, 0.08], cos_Q=[0.1, -0.2])]
+
+    def test_jets_are_the_derivatives(self):
+        """Checked by h-refinement: the residual must fall as O(h^2), not merely be
+        small. See :func:`_fd_order`."""
+        t = np.linspace(6.0, self.T_G - 6.0, 21)
+        for env in self._envelopes():
+            jet = env.jet_at(t, self.ORDER, np)
+            self.assertEqual(len(jet), self.ORDER + 1)
+            for n in range(1, self.ORDER + 1):
+                with self.subTest(env=type(env).__name__, n=n):
+                    if np.max(np.abs(np.asarray(jet[n]))) < 1e-14:
+                        continue                       # ConstantPulse: exactly zero
+                    for r in _fd_order(lambda x: env.value_at(x, np), t, n, jet[n]):
+                        self.assertGreater(r, 3.2)
+                        self.assertLess(r, 4.8)
+
+    def test_jet_order_one_reproduces_deriv_at(self):
+        t = np.linspace(2.0, self.T_G - 2.0, 17)
+        for env in self._envelopes():
+            with self.subTest(env=type(env).__name__):
+                np.testing.assert_allclose(env.jet_at(t, self.ORDER, np)[1],
+                                           env.deriv_at(t, np), atol=1e-15)
+
+    def test_jets_vanish_outside_the_gate(self):
+        t = np.array([-3.0, -0.5, self.T_G + 0.5, self.T_G + 3.0])
+        for env in self._envelopes():
+            with self.subTest(env=type(env).__name__):
+                for c in env.jet_at(t, self.ORDER, np):
+                    np.testing.assert_allclose(c, 0.0, atol=0, rtol=0)
+
+    def test_hann_supports_exactly_one_clean_derivative(self):
+        """THE reason a raised cosine cannot carry the full recursion.
+
+        The paper's Eq. 13 shape has m vanishing derivatives at each edge "which
+        guarantees the validity of the frame transformation". Hann has two, not
+        three -- so a second nested correction turns the pulse on with a finite
+        amplitude STEP. This test states that boundary fact directly.
+        """
+        from snail_solver.envelope import RaisedCosine
+        env = RaisedCosine(1.3, self.T_G)
+        for edge in (0.0, self.T_G):
+            jet = env.jet_at(np.array([edge]), 2, np)
+            with self.subTest(edge=edge):
+                self.assertEqual(abs(complex(jet[0][0])), 0.0)      # eps  = 0
+                self.assertLess(abs(complex(jet[1][0])), 1e-16)     # eps' = 0
+                self.assertAlmostEqual(abs(complex(jet[2][0])),     # eps'' != 0
+                                       1.3 * 0.5 * (TWO_PI / self.T_G) ** 2, places=12)
+
+    def test_iq_with_no_basis_is_a_raised_cosine_at_every_order(self):
+        from snail_solver.envelope import IQFourierEnvelope, RaisedCosine
+        t = np.linspace(0.0, self.T_G, 33)
+        a = IQFourierEnvelope(1.3, self.T_G).jet_at(t, self.ORDER, np)
+        b = RaisedCosine(1.3, self.T_G).jet_at(t, self.ORDER, np)
+        for x, y in zip(a, b):
+            np.testing.assert_allclose(x, y, atol=1e-15)
+
+    def test_chirp_detuning_jet(self):
+        from snail_solver.envelope import Chirp
+        ch = Chirp([0.004, 0.0, -0.011, 0.0, 0.003], self.T_G)
+        t = np.linspace(6.0, self.T_G - 6.0, 21)
+        jet = ch.detuning_jet(t, self.ORDER, np)
+        # order 0 must be EXACTLY detuning(): the DRAG beat outside the gate depends
+        # on it, and this method must not quietly redefine it.
+        np.testing.assert_allclose(jet[0], ch.detuning(t, np), atol=0, rtol=0)
+        for n in (1, 2):
+            with self.subTest(n=n):
+                for r in _fd_order(lambda x: np.asarray(ch.detuning(x, np)),
+                                   t, n, jet[n]):
+                    self.assertGreater(r, 3.2)
+                    self.assertLess(r, 4.8)
+
+    def test_chirp_detuning_jet_is_inert_without_a_chirp(self):
+        from snail_solver.envelope import Chirp
+        out = Chirp([], self.T_G).detuning_jet(np.linspace(0, self.T_G, 9),
+                                               self.ORDER, np)
+        self.assertEqual(len(out), self.ORDER + 1)
+        for c in out:
+            np.testing.assert_allclose(c, 0.0, atol=0, rtol=0)
+
+    def test_chirp_derivatives_vanish_outside_the_gate(self):
+        """`_u` clips, so delta is constant out there and its slope is genuinely 0."""
+        from snail_solver.envelope import Chirp
+        ch = Chirp([0.004, 0.0, -0.011], self.T_G)
+        t = np.array([-2.0, self.T_G + 2.0])
+        for c in ch.detuning_jet(t, self.ORDER, np)[1:]:
+            np.testing.assert_allclose(c, 0.0, atol=0, rtol=0)
+
+
+class TestJetImplementationsAgree(unittest.TestCase):
+    """`jax_engine` mirrors the envelope/chirp jets; the two must not drift.
+
+    Same contract as :class:`TestChirpPhaseImplementationsAgree`, extended to the
+    derivative stacks the recursion consumes.
+    """
+
+    T_G = 40.0
+    ORDER = 3
+    COEFFS = [0.0, 0.01, 0.03, 0.0, -0.004]
+
+    def test_chirp_detuning_jets_agree(self):
+        from snail_solver.envelope import Chirp
+        from snail_solver.jax_engine import _chirp_detuning_jet
+        t = np.linspace(0.0, self.T_G, 65)
+        got = _chirp_detuning_jet({"chirp": [np.asarray(self.COEFFS)]}, t, 0,
+                                  self.T_G, self.ORDER, np)
+        want = Chirp(self.COEFFS, self.T_G).detuning_jet(t, self.ORDER, np)
+        for a, b in zip(got, want):
+            np.testing.assert_allclose(a, b, atol=1e-12)
+
+    def test_shape_jets_agree(self):
+        from snail_solver.envelope import (ConstantPulse, IQFourierEnvelope,
+                                           RaisedCosine)
+        from snail_solver.jax_engine import _shape_jet_at
+        t = np.linspace(0.0, self.T_G, 65)
+        envs = [RaisedCosine(1.0, self.T_G), ConstantPulse(1.0, self.T_G),
+                IQFourierEnvelope(1.0, self.T_G, freqs=[0.21, 0.47],
+                                  sin_I=[0.3, -0.1], sin_Q=[0.2, 0.05],
+                                  cos_I=[-0.15, 0.08], cos_Q=[0.1, -0.2])]
+        for env in envs:
+            st = {"kind": type(env).__name__, "t_g": self.T_G,
+                  "freqs": np.asarray(getattr(env, "freqs", np.zeros(0)), float)}
+            params = {"iq": [np.asarray(env.get_params(), float)]}
+            got = _shape_jet_at(st, params, t, 0, np, self.ORDER)
+            want = env.jet_at(t, self.ORDER, np)      # env.amp == 1, so units match
+            for a, b in zip(got, want):
+                with self.subTest(env=st["kind"]):
+                    np.testing.assert_allclose(a, b, atol=1e-12)
+
+    def test_an_unknown_envelope_kind_fails_loudly(self):
+        """A new Envelope subclass must not be silently treated as a Hann."""
+        from snail_solver.jax_engine import _shape_jet_at
+        with self.assertRaises(NotImplementedError):
+            _shape_jet_at({"kind": "SomeNewShape", "t_g": self.T_G,
+                           "freqs": np.zeros(0)}, {"iq": [np.zeros(0)]},
+                          np.zeros(3), 0, np, 2)
+
+
+class TestRecursiveDrag(unittest.TestCase):
+    """The composition itself: ``F^(1) o F^(1) o F^(2)`` and its guarantees."""
+
+    T_G = 40.0
+    COEFFS = [0.0, 0.0, -0.012, 0.0, 0.004]
+
+    def _env(self):
+        from snail_solver.envelope import RaisedCosine
+        return RaisedCosine(1.4, self.T_G)
+
+    def _tone(self, channels=None, chirped=True, **kw):
+        from snail_solver.envelope import Chirp, PumpTone
+        return PumpTone(w_p_GHz=1.7, envelope=self._env(),
+                        chirp=(Chirp(self.COEFFS, self.T_G) if chirped else None),
+                        drag_channels=channels, **kw)
+
+    def _general(self, tone, t):
+        from snail_solver.drag import apply_drag, required_order
+        chs = tone.drag_channels_resolved()
+        k = required_order(chs)
+        return apply_drag(tone.envelope.jet_at(t, k, np),
+                          [tone.channel_detuning_jet(c, t, k, np) for c in chs],
+                          chs, np)
+
+    # -- the contract with everything that came before ---------------------
+    def test_order_one_reproduces_the_legacy_expression(self):
+        """The whole feature must be a no-op for every existing caller.
+
+        Both branches are exercised: `is_legacy_drag` routes the solver through the
+        closed form, and this checks that the JET path lands on the same number --
+        which is what makes the fast path an optimization rather than a divergence.
+        """
+        t = np.linspace(0.0, self.T_G, 401)
+        env = self._env()
+        for chirped in (True, False):
+            with self.subTest(chirped=chirped):
+                tone = self._tone(chirped=chirped, drag=True, delta_drag_GHz=0.30,
+                                  drag_n_pump=1)
+                self.assertTrue(tone.is_legacy_drag)
+                legacy = (env.value_at(t, np)
+                          - 1j * env.deriv_at(t, np) / tone.drag_detuning(t, np))
+                np.testing.assert_allclose(self._general(tone, t), legacy, atol=1e-13)
+
+    def test_drag_off_resolves_to_no_channels(self):
+        """Mirrors `make_chirp` returning None: an inert tone skips the path entirely."""
+        self.assertEqual(self._tone().drag_channels_resolved(), ())
+        self.assertEqual(self._tone(drag=True, delta_drag_GHz=0.0)
+                         .drag_channels_resolved(), ())
+        self.assertFalse(self._tone().is_legacy_drag)
+
+    def test_legacy_fields_become_the_one_channel_shorthand(self):
+        tone = self._tone(drag=True, delta_drag_GHz=0.25, drag_n_pump=2)
+        (ch,) = tone.drag_channels_resolved()
+        self.assertAlmostEqual(ch.beat_GHz, 0.25)
+        self.assertEqual(ch.n_pump, 2)
+        # n_photon stays 1: promoting it would silently turn every existing
+        # subharmonic (drag_n_pump=2) call site into second-order DRAG.
+        self.assertEqual(ch.n_photon, 1)
+        self.assertTrue(tone.is_legacy_drag)
+
+    # -- the composition rules ---------------------------------------------
+    def test_multi_photon_channels_are_forced_innermost(self):
+        """F^(n>=2) takes an n-th root, whose branch is only unambiguous while the
+        amplitude is still real. Caller order must not be able to break that."""
+        from snail_solver.envelope import DragChannel
+        c1 = DragChannel(0.30, n_photon=1)
+        c2 = DragChannel(0.55, n_pump=2, n_photon=2)
+        for order in ([c1, c2], [c2, c1]):
+            with self.subTest(order=[c.n_photon for c in order]):
+                got = self._tone(channels=order).drag_channels_resolved()
+                self.assertEqual([c.n_photon for c in got], [2, 1])
+
+    def test_composition_order_actually_matters(self):
+        """Guards against the sort being a decorative no-op."""
+        from snail_solver.drag import apply_drag
+        from snail_solver.envelope import DragChannel
+        t = np.linspace(0.0, self.T_G, 201)
+        c1, c2 = DragChannel(0.30, n_photon=1), DragChannel(0.55, n_pump=2, n_photon=2)
+        tone = self._tone(channels=[c1, c2])
+        jets = {c: tone.channel_detuning_jet(c, t, 2, np) for c in (c1, c2)}
+        shape = tone.envelope.jet_at(t, 2, np)
+        right = apply_drag(shape, [jets[c2], jets[c1]], [c2, c1], np)   # F1 o F2
+        # bypass the sort to build the physically wrong composition F2 o F1
+        g = apply_drag(tone.envelope.jet_at(t, 1, np), [jets[c1]], [c1], np)
+        self.assertGreater(np.max(np.abs(right - g)), 1e-3 * np.max(np.abs(right)))
+
+    def test_the_quotient_rule_term_is_real_and_grows_near_a_collision(self):
+        """Documents that today's arithmetic is NOT Eq. (4) verbatim on a chirp.
+
+        `eta - i eta'/Delta` omits the `+i eta Delta'/Delta^2` that the quotient rule
+        contributes once a chirp makes Delta time-dependent. Small far away,
+        order-unity near a collision -- exactly where DRAG is doing the work.
+        """
+        from snail_solver.envelope import DragChannel
+        t = np.linspace(0.0, self.T_G, 401)
+        base = self._env().value_at(t, np)
+        seen = {}
+        for beat in (0.30, 0.02):
+            on = self._general(self._tone(
+                channels=[DragChannel(beat, quotient_rule=True)]), t)
+            off = self._general(self._tone(
+                channels=[DragChannel(beat, quotient_rule=False)]), t)
+            seen[beat] = (np.max(np.abs(on - off))
+                          / np.max(np.abs(off - base)))
+        self.assertLess(seen[0.30], 0.10)          # a few % at 300 MHz
+        self.assertGreater(seen[0.02], 0.30)       # order unity at 20 MHz
+        self.assertGreater(seen[0.02], 3.0 * seen[0.30])
+
+    def test_hann_diverges_under_the_full_recursion(self):
+        """The measured justification for the Eq. 13 base shape.
+
+        With F^(2) innermost the imaginary term dominates as t -> 0, so for a shape
+        vanishing as t^p the corrected pulse goes as t^(p-1/2). Hann has p = 2, so
+        two further derivatives give t^(-1/2): halving the first sample time must
+        multiply the amplitude there by ~sqrt(2), without bound.
+        """
+        from snail_solver.envelope import DragChannel
+        tone = self._tone(chirped=False, channels=[
+            DragChannel(0.30, n_photon=1), DragChannel(-0.22, n_photon=1),
+            DragChannel(0.55, n_pump=2, n_photon=2)])
+        vals = [abs(complex(self._general(tone, np.array([self.T_G / n]))[0]))
+                for n in (401, 801, 1601, 3201)]
+        ratios = [vals[i + 1] / vals[i] for i in range(3)]
+        self.assertGreater(ratios[-1], 1.35)
+        self.assertLess(ratios[-1], 1.48)          # -> sqrt(2)
+        self.assertGreater(vals[-1], 2.0 * vals[0])
+
+    # -- the solver paths ---------------------------------------------------
+    def _coupler(self, tone):
+        from snail_solver.zhou_coupler import ZhouCoupler
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[2, 2, 3], anharmonicities_GHz={0: -0.12, 1: -0.12})
+        cpl.set_pump(tone, normalize_iswap=(0, 1))
+        return cpl
+
+    def _channels(self):
+        from snail_solver.envelope import DragChannel
+        return [DragChannel(0.30, n_photon=1, quotient_rule=True),
+                DragChannel(-0.22, n_photon=1, quotient_rule=True),
+                DragChannel(0.55, n_pump=2, n_photon=2, quotient_rule=True)]
+
+    def test_the_solver_applies_the_recursion(self):
+        """`_eta_at` must route multi-channel tones through the composition."""
+        t = np.linspace(0.0, self.T_G, 65)
+        tone = self._tone(channels=self._channels())
+        cpl = self._coupler(tone)
+        # `_general` reads tone.envelope, so it already carries set_pump's rescale;
+        # is_eta=True makes the prefactor 1 and phi_p is 0.
+        want = (self._general(tone, t)
+                * np.exp(-1j * np.asarray(tone.chirp.phase(t, np))))
+        np.testing.assert_allclose(cpl._eta_at(tone, t, np), want, atol=1e-12)
+        # and it must NOT be the plain envelope: the correction has to be visible
+        self.assertGreater(np.max(np.abs(cpl._eta_at(tone, t, np)
+                                         - tone.envelope.value_at(t, np))),
+                           1e-3 * tone.envelope.amp)
+
+    def test_numpy_and_jax_engines_agree_on_the_recursion(self):
+        """The two mirrors must stay the same function twice."""
+        from snail_solver import jax_engine as JE
+        t = np.linspace(0.0, self.T_G, 65)
+        for channels in ([self._channels()[0]], self._channels()[:2],
+                         self._channels()):
+            with self.subTest(n=len(channels)):
+                tone = self._tone(channels=list(channels))
+                cpl = self._coupler(tone)
+                spec, params = JE.pulse_spec(cpl), JE.pulse_params(cpl)
+                np.testing.assert_allclose(JE.eta_at(spec, params, t, 0, np),
+                                           cpl._eta_at(tone, t, np), atol=1e-12)
+
+    def test_the_scalar_callback_matches_the_vectorized_form(self):
+        tone = self._tone(channels=self._channels())
+        cpl = self._coupler(tone)
+        t = np.linspace(0.0, self.T_G, 33)
+        np.testing.assert_allclose([cpl._eta(tone, float(x)) for x in t],
+                                   cpl._eta_at(tone, t, np), atol=1e-12)
+
+    def test_the_detuning_guard_covers_every_channel(self):
+        """One collapsing beat is enough to break the pulse, wherever it sits."""
+        from snail_solver.device_utils import check_drag_detuning
+        from snail_solver.envelope import DragChannel
+        safe = [DragChannel(0.30), DragChannel(-0.22)]
+        check_drag_detuning(self._tone(channels=safe))
+        self.assertEqual(len(self._tone(channels=safe).drag_detuning_floors()), 2)
+        # a chirp that sweeps the SECOND channel's beat through zero must still raise
+        bad = [DragChannel(0.30), DragChannel(0.0, n_pump=1)]
+        with self.assertRaises(ValueError) as cm:
+            check_drag_detuning(self._tone(channels=bad))
+        self.assertIn("min|Delta(t)|", str(cm.exception))
+
+    def test_chirp_gradient_survives_the_recursion(self):
+        """Strictly harder than the first-order regression: with the quotient rule
+        on, the chirp now reaches the amplitude through Delta, Delta' AND Delta''."""
+        try:
+            import jax
+        except ImportError:                                    # pragma: no cover
+            self.skipTest("jax not installed")
+        jax.config.update("jax_enable_x64", True)
+        import jax.numpy as jnp
+        from snail_solver import jax_engine as JE
+
+        tone = self._tone(channels=self._channels())
+        cpl = self._coupler(tone)
+        spec, base = JE.pulse_spec(cpl), JE.pulse_params(cpl)
+        ts = jnp.asarray(np.linspace(0.0, self.T_G, 33))
+        c0 = np.asarray(self.COEFFS)
+
+        def objective(c):
+            p = {"amp": jnp.asarray(base["amp"]), "chirp": [c],
+                 "iq": [jnp.asarray(q) for q in base["iq"]]}
+            return jnp.sum(jnp.abs(JE.eta_at(spec, p, ts, 0, jnp)) ** 2)
+
+        g = np.asarray(jax.grad(objective)(jnp.asarray(c0)))
+        h = 1e-6
+        fd = np.array([(float(objective(jnp.asarray(c0 + h * np.eye(c0.size)[i])))
+                        - float(objective(jnp.asarray(c0 - h * np.eye(c0.size)[i]))))
+                       / (2 * h) for i in range(c0.size)])
+        self.assertTrue(np.all(np.isfinite(g)))
+        np.testing.assert_allclose(g, fd, atol=1e-6)
+        self.assertGreater(np.max(np.abs(fd)), 1e-3,
+                           "objective must actually depend on the chirp")
+
+
+class TestRecursiveDragPlumbing(unittest.TestCase):
+    """The guards and builders around the recursion, not the recursion itself."""
+
+    T_G = 40.0
+
+    def _channels(self):
+        from snail_solver.envelope import DragChannel
+        return [DragChannel(0.30, n_photon=1, quotient_rule=True),
+                DragChannel(-0.22, n_photon=1, quotient_rule=True),
+                DragChannel(0.55, n_pump=2, n_photon=2, quotient_rule=True)]
+
+    def _tone(self, channels, chirp_coeffs=None, amp=1.4):
+        from snail_solver.envelope import PumpTone, RaisedCosine, make_chirp
+        return PumpTone(w_p_GHz=1.7, envelope=RaisedCosine(amp, self.T_G),
+                        chirp=make_chirp(chirp_coeffs, self.T_G),
+                        drag_channels=channels)
+
+    def test_correction_ratio_is_zero_when_drag_is_off(self):
+        from snail_solver.device_utils import drag_correction_ratio
+        self.assertEqual(drag_correction_ratio(self._tone(None)), 0.0)
+
+    def test_correction_ratio_grows_as_the_beats_close_in(self):
+        """The guard `min|Delta(t)|` structurally cannot give: a pulse whose every
+        beat is far from zero can still have a correction larger than itself."""
+        from snail_solver.device_utils import drag_correction_ratio
+        from snail_solver.envelope import DragChannel
+        ratios = []
+        for scale in (1.0, 0.5, 0.25):
+            # SAME sign, so the two 1/Delta terms add. With opposite signs they
+            # partially cancel (+0.30/-0.22 lands near 0.08 rather than 0.39), which
+            # is real physics but the wrong case for exercising the warning.
+            chs = [DragChannel(0.30 * scale, n_photon=1),
+                   DragChannel(0.22 * scale, n_photon=1)]
+            ratios.append(drag_correction_ratio(self._tone(chs)))
+        self.assertTrue(all(np.isfinite(r) for r in ratios))
+        self.assertLess(ratios[0], ratios[1])
+        self.assertLess(ratios[1], ratios[2])
+        self.assertGreater(ratios[-1], 0.3)        # would trip build_coupler's warning
+        # every beat is still >= 55 MHz from zero, so the min|Delta| guard is happy:
+        # this is exactly the failure it cannot see
+        from snail_solver.device_utils import check_drag_detuning
+        check_drag_detuning(self._tone([DragChannel(0.075), DragChannel(0.055)]))
+
+    def test_correction_ratio_matches_the_legacy_quadrature(self):
+        from snail_solver.device_utils import drag_correction_ratio
+        from snail_solver.envelope import RaisedCosine
+        tone = self._tone(None)
+        tone.drag, tone.delta_drag_GHz, tone.drag_n_pump = True, 0.30, 1
+        env = RaisedCosine(1.4, self.T_G)
+        ts = np.linspace(0.0, self.T_G, 259)[1:-1]
+        want = (np.max(np.abs(env.deriv_at(ts, np) / (TWO_PI * 0.30)))
+                / np.max(np.abs(env.value_at(ts, np))))
+        self.assertAlmostEqual(drag_correction_ratio(tone), want, places=12)
+
+    def test_the_guard_names_the_offending_channel(self):
+        from snail_solver.device_utils import check_drag_detuning
+        from snail_solver.envelope import DragChannel
+        bad = [DragChannel(0.30), DragChannel(0.28), DragChannel(0.0)]
+        with self.assertRaises(ValueError) as cm:
+            check_drag_detuning(self._tone(bad))
+        msg = str(cm.exception)
+        self.assertIn("min|Delta(t)|", msg)        # pinned by the older guard test
+        self.assertIn("channel 3/3", msg)
+
+    def test_channel_filter_drops_only_the_offender(self):
+        """One swept-onto collision must not throw away the other channels."""
+        from snail_solver.envelope import DragChannel
+        from snail_solver.sweep_common import (DEFAULT_CONFIG,
+                                               _drag_channels_filtered)
+        chs = [DragChannel(0.30, n_pump=1), DragChannel(0.0005, n_pump=1),
+               DragChannel(-0.22, n_pump=1)]
+        kept = _drag_channels_filtered(DEFAULT_CONFIG, chs, None, self.T_G)
+        self.assertEqual([c.beat_GHz for c in kept], [0.30, -0.22])
+        self.assertEqual(_drag_channels_filtered(DEFAULT_CONFIG, [], None, self.T_G), ())
+
+    def test_build_coupler_threads_the_channels(self):
+        from snail_solver.device_utils import build_coupler
+        from snail_solver.sweep_common import DEFAULT_CONFIG
+        cfg = dict(DEFAULT_CONFIG, envelope="raised_cosine")
+        cpl, _wp, _peak = build_coupler(cfg, self.T_G, 1.0, 0.0,
+                                        drag_channels=self._channels())
+        tone = cpl._pump_tones[0]
+        self.assertEqual(len(tone.drag_channels_resolved()), 3)
+        self.assertFalse(tone.is_legacy_drag)
+        # and the default (no channels) is untouched
+        cpl0, _w, _p = build_coupler(cfg, self.T_G, 1.0, 0.0, drag_beat_GHz=0.30)
+        self.assertTrue(cpl0._pump_tones[0].is_legacy_drag)
+
+    def test_grape_baseline_uses_the_recursive_pulse(self):
+        """The gate every reported dF_grape is measured against must be the pulse the
+        solver plays -- otherwise the optimizer is credited for beating a fiction."""
+        from snail_solver.envelope import Chirp
+        from snail_solver.grape import _raised_cosine_eta, _tone_drag_channels
+        chs = self._channels()
+        chirp = Chirp([0.0, 0.0, -0.012], self.T_G)
+        rec = _raised_cosine_eta(self.T_G, 1.4, 24, None, chirp, 1, chs)
+        one = _raised_cosine_eta(self.T_G, 1.4, 24, 0.30, chirp, 1)
+        self.assertEqual(rec.shape, one.shape)
+        self.assertGreater(np.max(np.abs(rec - one)), 1e-3)
+        # channels=None / () must reproduce the historical samples EXACTLY
+        for empty in (None, ()):
+            np.testing.assert_allclose(
+                _raised_cosine_eta(self.T_G, 1.4, 24, 0.30, chirp, 1, empty),
+                one, atol=0, rtol=0)
+
+    def test_grape_reads_channels_off_the_coupler(self):
+        """`_tone_drag_channels` returns () for the legacy case, so the baseline
+        keeps its original code path (and its original float) for existing points."""
+        from snail_solver.device_utils import build_coupler
+        from snail_solver.grape import _tone_drag_channels
+        from snail_solver.sweep_common import DEFAULT_CONFIG
+        cfg = dict(DEFAULT_CONFIG, envelope="raised_cosine")
+        legacy, _w, _p = build_coupler(cfg, self.T_G, 1.0, 0.0, drag_beat_GHz=0.30)
+        self.assertEqual(_tone_drag_channels(legacy), ())
+        rec, _w, _p = build_coupler(cfg, self.T_G, 1.0, 0.0,
+                                    drag_channels=self._channels())
+        self.assertEqual(len(_tone_drag_channels(rec)), 3)
+
+    def test_the_crab_optimizer_clears_the_channel_list(self):
+        """`drag=False` alone does not disable an EXPLICIT channel list, so the
+        optimizer must clear it too -- otherwise the recursion fires on top of the
+        ansatz that is supposed to discover the quadrature itself."""
+        import inspect
+        from snail_solver import grape
+        src = inspect.getsource(grape._optimize_crab)
+        self.assertIn("tone.drag_channels = None", src)
+        self.assertIn("tone.drag_channels = channels_saved", src)
+
+
+class TestSinePowerRamp(unittest.TestCase):
+    """The Li/Calarco/Motzoi Eq. (13) base shape."""
+
+    T_G = 40.0
+
+    def test_m_one_is_exactly_a_raised_cosine(self):
+        """The keystone. The paper states it ("for m = 1 and with zero holding time,
+        the pulse is the same as the Hann window"), and it is what makes every
+        Hann-specific constant elsewhere a special case rather than a re-derivation.
+
+        It is also the check that settles the printed-vs-corrected reading of Eq. 13:
+        with the integrand as printed (`sin^m(pi t'/2 t_r)`) this differs from a Hann
+        window by 0.25 in amplitude and the ramp's slope at t_r does not vanish.
+        """
+        from snail_solver.envelope import RaisedCosine, SinePowerRamp
+        t = np.linspace(-2.0, self.T_G + 2.0, 977)
+        spr, rc = SinePowerRamp(1.3, self.T_G, m=1), RaisedCosine(1.3, self.T_G)
+        for n, (a, b) in enumerate(zip(spr.jet_at(t, 3, np), rc.jet_at(t, 3, np))):
+            with self.subTest(order=n):
+                np.testing.assert_allclose(a, b, atol=1e-14)
+        self.assertAlmostEqual(spr.area(), rc.area(), places=13)
+
+    def test_m_derivatives_vanish_at_both_edges(self):
+        """The property the recursion needs, and the reason m must track K."""
+        from snail_solver.envelope import SinePowerRamp
+        for m in (1, 3, 5):
+            env = SinePowerRamp(1.0, self.T_G, m=m)
+            for edge in (0.0, self.T_G):
+                jet = env.jet_at(np.array([edge]), m + 1, np)
+                with self.subTest(m=m, edge=edge):
+                    for n in range(m + 1):
+                        self.assertLess(abs(float(np.real(jet[n][0]))), 1e-12,
+                                        f"d^{n} should vanish for m={m}")
+                    self.assertGreater(abs(float(np.real(jet[m + 1][0]))), 1e-6,
+                                       f"d^{m + 1} should NOT vanish for m={m}")
+
+    def test_it_tames_the_recursion_that_hann_diverges_under(self):
+        """The whole point of the shape, stated as the contrast with Hann.
+
+        Same three channels, same recursion: on a raised cosine the edge amplitude
+        GROWS without bound as the grid refines (t^-1/2); on m=3 it decays.
+        """
+        from snail_solver.drag import apply_drag, required_order
+        from snail_solver.envelope import (DragChannel, PumpTone, RaisedCosine,
+                                           SinePowerRamp)
+        chs = [DragChannel(0.30, n_photon=1), DragChannel(-0.22, n_photon=1),
+               DragChannel(0.55, n_pump=2, n_photon=2)]
+        k = required_order(chs)
+
+        def edge_values(env):
+            tone = PumpTone(w_p_GHz=0.4, envelope=env, drag_channels=chs)
+            out = []
+            for n in (401, 801, 1601, 3201):
+                tt = np.array([self.T_G / n])
+                out.append(abs(complex(apply_drag(
+                    env.jet_at(tt, k, np),
+                    [tone.channel_detuning_jet(c, tt, k, np) for c in chs],
+                    chs, np)[0])))
+            return out
+
+        hann = edge_values(RaisedCosine(1.4, self.T_G))
+        ramp = edge_values(SinePowerRamp(1.4, self.T_G, m=3))
+        self.assertGreater(hann[-1], 2.0 * hann[0])        # diverging
+        self.assertLess(ramp[-1], 0.2 * ramp[0])           # vanishing
+        self.assertLess(ramp[-1], 1e-4 * hann[-1])
+
+    def test_area_closed_form_matches_quadrature(self):
+        """`normalize_iswap` divides by this, so it must be exact, not approximate."""
+        from snail_solver.envelope import SinePowerRamp
+        t = np.linspace(0.0, self.T_G, 20001)
+        for m, t_rise in [(3, None), (3, 8.0), (4, 12.0), (1, 20.0), (2, 5.0)]:
+            env = SinePowerRamp(1.1, self.T_G, m=m, t_rise=t_rise)
+            with self.subTest(m=m, t_rise=t_rise):
+                quad = float(np.trapz(env.value_at(t, np), t))
+                self.assertAlmostEqual(env.area() / quad, 1.0, places=9)
+
+    def test_plateau_and_mirror_symmetry(self):
+        from snail_solver.envelope import SinePowerRamp
+        env = SinePowerRamp(1.1, self.T_G, m=3, t_rise=8.0)
+        t = np.linspace(0.0, self.T_G, 401)
+        np.testing.assert_allclose(env.value_at(t, np),
+                                   env.value_at(self.T_G - t, np), atol=1e-13)
+        mid = np.linspace(9.0, self.T_G - 9.0, 33)          # strictly on the plateau
+        np.testing.assert_allclose(env.value_at(mid, np), 1.1, atol=1e-13)
+
+    def test_rejects_impossible_geometry(self):
+        from snail_solver.envelope import SinePowerRamp
+        with self.assertRaises(ValueError):
+            SinePowerRamp(1.0, self.T_G, m=0)
+        with self.assertRaises(ValueError):
+            SinePowerRamp(1.0, self.T_G, t_rise=self.T_G)     # > t_g/2
+        with self.assertRaises(ValueError):
+            SinePowerRamp(1.0, self.T_G, t_rise=0.0)
+
+    def test_it_satisfies_the_shared_envelope_contract(self):
+        """Same three properties `TestEnvelopeArrayAPI` pins for every other shape."""
+        from snail_solver.envelope import SinePowerRamp
+        env = SinePowerRamp(1.1, self.T_G, m=3, t_rise=9.0)
+        t = np.linspace(1.0, self.T_G - 1.0, 25)
+        np.testing.assert_allclose([float(env.value(x)) for x in t],
+                                   env.value_at(t, np), atol=1e-14)
+        np.testing.assert_allclose([float(env.deriv(x)) for x in t],
+                                   env.deriv_at(t, np), atol=1e-14)
+        # FD on a grid strictly INSIDE the rising ramp. The shape is only C^m at the
+        # ramp/plateau junction (d^(m+1) jumps there by construction), and an
+        # order-n central difference with h = 0.8 reaches +/-2.4 ns, so a grid
+        # spanning t_rise would measure that genuine kink rather than the formula.
+        ti = np.linspace(3.0, 6.0, 9)                        # t_rise = 9.0
+        for n in (1, 2, 3):
+            with self.subTest(n=n):
+                for r in _fd_order(lambda x: env.value_at(x, np), ti,
+                                   n, env.jet_at(ti, 3, np)[n]):
+                    self.assertGreater(r, 3.2)
+                    self.assertLess(r, 4.8)
+        out = env.jet_at(np.array([-2.0, self.T_G + 2.0]), 3, np)
+        for c in out:
+            np.testing.assert_allclose(c, 0.0, atol=0, rtol=0)
+
+    def test_the_jax_mirror_agrees(self):
+        from snail_solver.envelope import SinePowerRamp
+        from snail_solver.jax_engine import _shape_jet_at
+        env = SinePowerRamp(1.0, self.T_G, m=3, t_rise=9.0)
+        t = np.linspace(0.0, self.T_G, 65)
+        st = {"kind": "SinePowerRamp", "t_g": self.T_G, "freqs": np.zeros(0),
+              "shape_m": 3, "shape_t_rise": 9.0}
+        for a, b in zip(_shape_jet_at(st, {"iq": [np.zeros(0)]}, t, 0, np, 3),
+                        env.jet_at(t, 3, np)):
+            np.testing.assert_allclose(a, b, atol=1e-13)
+
+    def test_area_factor_and_the_amplitude_algebra(self):
+        """The Hann constant 1/2 must come out unchanged, bit for bit."""
+        from snail_solver.sweep_common import DEFAULT_CONFIG
+        from snail_solver.tune_up import area_factor, fixed_eta_amp_scale, peak_eta_of
+        hann = dict(DEFAULT_CONFIG, envelope="raised_cosine")
+        self.assertEqual(area_factor(hann), 0.5)
+        # sine_power with m=1 / no plateau is the same pulse, so the same factor
+        m1 = dict(DEFAULT_CONFIG, envelope="sine_power", envelope_m=1,
+                  envelope_rise_frac=0.5)
+        self.assertAlmostEqual(area_factor(m1), 0.5, places=13)
+        # a plateau raises the factor; a sharper ramp raises it further
+        wide = dict(DEFAULT_CONFIG, envelope="sine_power", envelope_m=3,
+                    envelope_rise_frac=0.2)
+        self.assertGreater(area_factor(wide), 0.5)
+        self.assertLess(area_factor(wide), 1.0)
+        # round trip holds for any shape
+        for cfg in (hann, m1, wide):
+            with self.subTest(envelope=cfg["envelope"]):
+                s = fixed_eta_amp_scale(cfg, 33.0, 1.8)
+                self.assertAlmostEqual(peak_eta_of(cfg, 33.0, s), 1.8, places=12)
+
+    def test_build_coupler_can_install_the_new_shape(self):
+        from snail_solver.device_utils import build_coupler
+        from snail_solver.envelope import SinePowerRamp
+        from snail_solver.sweep_common import DEFAULT_CONFIG
+        cfg = dict(DEFAULT_CONFIG, envelope="sine_power", envelope_m=3,
+                   envelope_rise_frac=0.25)
+        cpl, _wp, _peak = build_coupler(cfg, self.T_G, 1.0, 0.0)
+        env = cpl._pump_tones[0].envelope
+        self.assertIsInstance(env, SinePowerRamp)
+        self.assertEqual(env.m, 3)
+        # and the default is still a Hann -- this shape is strictly opt-in
+        cpl0, _w, _p = build_coupler(dict(DEFAULT_CONFIG, envelope="raised_cosine"),
+                                     self.T_G, 1.0, 0.0)
+        self.assertEqual(type(cpl0._pump_tones[0].envelope).__name__, "RaisedCosine")
+
+
+class TestTuneUpRecursiveDrag(unittest.TestCase):
+    """`chirp_from_measured_shift` now models the pulse the solver actually plays."""
+
+    T_G = 80.0
+
+    def _table(self):
+        return {"fit": {"k2": -0.9, "k4": 0.12, "delta0": -0.7}, "target_eta": 1.8,
+                "eta": np.linspace(0.5, 1.9, 9)}
+
+    @staticmethod
+    def _old_implementation(table, eta_star, degree, beat, k_pump, t_g,
+                            max_iters=12, tol=1e-12):
+        """The pre-recursion code, transcribed, as an independent oracle."""
+        from numpy.polynomial import legendre as L
+        k2, k4 = table["fit"]["k2"], table["fit"]["k4"]
+        u, w = np.polynomial.legendre.leggauss(max(2 * degree + 8, 32))
+        amp = eta_star * np.cos(np.pi * u / 2) ** 2
+        shift = lambda a: (k2 * a ** 2 + k4 * a ** 4) * 1e-3     # noqa: E731
+        d = shift(amp)
+        deta_dt = -eta_star * (np.pi / t_g) * np.sin(np.pi * u)
+        for _ in range(max_iters):
+            det = beat * TWO_PI - k_pump * (d * TWO_PI)
+            new = shift(np.sqrt(amp ** 2 + (deta_dt / det) ** 2))
+            done = np.max(np.abs(new - d)) < tol
+            d = new
+            if done:
+                break
+        c = np.array([(2 * k + 1) / 2 * np.sum(w * d * L.legval(u, np.eye(k + 1)[k]))
+                      for k in range(degree + 1)])
+        c[1::2] = 0.0
+        return c
+
+    def test_order_one_reproduces_the_previous_implementation(self):
+        """`sqrt(amp^2 + q^2)` equals `|amp - i q|` only because a first-order
+        correction is purely imaginary -- so at one channel the rewrite must be a
+        pure refactor, and beyond it the old formula was simply the wrong norm."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        for beat, k in [(0.30, 1), (0.05, 1), (0.05, 2), (0.30, 0)]:
+            with self.subTest(beat=beat, k=k):
+                got = chirp_from_measured_shift(
+                    self._table(), 1.8, degree=8, drag_beat_GHz=beat,
+                    drag_n_pump=k, t_g=self.T_G, pin_c0=False)["coeffs_GHz"]
+                want = self._old_implementation(self._table(), 1.8, 8, beat, k,
+                                                self.T_G)
+                np.testing.assert_allclose(got, want,
+                                           rtol=1e-11, atol=1e-16)
+
+    def test_channels_and_the_scalar_shorthand_agree(self):
+        from snail_solver.envelope import DragChannel
+        from snail_solver.tune_up import chirp_from_measured_shift
+        kw = dict(degree=8, t_g=self.T_G)
+        a = chirp_from_measured_shift(self._table(), 1.8, drag_beat_GHz=0.30,
+                                      drag_n_pump=1, **kw)
+        b = chirp_from_measured_shift(self._table(), 1.8,
+                                      drag_channels=[DragChannel(0.30, n_pump=1)], **kw)
+        np.testing.assert_allclose(a["coeffs_GHz"], b["coeffs_GHz"], atol=0, rtol=0)
+
+    def test_multi_channel_reports_every_beat(self):
+        from snail_solver.envelope import DragChannel
+        from snail_solver.tune_up import chirp_from_measured_shift
+        out = chirp_from_measured_shift(
+            self._table(), 1.8, degree=8, t_g=self.T_G,
+            drag_channels=[DragChannel(0.30), DragChannel(-0.22),
+                           DragChannel(0.55, n_pump=2, n_photon=2)])
+        self.assertEqual(out["n_drag_channels"], 3)
+        self.assertEqual(len(out["min_abs_detuning_per_channel_GHz"]), 3)
+        self.assertAlmostEqual(out["min_abs_detuning_GHz"],
+                               min(out["min_abs_detuning_per_channel_GHz"]), places=15)
+        self.assertGreater(out["drag_correction_ratio"], 0.0)
+        self.assertTrue(np.isfinite(out["drag_delta_frac"]))
+
+    def test_drag_off_is_unaffected_by_a_channel_list(self):
+        from snail_solver.tune_up import chirp_from_measured_shift
+        kw = dict(degree=8, t_g=self.T_G)
+        off = chirp_from_measured_shift(self._table(), 1.8, **kw)
+        for empty in (None, [], ()):
+            with self.subTest(empty=empty):
+                got = chirp_from_measured_shift(self._table(), 1.8,
+                                                drag_channels=empty, **kw)
+                np.testing.assert_allclose(got["coeffs_GHz"], off["coeffs_GHz"],
+                                           atol=0, rtol=0)
+                self.assertNotIn("drag_iters", got)
+
+    def test_t_g_is_still_required_with_channels(self):
+        from snail_solver.envelope import DragChannel
+        from snail_solver.tune_up import chirp_from_measured_shift
+        with self.assertRaises(ValueError):
+            chirp_from_measured_shift(self._table(), 1.8, degree=8,
+                                      drag_channels=[DragChannel(0.30)])
+
+    def test_recursion_breaks_length_independence_harder(self):
+        """DRAG-off the chirp is t_g-independent; each nested order adds a 1/t_g."""
+        from snail_solver.envelope import DragChannel
+        from snail_solver.tune_up import chirp_from_measured_shift
+
+        def coeffs(t_g, chs):
+            return chirp_from_measured_shift(self._table(), 1.8, degree=8, t_g=t_g,
+                                             drag_channels=chs)["coeffs_GHz"]
+
+        off_a, off_b = coeffs(40.0, None), coeffs(80.0, None)
+        np.testing.assert_allclose(off_a, off_b, atol=1e-15)
+        one = [DragChannel(0.30)]
+        two = [DragChannel(0.30), DragChannel(0.22)]
+        d1 = np.max(np.abs(coeffs(40.0, one) - coeffs(80.0, one)))
+        d2 = np.max(np.abs(coeffs(40.0, two) - coeffs(80.0, two)))
+        self.assertGreater(d1, 0.0)
+        self.assertGreater(d2, d1)
+
+    def test_cli_channel_parsing(self):
+        from snail_solver.tune_up import parse_drag_channels
+        self.assertIsNone(parse_drag_channels(None))
+        self.assertIsNone(parse_drag_channels([]))
+        chs = parse_drag_channels(["0.30", "-0.22:1", "0.55:2:2", "0.1:2"])
+        self.assertEqual([c.beat_GHz for c in chs], [0.30, -0.22, 0.55, 0.1])
+        self.assertEqual([c.n_pump for c in chs], [1, 1, 2, 2])
+        # n_photon defaults to n_pump: for every channel this device produces they
+        # are the same integer, but they stay separately settable
+        self.assertEqual([c.n_photon for c in chs], [1, 1, 2, 2])
+        self.assertTrue(all(c.quotient_rule for c in chs))
+        with self.assertRaises(ValueError):
+            parse_drag_channels(["0.3:1:1:1"])
+
+    def test_the_outer_loop_gets_more_passes_for_deeper_recursions(self):
+        """The d-th nested correction scales as 1/t_g^d, so the chirp<->length
+        coupling tightens with the channel count."""
+        import inspect
+        from snail_solver import tune_up
+        src = inspect.getsource(tune_up.run_tune_up)
+        self.assertIn("2 * _n_ch", src)
+        self.assertIn("_drag_on = drag_beat_GHz is not None or bool(drag_channels)", src)
+
+
 class TestPumpQuantaMapping(unittest.TestCase):
     """k per collision channel, and the chirp-aware DRAG safety test."""
 

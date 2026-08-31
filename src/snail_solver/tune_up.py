@@ -100,6 +100,39 @@ def _area(config: Dict[str, Any]) -> float:
                            float(config["lam_b"]))
 
 
+def area_factor(config: Dict[str, Any]) -> float:
+    """``f = area / (amp * t_g)`` for this device's envelope shape.
+
+    The whole fixed-amplitude algebra below rests on the relation between a pulse's
+    AREA (which ``normalize_iswap`` pins) and its PEAK (which this module holds
+    fixed). For a Hann window that ratio is exactly 1/2, which is why the two
+    functions here have read ``2 A / t_g`` since they were written.
+
+    That constant is a property of the SHAPE, not of the physics, so it has to move
+    when the shape does -- e.g. to the Li/Calarco/Motzoi Eq. (13) ramp that recursive
+    DRAG requires (:class:`envelope.SinePowerRamp`), whose factor depends on ``m`` and
+    the rise time. Returns exactly 0.5 for the raised cosine, so every existing
+    call site is bit-for-bit unchanged.
+    """
+    kind = config.get("envelope", "raised_cosine")
+    if kind == "raised_cosine":
+        return 0.5
+    from snail_solver.envelope import ENVELOPE_KINDS
+    cls = ENVELOPE_KINDS.get(kind)
+    if cls is None or kind == "constant":
+        return 1.0
+    # Built at t_g = 1 with the rise as a FRACTION of the gate. That is exactly why
+    # the config carries a fraction rather than a rise time in ns: a fixed absolute
+    # t_rise would make this factor t_g-dependent, and with it the Stark shift and
+    # the chirp -- destroying the length/frequency decoupling the whole module rests
+    # on (see the "Why fix the amplitude" section of the module docstring).
+    kw = ({"m": int(config.get("envelope_m", 3)),
+           "t_rise": float(config.get("envelope_rise_frac", 0.5))}
+          if cls.__name__ == "SinePowerRamp" else {})
+    env = cls(amp=1.0, t_g=1.0, **kw)
+    return float(env.area())              # amp = t_g = 1, so area IS the factor
+
+
 def fixed_eta_amp_scale(config: Dict[str, Any], t_g: float,
                         target_eta: float) -> float:
     """``amp_scale`` that holds the physical peak |eta| at `target_eta` at this `t_g`.
@@ -110,17 +143,26 @@ def fixed_eta_amp_scale(config: Dict[str, Any], t_g: float,
     amplitude as 1/t_g to hold the pulse area, so holding the PEAK requires scaling
     back up. Getting this backwards still yields a plausible length-Rabi curve.
     """
-    return float(target_eta) * float(t_g) / (2.0 * _area(config))
+    return (float(target_eta) * float(t_g) * area_factor(config)) / _area(config)
 
 
 def peak_eta_of(config: Dict[str, Any], t_g: float, amp_scale: float) -> float:
-    """Physical peak |eta| for a normalized Hann pulse at (t_g, amp_scale).
+    """Physical peak |eta| for a normalized pulse at (t_g, amp_scale).
 
     The inverse of :func:`fixed_eta_amp_scale`; used to convert a calibration map's
-    amp_scale axis into physical drive. Unaffected by DRAG (Hann has deta/dt = 0 at
-    the peak) or by a chirp (a pure phase).
+    amp_scale axis into physical drive. Unaffected by a chirp (a pure phase).
+
+    .. warning::
+       It is also unaffected by FIRST-ORDER DRAG, because a Hann window has
+       ``deta/dt = 0`` at its peak -- which is what this docstring used to claim
+       outright. That no longer holds under RECURSIVE DRAG: two nested corrections
+       contribute ``-eta''/(Delta_a Delta_b)``, and ``eta''`` at the peak is not zero.
+       So with several channels the true peak |eta| carries a DRAG-dependent term
+       this function does not model, and it propagates into
+       :func:`fixed_eta_amp_scale` and hence the fixed-|eta| premise of the whole
+       tune-up. Use :func:`device_utils.drag_correction_ratio` to see how large it is.
     """
-    return float(amp_scale) * 2.0 * _area(config) / float(t_g)
+    return float(amp_scale) * _area(config) / (float(t_g) * area_factor(config))
 
 
 def nominal_t_g(config: Dict[str, Any], target_eta: float) -> float:
@@ -916,10 +958,102 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
 # ===========================================================================
 # Step 2 -- chirp by projecting the MEASURED curve
 # ===========================================================================
+def parse_drag_channels(specs: Optional[Sequence[str]]) -> Optional[list]:
+    """Parse repeated ``--drag-channel BEAT[:K[:N]]`` into :class:`DragChannel` list.
+
+    ``K`` is the pump-quanta count (how the beat moves under a chirp) and ``N`` the
+    photon count in ``F^(n)``; ``N`` defaults to ``K`` because for every channel this
+    device produces they are the same integer -- but they stay separately settable,
+    since they enter the substitution in different places.
+
+    Returns None for no channels, so the caller falls through to the scalar
+    ``--drag-beat-GHz`` shorthand.
+    """
+    if not specs:
+        return None
+    from snail_solver.envelope import DragChannel
+    out = []
+    for text in specs:
+        parts = str(text).split(":")
+        if not 1 <= len(parts) <= 3:
+            raise ValueError(f"--drag-channel wants BEAT[:K[:N]], got {text!r}")
+        beat = float(parts[0])
+        k = int(parts[1]) if len(parts) > 1 and parts[1] else 1
+        n = int(parts[2]) if len(parts) > 2 and parts[2] else max(k, 1)
+        out.append(DragChannel(beat, n_pump=k, n_photon=n, quotient_rule=True))
+    return out
+
+
+def _shape_envelope(shape: str = "raised_cosine",
+                    shape_kw: Optional[Dict[str, Any]] = None):
+    """Unit-amplitude envelope on ``t_g = 2``, so ``t = u + 1`` maps [-1,1] -> [0,2].
+
+    Used to read the pulse shape in NORMALIZED gate time. t_g = 2 is arbitrary and
+    harmless precisely because every envelope here is t_g-independent in u -- the
+    property the module docstring's "Why fix the amplitude" section depends on.
+    """
+    from snail_solver.envelope import ENVELOPE_KINDS
+    cls = ENVELOPE_KINDS.get(str(shape))
+    if cls is None:
+        raise ValueError(f"unknown envelope shape {shape!r}; "
+                         f"known: {sorted(ENVELOPE_KINDS)}")
+    kw = dict(shape_kw or {})
+    if cls.__name__ == "SinePowerRamp":
+        # rise given as a FRACTION of the gate; t_g = 2 here
+        kw = {"m": int(kw.get("m", 3)),
+              "t_rise": 2.0 * float(kw.get("rise_frac", 0.5))}
+    return cls(amp=1.0, t_g=2.0, **kw)
+
+
+def shape_config(config: Dict[str, Any]) -> tuple:
+    """``(shape, shape_kw)`` for this device, to pass to the chirp projection."""
+    kind = str(config.get("envelope", "raised_cosine"))
+    kw = ({"m": int(config.get("envelope_m", 3)),
+           "rise_frac": float(config.get("envelope_rise_frac", 0.5))}
+          if kind == "sine_power" else {})
+    return kind, kw
+
+
+def _resolve_drag_channels(beat_GHz: Optional[float], n_pump: int = 1,
+                           channels: Optional[Sequence[Any]] = None) -> tuple:
+    """Normalize this module's DRAG arguments to a channel tuple, innermost-first.
+
+    Same resolution rule as :meth:`envelope.PumpTone.drag_channels_resolved`, so the
+    calibration and the pulse cannot disagree about which processes are suppressed:
+    an explicit `channels` list wins, else the scalar `beat_GHz`/`n_pump` shorthand,
+    else DRAG is off (empty tuple).
+    """
+    from snail_solver.drag import order_channels
+    from snail_solver.envelope import DragChannel
+    if channels:
+        return order_channels(tuple(channels))
+    if beat_GHz:
+        return (DragChannel(float(beat_GHz), n_pump=int(n_pump)),)
+    return ()
+
+
+def _project(values: np.ndarray, u: np.ndarray, w: np.ndarray,
+             degree: int) -> np.ndarray:
+    """Gauss-Legendre projection of `values` onto P_0..P_degree, odd terms zeroed.
+
+    Odd coefficients vanish by parity (the envelope is symmetric about mid-gate);
+    zeroing them keeps that exact instead of leaving quadrature dust.
+    """
+    from numpy.polynomial import legendre as L
+    c = np.array([(2 * k + 1) / 2.0 * np.sum(w * values * L.legval(u, np.eye(k + 1)[k]))
+                  for k in range(int(degree) + 1)])
+    c[1::2] = 0.0
+    return c
+
+
+
 def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float] = None,
                               degree: int = 8, pin_c0: bool = True,
                               drag_beat_GHz: Optional[float] = None,
                               drag_n_pump: int = 1, t_g: Optional[float] = None,
+                              drag_channels: Optional[Sequence[Any]] = None,
+                              shape: str = "raised_cosine",
+                              shape_kw: Optional[Dict[str, Any]] = None,
                               max_iters: int = 12,
                               tol_GHz: float = 1e-12,
                               quartic_warn: float = 0.25) -> Dict[str, Any]:
@@ -1006,7 +1140,14 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
 
     n_quad = max(2 * int(degree) + 8, 32)
     u, w = np.polynomial.legendre.leggauss(n_quad)
-    s = np.cos(np.pi * u / 2.0) ** 2                       # |eta(u)| / eta*
+    # |eta(u)| / eta*. The closed form cos^2(pi u / 2) is the HANN case; read it off
+    # the actual envelope so selecting a different base shape (which recursive DRAG
+    # requires past one channel -- see envelope.SinePowerRamp) cannot leave the chirp
+    # tracking a pulse the solver is not playing. Evaluated at t_g = 2 so u = t - 1:
+    # every envelope here is t_g-independent in normalized gate time, which is the
+    # property this whole module's amplitude/length decoupling rests on.
+    shape_env = _shape_envelope(shape, shape_kw)
+    s = np.abs(np.asarray(shape_env.value_at(u + 1.0, np), dtype=complex))
     amp = eta_star * s
 
     def shift_GHz(a):                                      # MHz law -> GHz
@@ -1016,22 +1157,48 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
     base_norm = float(np.linalg.norm(delta_GHz))
     extra: Dict[str, Any] = {}
 
-    if drag_beat_GHz:
+    channels = _resolve_drag_channels(drag_beat_GHz, drag_n_pump, drag_channels)
+    if channels:
         if t_g is None:
             raise ValueError("chirp_from_measured_shift needs t_g when DRAG is on: "
                              "the quadrature is (d eta/dt)/Delta(t) and so scales as "
                              "1/t_g, which breaks the length-independence of the chirp")
-        # Hann: eta(t) = eta* cos^2(pi u / 2) with u = 2t/t_g - 1
-        #   -> d eta/dt = -eta* (pi / t_g) sin(pi u)                       [1/ns]
-        deta_dt = -eta_star * (np.pi / float(t_g)) * np.sin(np.pi * u)
-        detuning0 = float(drag_beat_GHz) * TWO_PI                          # rad/ns
-        k_pump = int(drag_n_pump)
+        from snail_solver import drag as _drag
+        from snail_solver.envelope import Chirp, PumpTone
+        t_g = float(t_g)
+        # The pulse the SOLVER will play, built the same way it builds it, rather
+        # than a hand-derived model of it. Previously this line differentiated the
+        # Hann by hand and formed sqrt(amp^2 + q^2) -- which is |amp - i q| ONLY
+        # because a first-order correction is purely imaginary. Recursive DRAG's
+        # correction has a real part (-eta''/(Da Db)), so abs() is the general form
+        # and the old expression is simply wrong beyond one channel.
+        env = _shape_envelope(shape, shape_kw)
+        env.amp, env.t_g = eta_star, t_g
+        order = _drag.required_order(channels)
+        shape = env.jet_at(t_g * (u + 1.0) / 2.0, order, np)
         min_abs = float("inf")
         for it in range(int(max_iters)):
-            detuning = detuning0 - k_pump * (delta_GHz * TWO_PI)   # Delta(t) = D0 - k d(t)
-            min_abs = float(np.min(np.abs(detuning)) / TWO_PI)
-            q = deta_dt / detuning
-            new = shift_GHz(np.sqrt(amp ** 2 + q ** 2))
+            # Iterate on the LEGENDRE COEFFICIENTS, not on sampled values: the
+            # detuning JET needs d/dt of the current chirp iterate, and only a
+            # coefficient representation has an analytic derivative.
+            #
+            # Projected at a HIGHER degree than the chirp we ultimately emit.
+            # delta(u) is built from cos^4/cos^8(pi u / 2), whose Legendre series does
+            # not actually terminate, so truncating at `degree` leaves ripple near
+            # |u| = 1 -- and that ripple lands in a PHYSICAL denominator. At degree 8
+            # it is enough to flip the sign of Delta - Delta_0 on a 50 MHz beat
+            # (by ~6 kHz), which would misreport the singularity guard and invert the
+            # k-scaling the beat is supposed to show. The output chirp is still
+            # truncated to `degree`; only Delta's internal representation is refined.
+            chirp = Chirp(_project(delta_GHz, u, w, max(int(degree), 24)), t_g)
+            tone = PumpTone(w_p_GHz=0.0, envelope=env, chirp=chirp,
+                            drag_channels=list(channels))
+            jets = [tone.channel_detuning_jet(c, t_g * (u + 1.0) / 2.0, order, np)
+                    for c in channels]
+            floors = [float(np.min(np.abs(j[0])) / TWO_PI) for j in jets]
+            min_abs = min(floors)
+            eta_tot = np.abs(_drag.apply_drag(shape, jets, channels, np))
+            new = shift_GHz(eta_tot)
             step = float(np.max(np.abs(new - delta_GHz)))
             delta_GHz = new
             if step < tol_GHz:
@@ -1039,18 +1206,22 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
         else:
             raise RuntimeError(
                 f"the chirp<->DRAG fixed point did not settle in {max_iters} passes "
-                f"(last step {step:.2e} GHz, min|Delta(t)| = {min_abs * 1e3:.3f} MHz). "
-                f"Near a collision the quadrature and the chirp can chase each other; "
-                f"pick a further-detuned beat or a weaker drive.")
+                f"(last step {step:.2e} GHz, min|Delta(t)| = {min_abs * 1e3:.3f} MHz, "
+                f"{len(channels)} channel(s)). Near a collision the quadrature and the "
+                f"chirp can chase each other; pick a further-detuned beat or a weaker "
+                f"drive. Note the d-th nested correction scales as 1/t_g^d, so a deeper "
+                f"recursion couples the chirp and the length more tightly and may need "
+                f"more passes.")
         drag_norm = float(np.linalg.norm(delta_GHz))
         extra = {"drag_iters": it + 1, "min_abs_detuning_GHz": min_abs,
+                 "min_abs_detuning_per_channel_GHz": floors,
+                 "n_drag_channels": len(channels),
+                 "drag_correction_ratio": float(
+                     np.max(np.abs(eta_tot - amp)) / max(float(np.max(amp)), 1e-30)),
                  "drag_delta_frac": ((drag_norm - base_norm) / base_norm
                                      if base_norm else float("nan"))}
 
-    coeffs = np.array([(2 * k + 1) / 2.0 * np.sum(w * delta_GHz
-                                                  * L.legval(u, np.eye(k + 1)[k]))
-                       for k in range(int(degree) + 1)])
-    coeffs[1::2] = 0.0                       # odd terms vanish by parity; keep it exact
+    coeffs = _project(delta_GHz, u, w, degree)
     stark_mean_GHz = float(coeffs[0])
     # The static part of the measured ridge is drive-INDEPENDENT, so it has no shape
     # for a chirp to track -- it is purely a carrier retune, and it is added to the
@@ -1817,6 +1988,7 @@ def length_rabi(config: Dict[str, Any], target_eta: float,
                 wp_offset_GHz: float = 0.0,
                 chirp_coeffs_GHz: Optional[Sequence[float]] = None,
                 drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
+                drag_channels=None,
                 spec_abs_GHz: Optional[float] = None,
                 solver: Optional[Dict[str, Any]] = None,
                 refine: bool = True,
@@ -1844,7 +2016,7 @@ def length_rabi(config: Dict[str, Any], target_eta: float,
             config, float(t_g), fixed_eta_amp_scale(config, float(t_g), target_eta),
             wp_offset_GHz, solver, spec_abs_GHz=spec_abs_GHz,
             drag_beat_GHz=drag_beat_GHz, chirp_coeffs_GHz=chirp_coeffs_GHz,
-            drag_n_pump=drag_n_pump)
+            drag_n_pump=drag_n_pump, drag_channels=drag_channels)
 
     P = np.array([score(t) for t in grid])
     k = int(np.argmax(P))
@@ -1868,6 +2040,7 @@ def length_rabi(config: Dict[str, Any], target_eta: float,
 # ===========================================================================
 def calibrate_drag_offset(config: Dict[str, Any], t_g: float, target_eta: float,
                           drag_beat_GHz: float, *, drag_n_pump: int = 1,
+                          drag_channels=None,
                           chirp_coeffs_GHz: Optional[Sequence[float]] = None,
                           span_MHz: float = 40.0, points: int = 31,
                           time_points: int = 120,
@@ -1905,7 +2078,8 @@ def calibrate_drag_offset(config: Dict[str, Any], t_g: float, target_eta: float,
                        1.05 * float(t_g), int(time_points), solver, n_jobs=jobs,
                        spec_abs_GHz=spec_abs_GHz, shape="raised_cosine",
                        drag_beat_GHz=beat, chirp_coeffs_GHz=chirp_coeffs_GHz,
-                       drag_n_pump=drag_n_pump)
+                       drag_n_pump=drag_n_pump,
+                       drag_channels=(drag_channels if beat is not None else None))
 
     off = locate(None)
     on = locate(float(drag_beat_GHz))
@@ -1923,7 +2097,7 @@ def calibrate_drag_offset(config: Dict[str, Any], t_g: float, target_eta: float,
 
 
 def drag_shift_table(config: Dict[str, Any], target_eta: float, drag_beat_GHz: float, *,
-                     drag_n_pump: int = 1, eta_lo: float = 0.6, eta_hi: float = 1.2,
+                     drag_n_pump: int = 1, drag_channels=None, eta_lo: float = 0.6, eta_hi: float = 1.2,
                      amp_points: int = 4,
                      chirp_coeffs_GHz: Optional[Sequence[float]] = None,
                      span_MHz: float = 40.0, points: int = 25,
@@ -1966,6 +2140,7 @@ def drag_shift_table(config: Dict[str, Any], target_eta: float, drag_beat_GHz: f
         t_gs[i] = t_g
         row = calibrate_drag_offset(
             config, t_g, float(e), float(drag_beat_GHz), drag_n_pump=drag_n_pump,
+            drag_channels=drag_channels,
             chirp_coeffs_GHz=chirp_coeffs_GHz, span_MHz=span_MHz, points=points,
             time_points=time_points, spec_abs_GHz=spec_abs_GHz, solver=solver,
             jobs=jobs)
@@ -2009,6 +2184,7 @@ def project_nodrag_mean(table: Dict[str, Any], target_eta: float,
 # ===========================================================================
 def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
+                drag_channels=None,
                 spec_abs_GHz: Optional[float] = None, chirp_degree: int = 8,
                 quartic_warn: float = 0.25,
                 eta_lo: float = 0.3, eta_hi: float = 1.0,
@@ -2074,7 +2250,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         """The chirp implied by the measured law at this gate length."""
         return chirp_from_measured_shift(
             table, target_eta, degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
-            drag_n_pump=drag_n_pump, t_g=t_g, quartic_warn=quartic_warn)
+            drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
+            shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn)
 
     def shaped_residual(t_g: float, chirp, wp_offset: float) -> float:
         """Residual offset of the ASSEMBLED gate: shaped pulse, chirp and DRAG on.
@@ -2096,7 +2273,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                         1.05 * float(t_g), int(n_time), solver, n_jobs=jobs,
                         spec_abs_GHz=spec_abs_GHz, shape="raised_cosine",
                         drag_beat_GHz=drag_beat_GHz, chirp_coeffs_GHz=list(chirp),
-                        drag_n_pump=drag_n_pump)
+                        drag_n_pump=drag_n_pump, drag_channels=drag_channels)
         return float(chev["resonance_offset_GHz"]) - float(wp_offset)
 
     stages: Dict[str, Any] = {"rabi": table}
@@ -2104,7 +2281,13 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     t_g = t_g0
     chirp, wp_offset, length = None, 0.0, None
     # With DRAG off nothing below depends on t_g, so one pass IS the fixed point.
-    n_outer = int(max_drag_iters) if drag_beat_GHz is not None else 1
+    # A recursive tone couples the chirp and the length harder than a first-order
+    # one: the d-th nested correction scales as 1/t_g^d, so with K channels the
+    # residual coupling is ~1/t_g^K rather than 1/t_g. Give the loop more passes.
+    _shape_kind, _shape_kw = shape_config(config)
+    _drag_on = drag_beat_GHz is not None or bool(drag_channels)
+    _n_ch = len(_resolve_drag_channels(drag_beat_GHz, drag_n_pump, drag_channels))
+    n_outer = (max(int(max_drag_iters), 2 * _n_ch) if _drag_on else 1)
 
     for it in range(n_outer):
         prev_chirp = None if chirp is None else np.array(chirp)
@@ -2154,7 +2337,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         log.info("step 4: length scan at fixed |eta| (the only free parameter)")
         length = length_rabi(config, target_eta, wp_offset_GHz=wp_offset,
                              chirp_coeffs_GHz=chirp, drag_beat_GHz=drag_beat_GHz,
-                             drag_n_pump=drag_n_pump, spec_abs_GHz=spec_abs_GHz,
+                             drag_n_pump=drag_n_pump, drag_channels=drag_channels,
+                             spec_abs_GHz=spec_abs_GHz,
                              solver=solver, logger=log,
                              t_g_grid=t_g0 * np.linspace(0.7, 1.3, int(tg_points)))
         t_g = float(length["t_g_ns"])
@@ -2167,7 +2351,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         history.append({"iter": it, "t_g_ns": t_g, "max_dc_GHz": dc,
                         "d_t_g_ns": dt, "wp_offset_GHz": wp_offset,
                         "residual_GHz": residual_GHz, "chirp_GHz": list(chirp)})
-        if drag_beat_GHz is None:
+        if not _drag_on:
             break
         log.info(f"  pass {it + 1}: max|dc|={dc:.2e} GHz, |d t_g|={dt:.4f} ns")
         if dc < chirp_tol_GHz and dt < 1e-3 * t_g0:
@@ -2184,16 +2368,17 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     stages["length"] = length
     stages["residual_GHz"] = residual_GHz
     drag_info = ({"history": history, "iters": len(history)}
-                 if drag_beat_GHz is not None else None)
+                 if _drag_on else None)
 
     # Everything above assumes DRAG shifts the resonance only by adding drive,
     # through the law the (DRAG-blind) constant probe measured. These shaped
     # DRAG-off/DRAG-on chevrons are the direct test of that assumption.
-    if drag_beat_GHz is not None:
+    if _drag_on and drag_beat_GHz is not None:
         predicted = (float(proj["mean_shift_GHz"])
                      - float(project_nodrag_mean(table, target_eta, chirp_degree)))
         meas = calibrate_drag_offset(
             config, t_g, target_eta, float(drag_beat_GHz), drag_n_pump=drag_n_pump,
+            drag_channels=drag_channels,
             chirp_coeffs_GHz=chirp, span_MHz=(wp_span_MHz or 40.0),
             points=int(wp_points), time_points=int(n_time),
             spec_abs_GHz=spec_abs_GHz, solver=solver, jobs=jobs,
@@ -2213,6 +2398,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         if drag_shift_points:
             stages["drag_shift_table"] = drag_shift_table(
                 config, target_eta, float(drag_beat_GHz), drag_n_pump=drag_n_pump,
+                drag_channels=drag_channels,
                 amp_points=int(drag_shift_points), chirp_coeffs_GHz=chirp,
                 span_MHz=(wp_span_MHz or 40.0), points=int(wp_points),
                 time_points=int(n_time), spec_abs_GHz=spec_abs_GHz, solver=solver,
@@ -2247,7 +2433,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         from snail_solver.device_utils import transfer_probability
         flat_transfer = transfer_probability(
             config, t_g, amp_scale, wp_offset, solver, spec_abs_GHz=spec_abs_GHz,
-            drag_beat_GHz=drag_beat_GHz, chirp_coeffs_GHz=[], drag_n_pump=drag_n_pump)
+            drag_beat_GHz=drag_beat_GHz, chirp_coeffs_GHz=[], drag_n_pump=drag_n_pump,
+            drag_channels=drag_channels)
         stages["chirp_ablation"] = {
             "transfer_with_chirp": float(length["transfer"]),
             "transfer_flat_carrier": float(flat_transfer),
@@ -2318,6 +2505,19 @@ def main() -> None:
     ap.add_argument("--drag-beat-GHz", type=float, default=None,
                     help="calibrate with DRAG on at this beat; enables the "
                          "chirp<->DRAG iteration")
+    ap.add_argument("--drag-channel", action="append", default=None,
+                    metavar="BEAT[:K[:N]]",
+                    help="RECURSIVE multi-derivative DRAG (Li/Calarco/Motzoi, npj QI "
+                         "10, 66 (2024)): suppress several off-resonant processes at "
+                         "once by composing one derivative correction per process. "
+                         "Repeatable. BEAT in GHz, K = pump quanta (chirp tracking, "
+                         "default 1), N = photons in F^(n) (default = K). e.g. "
+                         "--drag-channel 0.30 --drag-channel -0.22:1 "
+                         "--drag-channel 0.55:2:2 . Mutually exclusive with "
+                         "--drag-beat-GHz. NOTE: more than one channel needs a base "
+                         "shape with enough vanishing end derivatives -- set "
+                         "envelope=sine_power with envelope_m >= the channel count, "
+                         "or the pulse diverges at the gate edges.")
     ap.add_argument("--drag-n-pump", type=int, default=1,
                     help="pump quanta of the suppressed process (1 one-pump, "
                          "2 subharmonic, 0 static/pump-independent)")
@@ -2396,6 +2596,10 @@ def main() -> None:
                     help="save the result into the device JSON under this name")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
+    if args.drag_channel and args.drag_beat_GHz is not None:
+        ap.error("--drag-channel and --drag-beat-GHz are two spellings of the same "
+                 "setting (--drag-beat-GHz is the one-channel shorthand); pass only one")
+    _cli_channels = parse_drag_channels(args.drag_channel)
     if args.gpu:
         from snail_solver import zhou_coupler
         zhou_coupler.use_gpu(True)
@@ -2434,7 +2638,9 @@ def main() -> None:
         try:
             out = run_tune_up(
                 config, args.target_eta, drag_beat_GHz=args.drag_beat_GHz,
-                drag_n_pump=args.drag_n_pump, spec_abs_GHz=args.spec_abs_GHz,
+                drag_n_pump=args.drag_n_pump,
+                drag_channels=_cli_channels,
+                spec_abs_GHz=args.spec_abs_GHz,
                 chirp_degree=args.chirp_degree, quartic_warn=args.quartic_warn,
                 window_tg=args.window_tg, n_time=args.n_time,
                 span_linewidths=args.span_linewidths,

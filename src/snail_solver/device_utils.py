@@ -147,13 +147,28 @@ def check_drag_detuning(tone, floor_GHz: float = DRAG_FLOOR_GHz) -> float:
         ``min_t |Delta(t)|`` in GHz (``inf`` when DRAG is off).
     """
     floor_rad = float(min(floor_GHz, DRAG_FLOOR_GHz)) * TWO_PI
-    got = tone.drag_detuning_floor()
+    floors = tone.drag_detuning_floors()
+    got = min(floors) if floors else float("inf")
     if got < floor_rad:
+        channels = tone.drag_channels_resolved()
+        worst = int(np.argmin(floors))
+        if len(channels) == 1:
+            which = (f"Delta_0 = {float(channels[0].beat_GHz) * 1e3:.3f} MHz, "
+                     f"drag_n_pump = {channels[0].n_pump}")
+        else:
+            # name the offender: with several channels the failing one is not
+            # otherwise identifiable from the aggregate minimum
+            which = (f"channel {worst + 1}/{len(channels)} "
+                     f"(Delta_0 = {float(channels[worst].beat_GHz) * 1e3:.3f} MHz, "
+                     f"n_pump = {channels[worst].n_pump}, "
+                     f"n_photon = {channels[worst].n_photon}); all channels "
+                     + ", ".join(f"{float(c.beat_GHz) * 1e3:+.1f}@k{c.n_pump}"
+                                 f"->{f / TWO_PI * 1e3:.3f} MHz"
+                                 for c, f in zip(channels, floors)))
         raise ValueError(
             f"DRAG beat passes through zero during the pulse: min|Delta(t)| = "
             f"{got / TWO_PI * 1e3:.4f} MHz < {floor_rad / TWO_PI * 1e3:.4f} MHz, with "
-            f"Delta_0 = {float(tone.delta_drag_GHz or 0.0) * 1e3:.3f} MHz, "
-            f"drag_n_pump = {tone.drag_n_pump}, chirp = "
+            f"{which}, chirp = "
             f"{None if tone.chirp is None else list(tone.chirp.coeffs_GHz)} GHz. "
             f"The chirp is sweeping the pump onto the process DRAG is meant to "
             f"suppress. Reduce the chirp, pick a further-detuned beat, or set "
@@ -161,11 +176,52 @@ def check_drag_detuning(tone, floor_GHz: float = DRAG_FLOOR_GHz) -> float:
     return got / TWO_PI
 
 
+def drag_correction_ratio(tone, n: int = 257) -> float:
+    """How large the DRAG correction is relative to the pulse it corrects.
+
+    ``max_t |eta_corrected - eta_base| / max_t |eta_base|``, with the chirp phase
+    excluded (it is a pure phase and would swamp the comparison).
+
+    ``min|Delta(t)|`` is necessary but NOT sufficient for a recursive pulse. The
+    perturbative ``F^(n)`` is only valid while ``|Omega'/(Omega Delta)| << 1`` at every
+    level, and with several nestings that product can exceed 1 -- at which point the
+    "correction" is larger than the pulse and the expansion has stopped meaning
+    anything, even though every individual beat is comfortably far from zero. Nothing
+    else in the codebase would surface that.
+
+    Callers should WARN, not raise: like the rest of this pipeline, it reports.
+    Returns 0.0 when DRAG is off.
+    """
+    channels = tone.drag_channels_resolved()
+    if not channels:
+        return 0.0
+    from snail_solver import drag as _drag
+    env = tone.envelope
+    t_g = float(getattr(env, "t_g", 0.0)) or 1.0
+    # interior samples: the envelope vanishes at the endpoints, where the ratio is
+    # either 0/0 or (for a base shape that is too shallow) unbounded by construction
+    ts = np.linspace(0.0, t_g, int(n) + 2)[1:-1]
+    base = np.asarray(env.value_at(ts, np), dtype=complex)
+    if tone.is_legacy_drag:
+        corrected = base - 1j * np.asarray(env.deriv_at(ts, np)) / np.asarray(
+            tone.drag_detuning(ts, np))
+    else:
+        order = _drag.required_order(channels)
+        corrected = np.asarray(_drag.apply_drag(
+            env.jet_at(ts, order, np),
+            [tone.channel_detuning_jet(c, ts, order, np) for c in channels],
+            channels, np), dtype=complex)
+    denom = float(np.max(np.abs(base)))
+    return float(np.max(np.abs(corrected - base)) / denom) if denom else float("inf")
+
+
 def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
                   wp_offset_GHz: float, spec_abs_GHz: Optional[float] = None,
                   drag_beat_GHz: Optional[float] = None,
                   chirp_coeffs_GHz: Optional[Sequence[float]] = None,
-                  drag_n_pump: int = 1):
+                  drag_n_pump: int = 1, drag_channels=None,
+                  correction_warn: float = 0.3,
+                  logger=None):
     """Build the (qubit a, qubit b, coupler[, spectator]) gate with the pump
     normalized to a full iSWAP and scaled by amp_scale (anharmonicity included).
 
@@ -196,6 +252,16 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
         moves under a chirp: ``Delta(t) = drag_beat_GHz - drag_n_pump * delta(t)``.
         1 for a one-pump collision, 2 for a subharmonic one, 0 for a static
         (pump-independent) beat. Irrelevant without a chirp.
+    drag_channels : sequence of DragChannel, optional
+        Several processes to suppress at once, via recursive multi-derivative DRAG
+        (see :mod:`snail_solver.drag`). OVERRIDES `drag_beat_GHz`/`drag_n_pump`,
+        which remain the one-channel shorthand. None (default) leaves the tone on
+        the historical first-order path.
+    correction_warn : float, default 0.3
+        Log a warning when :func:`drag_correction_ratio` exceeds this -- the
+        perturbative expansion has stopped being small. Never raises.
+    logger : logging.Logger, optional
+        Where that warning goes; silent if omitted.
 
     Returns
     -------
@@ -208,6 +274,7 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
         If a chirp drives the DRAG beat through zero during the pulse; see
         :func:`check_drag_detuning`.
     """
+    from snail_solver.envelope import ENVELOPE_KINDS
     from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse, make_chirp
 
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
@@ -231,15 +298,35 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
     cpl = ZhouCoupler(mode_freqs_GHz=freqs, coupler_index=2,
                       participations=participations, nonlinearities=nonlin, levels=levels,
                       anharmonicities_GHz=anharm)
-    EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
+    EnvCls = ENVELOPE_KINDS.get(config["envelope"], ConstantPulse)
     if chirp_coeffs_GHz is None:
         chirp_coeffs_GHz = config.get("chirp_coeffs_GHz") or None
-    tone = PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True,
+    env_kw = {}
+    if EnvCls.__name__ == "SinePowerRamp":         # Eq. (13) shape parameters
+        # The rise is a FRACTION of t_g, not a time in ns, so the envelope in
+        # normalized gate time stays t_g-independent -- the property tune_up's
+        # amplitude/length decoupling depends on. See `tune_up.area_factor`.
+        env_kw = {"m": int(config.get("envelope_m", 3)),
+                  "t_rise": float(config.get("envelope_rise_frac", 0.5)) * t_g}
+    tone = PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g, **env_kw),
+                    is_eta=True,
                     drag=(drag_beat_GHz is not None),
                     delta_drag_GHz=(drag_beat_GHz if drag_beat_GHz is not None else 0.0),
                     chirp=make_chirp(chirp_coeffs_GHz, t_g),
-                    drag_n_pump=int(drag_n_pump))
+                    drag_n_pump=int(drag_n_pump),
+                    drag_channels=(list(drag_channels) if drag_channels else None))
     check_drag_detuning(tone)          # a chirp must not sweep the pump onto the beat
+    # A far-from-zero beat is not on its own enough for a RECURSIVE pulse; see
+    # drag_correction_ratio. Warn only -- this pipeline reports, it does not refuse.
+    if logger is not None and not tone.is_legacy_drag and tone.drag_channels_resolved():
+        ratio = drag_correction_ratio(tone)
+        if ratio > float(correction_warn):
+            logger.info(
+                f"  WARNING: the DRAG correction is {100 * ratio:.0f}% of the pulse "
+                f"it corrects (> {100 * correction_warn:.0f}%), over "
+                f"{len(tone.drag_channels_resolved())} channels. The perturbative "
+                f"expansion is no longer small, so the composed pulse is a guess, "
+                f"not a correction -- use fewer channels or further-detuned beats.")
     cpl.set_pump(tone, normalize_iswap=(0, 1))
     cpl.scale_pump_amplitude(amp_scale)
     return cpl, w_p_GHz, cpl.peak_eta()

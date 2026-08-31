@@ -97,7 +97,8 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                           drag_beat_GHz: Optional[float] = None,
                           amp_scale: float = 1.0,
                           chirp_coeffs_GHz: Optional[Sequence[float]] = None,
-                          drag_n_pump: int = 1):
+                          drag_n_pump: int = 1,
+                          drag_channels=None):
     """(a, b, coupler[, spectator]) system driven by a probe pump, with the pump
     frequency offset from |w_b - w_a| by wp_offset_GHz. Anharmonicity / qutrit
     levels are included.
@@ -193,8 +194,9 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                         drag=(drag_beat_GHz is not None),
                         delta_drag_GHz=drag_beat_GHz,
                         chirp=make_chirp(chirp_coeffs_GHz, t_g),
-                        drag_n_pump=int(drag_n_pump))
-        if drag_beat_GHz is not None:
+                        drag_n_pump=int(drag_n_pump),
+                        drag_channels=(list(drag_channels) if drag_channels else None))
+        if drag_beat_GHz is not None or drag_channels:
             check_drag_detuning(tone)      # chirp must not sweep the pump onto the beat
         cpl.set_pump(tone, normalize_iswap=(0, 1))
         cpl.scale_pump_amplitude(float(amp_scale))
@@ -400,6 +402,7 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
          drag_beat_GHz: Optional[float] = None,
          chirp_coeffs_GHz: Optional[Sequence[float]] = None,
          drag_n_pump: int = 1,
+         drag_channels=None,
          eta_op: Optional[float] = None,
          keep_full_channels: bool = False) -> Dict[str, Any]:
     """Run the pump-frequency chevron and locate the Stark-shifted resonance.
@@ -467,7 +470,10 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
                 "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else None),
                 "amp_scale": float(amp_scale),
                 "chirp_coeffs_GHz": chirp_list,
-                "drag_n_pump": int(drag_n_pump)}
+                "drag_n_pump": int(drag_n_pump),
+                # frozen dataclasses of plain scalars -- picklable, so they survive
+                # the multiprocessing fan-out to _chevron_worker unchanged
+                "drag_channels": (list(drag_channels) if drag_channels else None)}
     args = [(config, eta_op, float(off), times, solver, spec_abs_GHz, build_kw)
             for off in offsets_GHz]
 

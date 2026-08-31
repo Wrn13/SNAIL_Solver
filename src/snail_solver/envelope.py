@@ -49,6 +49,7 @@ existing per-time solver callbacks are unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import comb as _comb
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
@@ -114,6 +115,29 @@ class Envelope:
         v = self.deriv_at(float(t), np)
         return complex(v) if self.is_complex else float(v)
 
+    # -- higher derivatives (the recursive-DRAG requirement) ---------------
+    def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
+        """Derivatives ``(eps, eps', ..., eps^(order))`` at time(s) `t` (ns).
+
+        Recursive DRAG (:mod:`snail_solver.drag`) differentiates the amplitude
+        produced by the previous correction, so a K-fold composition needs the base
+        envelope to order K. Every envelope in this module is a finite trigonometric
+        polynomial, so the overrides below are all closed forms -- no quadrature, no
+        finite differences, and trace-clean like `value_at`/`deriv_at`.
+
+        `order` must be a static Python int (it controls an unrolled loop). The base
+        implementation covers orders 0 and 1 by delegating to the existing methods;
+        anything higher is a per-subclass responsibility.
+        """
+        order = int(order)
+        if order <= 0:
+            return (self.value_at(t, xp),)
+        if order == 1:
+            return (self.value_at(t, xp), self.deriv_at(t, xp))
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement jet_at beyond order 1; "
+            f"recursive DRAG with K channels needs order K")
+
     # -- integrated quantities ---------------------------------------------
     def area(self) -> float:
         """Return integral_0^{t_g} value(t) dt by quadrature (override if a closed
@@ -164,6 +188,11 @@ class ConstantPulse(Envelope):
         """Zero everywhere (flat pulse)."""
         return 0.0 * xp.asarray(t)
 
+    def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
+        """Value, then zeros: a flat pulse has no interior derivatives."""
+        v = self.value_at(t, xp)
+        return (v,) + tuple(0.0 * v for _ in range(int(order)))
+
     def area(self) -> float:
         """Closed form: amp * t_g."""
         return self.amp * self.t_g
@@ -185,9 +214,184 @@ class RaisedCosine(Envelope):
         return (self.amp * 0.5 * (TWO_PI / self.t_g) * xp.sin(TWO_PI * t / self.t_g)
                 * self._support(t, xp))
 
+    def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
+        """Closed-form derivatives to any order.
+
+        Only the cosine carries the time dependence, so for n >= 1
+        ``d^n/dt^n[-amp/2 cos(w t)] = -amp/2 w^n cos(w t + n pi/2)`` with
+        ``w = 2 pi / t_g``. At n = 1 this reproduces :meth:`deriv_at` exactly.
+
+        Note what this shows about the boundaries: ``eps(0) = eps'(0) = 0`` but
+        ``eps''(0) = amp/2 w^2 != 0``. A Hann window therefore supports exactly ONE
+        clean derivative correction -- see :mod:`snail_solver.drag`.
+        """
+        w = TWO_PI / self.t_g
+        support = self._support(t, xp)
+        out = [self.value_at(t, xp)]
+        for n in range(1, int(order) + 1):
+            out.append(-self.amp * 0.5 * w ** n
+                       * xp.cos(w * t + n * (np.pi / 2.0)) * support)
+        return tuple(out)
+
     def area(self) -> float:
         """Closed form: amp * t_g / 2 (exact integral of the Hann window)."""
         return self.amp * self.t_g / 2.0
+
+
+class SinePowerRamp(Envelope):
+    r"""The Li/Calarco/Motzoi Eq. (13) shape: a ramp with m vanishing end derivatives.
+
+    .. math::
+        \Omega^{(m)}(t) = \mathrm{amp}\;\mathcal{I}_0
+            \int_0^{t} \sin^m\!\big(\pi t' / t_r\big)\,dt' ,\qquad 0 \le t \le t_r
+
+    normalized by :math:`\mathcal{I}_0` so that :math:`\Omega(t_r) = \mathrm{amp}`,
+    then held flat and mirrored down over ``[t_g - t_r, t_g]``.
+
+    Why this shape exists
+    ---------------------
+    Recursive DRAG differentiates the pulse once per suppressed channel, and the
+    paper requires the base shape to be m-times differentiable with **all m
+    derivatives vanishing at both ends**, "which guarantees the validity of the frame
+    transformation". :class:`RaisedCosine` only manages two
+    (``eps(0) = eps'(0) = 0`` but ``eps''(0) != 0``), and that is not a small error:
+    with ``F^(2)`` innermost the imaginary term dominates as ``t -> 0``, so a shape
+    vanishing as ``t^p`` comes out as ``t^(p - 1/2)``. Hann has ``p = 2``, so two
+    further derivatives give a ``t^(-1/2)`` DIVERGENCE at both gate edges -- measured,
+    and pinned by ``test_hann_diverges_under_the_full_recursion``. Here
+    ``eps ~ t^(m+1)``, so ``m = 3`` carries a 3-channel recursion comfortably.
+
+    Keep m as small as the channel count allows: the paper warns that larger m packs
+    more high-frequency content into the pulse, which is itself a source of
+    non-adiabatic error.
+
+    Reduces exactly to a Hann window
+    --------------------------------
+    ``SinePowerRamp(amp, t_g, m=1)`` (i.e. ``t_rise = t_g/2``, no plateau) IS
+    :class:`RaisedCosine`, to floating-point equality -- the paper says as much
+    ("for m = 1 and with zero holding time, the pulse is the same as the Hann
+    window"), and a test asserts it. That makes every Hann-specific constant elsewhere
+    in the codebase a special case of this family rather than a separate derivation.
+
+    .. note::
+       The paper PRINTS the integrand as ``sin^m(pi t'/2 t_r)``, which would make it
+       equal 1 (its maximum) at ``t' = t_r`` and so leave ``Omega'(t_r) != 0`` --
+       contradicting the very property the equation is introduced to provide, and
+       failing its own m=1 claim by 0.25 in amplitude. The ``pi t'/t_r`` reading used
+       here vanishes at both ends and reproduces the Hann window to 6e-16.
+
+    Parameters
+    ----------
+    amp : float
+        Peak amplitude (reached on the plateau).
+    t_g : float
+        Gate duration (ns).
+    m : int, default 3
+        Number of vanishing derivatives at each edge. Must be >= 1.
+    t_rise : float, optional
+        Ramp duration. Defaults to ``t_g/2`` -- no plateau, the direct Hann analogue.
+        Must satisfy ``2 t_rise <= t_g``.
+    """
+
+    def __init__(self, amp: float, t_g: float, m: int = 3,
+                 t_rise: Optional[float] = None) -> None:
+        super().__init__(amp, t_g)
+        self.m = int(m)
+        if self.m < 1:
+            raise ValueError(f"m must be >= 1, got {self.m}")
+        self.t_rise = float(self.t_g / 2.0 if t_rise is None else t_rise)
+        if not (0.0 < self.t_rise <= self.t_g / 2.0 + 1e-12):
+            raise ValueError(f"t_rise must be in (0, t_g/2]; got {self.t_rise} "
+                             f"with t_g = {self.t_g}")
+        # sin^m(x) = sum_j W_j e^{i k_j x},  k_j = m - 2j, from the binomial expansion
+        # of ((e^{ix} - e^{-ix}) / 2i)^m. Complex exponentials rather than a
+        # parity-split sin/cos series: one code path covers odd and even m, and both
+        # the antiderivative and every derivative are then one-liners.
+        j = np.arange(self.m + 1)
+        self._k = (self.m - 2 * j).astype(float)
+        self._W = (np.array([_comb(self.m, int(x)) for x in j], dtype=complex)
+                   * (-1.0) ** j / (2.0j) ** self.m)
+        self._w = np.pi / self.t_rise                      # angular rate of the ramp
+        # I_0, fixed by Omega(t_rise) = amp
+        self._I0 = 1.0 / float(self._integral(self.t_rise))
+
+    # -- the ramp, its integral and its derivatives ------------------------
+    def _integral(self, t: Any, xp: Any = np) -> Any:
+        """``int_0^t sin^m(w t') dt'`` (un-normalized), termwise in the exponentials.
+
+        The basis lives on a trailing axis, so a scalar and an array of times take
+        the same code path (the same trick as ``IQFourierEnvelope._basis``).
+        """
+        k, W, w = self._k, self._W, self._w
+        zero = np.abs(k) < 1e-12
+        k_safe = np.where(zero, 1.0, k)        # avoid 0/0 in the discarded branch
+        tt = xp.asarray(t)[..., None]
+        # the k = 0 term integrates to t; every other to (e^{i k w t} - 1)/(i k w)
+        terms = xp.where(zero, tt + 0.0j,
+                         (xp.exp(1j * k_safe * w * tt) - 1.0) / (1j * k_safe * w))
+        return xp.real(xp.sum(terms * W, axis=-1))
+
+    def _ramp_derivs(self, t: Any, order: int, xp: Any) -> list:
+        """``R, R', ..., R^(order)`` of the normalized rising ramp at `t`."""
+        k, W, w, I0 = self._k, self._W, self._w, self._I0
+        out = [I0 * self._integral(t, xp)]
+        arg = xp.exp(1j * (k * w) * xp.asarray(t)[..., None])
+        for n in range(1, int(order) + 1):
+            # R^(n) = I0 * d^(n-1)/dt^(n-1) sin^m(w t)
+            out.append(I0 * xp.real(xp.sum(arg * (W * (1j * k * w) ** (n - 1)),
+                                           axis=-1)))
+        return out
+
+    def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
+        """Closed-form derivatives to any order, across rise / plateau / fall.
+
+        The three regions are combined with ``xp.where`` masks, never a Python
+        branch, so a scalar, an array and a tracer all take the same path. The fall
+        is the rise reflected, so its n-th derivative carries ``(-1)^n``.
+        """
+        order = int(order)
+        t = xp.asarray(t)
+        t_r, t_g = self.t_rise, self.t_g
+        up = self._ramp_derivs(t, order, xp)
+        down = self._ramp_derivs(t_g - t, order, xp)
+        # Closed on the left at t_r, so the ramp -- not the plateau -- owns the
+        # junction. With no plateau (t_rise = t_g/2) that point is the bell's peak,
+        # where derivatives above order m are genuinely NON-zero; handing it to the
+        # plateau branch would zero them and silently break the m=1/Hann identity.
+        rising = t <= t_r
+        falling = t >= (t_g - t_r)
+        support = self._support(t, xp)
+        out = []
+        for n in range(order + 1):
+            flat = (xp.ones_like(t) if n == 0 else 0.0 * t)    # plateau value
+            v = xp.where(rising, up[n],
+                         xp.where(falling, (-1.0) ** n * down[n], flat))
+            out.append(self.amp * v * support)
+        return tuple(out)
+
+    def value_at(self, t: Any, xp: Any = np) -> Any:
+        """Envelope amplitude at `t` (ns); 0 outside [0, t_g]."""
+        return self.jet_at(t, 0, xp)[0]
+
+    def deriv_at(self, t: Any, xp: Any = np) -> Any:
+        """Analytic d eps/dt at `t` (ns); 0 outside [0, t_g]."""
+        return self.jet_at(t, 1, xp)[1]
+
+    def area(self) -> float:
+        """Closed form: two ramps plus the plateau.
+
+        Exact rather than quadrature because ``set_pump(normalize_iswap=...)``
+        divides by this to calibrate the pi/2 rotation.
+        """
+        k, W, w, t_r = self._k, self._W, self._w, self.t_rise
+        zero = np.abs(k) < 1e-12
+        k_safe = np.where(zero, 1.0, k)
+        # int_0^{t_r} of each antiderivative term
+        inner = np.where(zero, t_r ** 2 / 2.0,
+                         ((np.exp(1j * k_safe * w * t_r) - 1.0) / (1j * k_safe * w)
+                          - t_r) / (1j * k_safe * w))
+        ramp_area = self._I0 * float(np.real(np.sum(inner * W)))
+        return self.amp * (2.0 * ramp_area + (self.t_g - 2.0 * t_r))
 
 
 class IQFourierEnvelope(Envelope):
@@ -311,6 +515,46 @@ class IQFourierEnvelope(Envelope):
                             + self._shape(t, xp) * self._dmod(t, xp))
                 * self._support(t, xp))
 
+    def _shape_derivs(self, t: Any, order: int, xp: Any) -> list:
+        """``S, S', ..., S^(order)`` for the Hann shape function."""
+        W = TWO_PI / self.t_g
+        return [self._shape(t, xp)] + [
+            -0.5 * W ** n * xp.cos(W * t + n * (np.pi / 2.0))
+            for n in range(1, int(order) + 1)]
+
+    def _mod_derivs(self, t: Any, order: int, xp: Any) -> list:
+        """``M, M', ..., M^(order)`` for the Fourier modulation."""
+        out = [self._mod(t, xp)]
+        if self.freqs.size == 0:            # M == 1: every derivative vanishes
+            zero = 0.0 * xp.asarray(t)
+            return out + [zero + 0.0j for _ in range(int(order))]
+        w = self.freqs
+        arg = xp.asarray(t)[..., None] * w
+        for n in range(1, int(order) + 1):
+            s = xp.sin(arg + n * (np.pi / 2.0))
+            c = xp.cos(arg + n * (np.pi / 2.0))
+            wn = w ** n
+            out.append((xp.sum(s * (self.sin_I * wn), axis=-1)
+                        + xp.sum(c * (self.cos_I * wn), axis=-1))
+                       + 1j * (xp.sum(s * (self.sin_Q * wn), axis=-1)
+                               + xp.sum(c * (self.cos_Q * wn), axis=-1)))
+        return out
+
+    def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
+        """Closed-form derivatives to any order, by Leibniz over ``S(t) M(t)``.
+
+        Both factors are finite trigonometric polynomials, so each is differentiated
+        by phase-shifting its arguments; the product rule is then the plain binomial
+        sum. At order 1 this reproduces :meth:`deriv_at` exactly.
+        """
+        order = int(order)
+        S = self._shape_derivs(t, order, xp)
+        M = self._mod_derivs(t, order, xp)
+        support = self._support(t, xp)
+        return tuple(self.amp * support * sum(
+            _comb(n, j) * S[j] * M[n - j] for j in range(n + 1))
+            for n in range(order + 1))
+
     def area(self) -> float:
         """Integral of Re[eta] over the gate (see Notes); closed form when the
         basis is empty."""
@@ -356,6 +600,33 @@ def _legendre_stack(u: Any, degree: int, xp: Any):
         # (k+1) P_{k+1} = (2k+1) u P_k - k P_{k-1}
         out.append(((2 * k + 1) * u * out[k] - k * out[k - 1]) / (k + 1))
     return out
+
+
+def _legendre_deriv_stack(u: Any, degree: int, order: int, xp: Any):
+    """``P[m][k] = d^m P_k / du^m`` for m <= `order`, k <= `degree`.
+
+    The same recurrence as :func:`_legendre_stack`, differentiated m times in place.
+    Since ``u P_k`` is a product with a LINEAR factor, Leibniz truncates after two
+    terms::
+
+        (k+1) P_{k+1}^(m) = (2k+1) [ u P_k^(m) + m P_k^(m-1) ] - k P_{k-1}^(m)
+
+    Used by :meth:`Chirp.detuning_jet`; kept here beside the value recurrence so the
+    two cannot drift.
+    """
+    zero = 0.0 * u
+    ones = xp.ones_like(u)
+    stack = [_legendre_stack(u, degree, xp)]
+    for m in range(1, int(order) + 1):
+        prev = stack[m - 1]
+        row = [zero]
+        if degree >= 1:
+            row.append(ones if m == 1 else zero)          # P_1 = u
+        for k in range(1, degree):
+            row.append(((2 * k + 1) * (u * row[k] + m * prev[k])
+                        - k * row[k - 1]) / (k + 1))
+        stack.append(row)
+    return stack
 
 
 class Chirp:
@@ -434,6 +705,41 @@ class Chirp:
         total = sum(c * P[k] for k, c in enumerate(self.coeffs_GHz))
         return TWO_PI * total
 
+    def detuning_jet(self, t: Any, order: int, xp: Any = np) -> tuple:
+        """``delta, delta', ..., delta^(order)`` at time(s) `t`, in rad/ns^(1+m).
+
+        Recursive DRAG applied verbatim (Eq. 4 of Li/Calarco/Motzoi) differentiates
+        ``Omega^n / Delta(t)`` as a whole, so on a CHIRPED tone it needs derivatives
+        of the beat, not just its value. Those did not exist before this method:
+        ``Delta(t) = Delta_0 - k delta(t)``, so ``Delta^(m) = -k delta^(m)``.
+
+        With ``u = 2t/t_g - 1`` the chain rule gives
+        ``d^m delta/dt^m = 2 pi (2/t_g)^m sum_k c_k P_k^(m)(u)``.
+
+        Outside the gate :meth:`_u` CLIPS, so ``delta`` is constant there and every
+        derivative is genuinely zero. The support mask below states that explicitly
+        rather than leaning on ``xp.clip``'s subgradient, which is backend-dependent
+        at the boundary. The 0th entry is left unmasked so it is exactly
+        :meth:`detuning` -- changing that would move the DRAG beat outside the gate.
+        """
+        order = int(order)
+        n = self.coeffs_GHz.size
+        if n == 0:
+            zero = 0.0 * xp.asarray(t)
+            return tuple(zero for _ in range(order + 1))
+        u = self._u(t, xp)
+        P = _legendre_deriv_stack(u, n - 1, order, xp)
+        support = xp.where((t >= 0.0) & (t <= self.t_g), 1.0, 0.0)
+        du_dt = 2.0 / self.t_g
+        # order 0 from the stack we already have -- calling self.detuning() here would
+        # rebuild the whole Legendre recurrence a second time, which showed up as ~10x
+        # redundant work in the scalar solver callback.
+        out = [TWO_PI * sum(c * P[0][k] for k, c in enumerate(self.coeffs_GHz))]
+        for m in range(1, order + 1):
+            total = sum(c * P[m][k] for k, c in enumerate(self.coeffs_GHz))
+            out.append(TWO_PI * du_dt ** m * total * support)
+        return tuple(out)
+
     def phase(self, t: Any, xp: Any = np) -> Any:
         """Accumulated chirp phase Phi(t) = int_0^t delta(t') dt', in radians."""
         n = self.coeffs_GHz.size
@@ -478,6 +784,82 @@ def make_chirp(coeffs_GHz: Optional[Sequence[float]], t_g: float) -> Optional[Ch
         return None
     chirp = Chirp(coeffs_GHz, t_g)
     return None if chirp.is_trivial else chirp
+
+
+#: Envelope kinds addressable by name, for ``config["envelope"]`` and
+#: ``find_stark_resonance.scan(shape=...)``. The Hann default is deliberately
+#: unchanged: ``sine_power`` is opt-in, because switching the base shape moves the
+#: amplitude/area algebra the tune-up is built on (see ``tune_up.area_factor``).
+ENVELOPE_KINDS = {
+    "raised_cosine": RaisedCosine,
+    "constant": ConstantPulse,
+    "sine_power": SinePowerRamp,
+}
+
+
+# ===========================================================================
+# DRAG channels
+# ===========================================================================
+@dataclass(frozen=True)
+class DragChannel:
+    """One off-resonant process for recursive DRAG to suppress.
+
+    See :mod:`snail_solver.drag`. A tone carrying several of these applies one
+    substitution ``F^(n_photon)_{Delta(t)}`` per channel, composed innermost-first.
+
+    Frozen so it can be carried as STATIC data in a ``jax_engine`` pulse spec (it
+    controls unrolled Python loops and must never be traced) and hashed as a jit
+    static argument.
+
+    Parameters
+    ----------
+    beat_GHz : float
+        ``Delta_0``, the static beat of the suppressed process.
+    n_pump : int, default 1
+        Pump quanta the process carries, i.e. how its beat MOVES under a chirp:
+        ``Delta(t) = 2 pi beat_GHz - n_pump delta(t)``. This is the codebase's
+        long-standing ``drag_n_pump``; see ``sweep_common._PUMP_QUANTA``.
+    n_photon : int, default 1
+        The paper's ``n`` in ``F^(n)`` -- the exponent the drive is raised to.
+
+        Deliberately SEPARATE from `n_pump` even though the two are the same
+        physical integer for every channel this device produces. They enter in
+        different places (``n_pump`` in the denominator, ``n_photon`` as a numerator
+        exponent), and fusing them would silently promote every existing
+        ``drag_n_pump=2`` call site -- the subharmonic sweeps, ``--drag-n-pump 2`` --
+        from first-order to second-order DRAG. :meth:`from_collision` sets both when
+        that IS what you want.
+    mode : str, default "perturbative"
+        ``"perturbative"`` is Eq. (4). ``"givens"`` (Eq. 7) is not implemented.
+    quotient_rule : bool, default False
+        Whether ``d/dt`` acts on ``Omega^n / Delta`` as a whole (Eq. 4 verbatim) or
+        only on ``Omega^n``. False reproduces this codebase's historical first-order
+        arithmetic bit-for-bit; on an UNCHIRPED tone the two are identical anyway
+        (``Delta' = 0``).
+    kappa : float, optional
+        Coupling-per-unit-drive ``g = kappa Omega`` of this process. Required only by
+        ``mode="givens"``.
+    """
+
+    beat_GHz: float
+    n_pump: int = 1
+    n_photon: int = 1
+    mode: str = "perturbative"
+    quotient_rule: bool = False
+    kappa: Optional[float] = None
+
+    @classmethod
+    def from_collision(cls, beat_GHz: float, kind: str, **kw: Any) -> "DragChannel":
+        """Channel for a collision labelled by ``sweep_common._nearest_collision``.
+
+        Sets BOTH `n_pump` and `n_photon` from the collision's pump-quanta count, and
+        turns the quotient rule on -- i.e. the paper's scheme applied verbatim. This
+        is the auto-fill path; construct :class:`DragChannel` directly for full control.
+        """
+        from snail_solver.sweep_common import _PUMP_QUANTA
+        k = int(_PUMP_QUANTA.get(str(kind), 1))
+        kw.setdefault("quotient_rule", True)
+        return cls(float(beat_GHz), n_pump=k, n_photon=max(k, 1), **kw)
 
 
 # ===========================================================================
@@ -552,6 +934,90 @@ class PumpTone:
     delta_drag_GHz: Optional[float] = None
     chirp: Optional[Chirp] = None
     drag_n_pump: int = 1
+    drag_channels: Optional[Sequence[DragChannel]] = None
+
+    # -- which processes DRAG is suppressing --------------------------------
+    def drag_channels_resolved(self) -> tuple:
+        """The active :class:`DragChannel` list, innermost-first; ``()`` when DRAG is off.
+
+        Resolution order: an explicit `drag_channels` list wins; otherwise the legacy
+        scalar ``drag``/``delta_drag_GHz``/``drag_n_pump`` fields are read as the
+        one-channel shorthand; otherwise DRAG is off.
+
+        Returning an EMPTY tuple for an inert tone (rather than a one-element list
+        with a zero beat) is deliberate, and mirrors :func:`make_chirp` returning None
+        for an absent chirp: it lets the solver skip the correction entirely, which is
+        what keeps the DRAG-off path byte-identical to before this feature existed.
+        """
+        from snail_solver.drag import order_channels
+        if self.drag_channels:
+            chs = tuple(self.drag_channels)
+        elif self.drag and self.delta_drag_GHz not in (None, 0.0):
+            chs = (DragChannel(float(self.delta_drag_GHz), n_pump=int(self.drag_n_pump)),)
+        else:
+            return ()
+        return order_channels(chs)
+
+    @property
+    def is_legacy_drag(self) -> bool:
+        """True when the active DRAG is exactly the historical first-order form.
+
+        One perturbative channel, single-photon, no quotient rule -- the case the
+        solver evaluates through its closed-form fast path rather than through jet
+        arithmetic, so that every pre-existing result stays bit-identical.
+        """
+        chs = self.drag_channels_resolved()
+        return (len(chs) == 1 and chs[0].n_photon == 1
+                and chs[0].mode == "perturbative" and not chs[0].quotient_rule)
+
+    def channel_detuning(self, ch: DragChannel, t: Any, xp: Any = np) -> Any:
+        """Instantaneous beat ``Delta_j(t)`` of one channel, in rad/ns."""
+        detuning = float(ch.beat_GHz) * TWO_PI
+        if self.chirp is None or not ch.n_pump:
+            return detuning + 0.0 * xp.asarray(t)
+        return detuning - int(ch.n_pump) * self.chirp.detuning(t, xp)
+
+    def channel_detuning_jet(self, ch: DragChannel, t: Any, order: int,
+                             xp: Any = np) -> tuple:
+        """``Delta_j`` and its derivatives to `order`, in rad/ns.
+
+        ``Delta_j(t) = 2 pi beat - n_pump delta(t)``, so every derivative comes from
+        the chirp alone: ``Delta_j^(m) = -n_pump delta^(m)`` for m >= 1.
+        """
+        value = self.channel_detuning(ch, t, xp)
+        order = int(order)
+        if self.chirp is None or not ch.n_pump:
+            return (value,) + tuple(0.0 * xp.asarray(t) for _ in range(order))
+        dj = self.chirp.detuning_jet(t, order, xp)
+        return (value,) + tuple(-int(ch.n_pump) * dj[m] for m in range(1, order + 1))
+
+    def channel_detuning_jets(self, channels: Sequence[DragChannel], t: Any,
+                              order: int, xp: Any = np) -> list:
+        """``Delta_j`` jets for every channel, sharing ONE chirp evaluation.
+
+        Every channel divides the same ``delta(t)`` by a different ``n_pump``, so
+        calling :meth:`channel_detuning_jet` per channel rebuilds the whole Legendre
+        recurrence once per channel. That is the dominant cost of the scalar solver
+        callback (the recurrence ran 10x more often than necessary in a 3-channel
+        profile), and it is pure duplication.
+        """
+        order = int(order)
+        chs = tuple(channels)
+        zero = 0.0 * xp.asarray(t)
+        if self.chirp is None:
+            return [(float(c.beat_GHz) * TWO_PI + zero,)
+                    + tuple(zero for _ in range(order)) for c in chs]
+        dj = self.chirp.detuning_jet(t, order, xp)          # once, not once per channel
+        out = []
+        for c in chs:
+            k = int(c.n_pump)
+            if not k:                                        # static, pump-independent
+                out.append((float(c.beat_GHz) * TWO_PI + zero,)
+                           + tuple(zero for _ in range(order)))
+            else:
+                out.append((float(c.beat_GHz) * TWO_PI - k * dj[0],)
+                           + tuple(-k * dj[m] for m in range(1, order + 1)))
+        return out
 
     # -- the time-dependent DRAG beat ---------------------------------------
     def drag_detuning(self, t: Any, xp: Any = np) -> Any:
@@ -574,9 +1040,21 @@ class PumpTone:
         rather than ``abs(delta_drag_GHz)``.
 
         Returns ``inf`` when DRAG is off (nothing to guard).
+
+        With several channels this is the min over ALL of them -- one collapsing beat
+        is enough to break the pulse. :meth:`drag_detuning_floors` gives the
+        per-channel breakdown, which is what an error message needs in order to name
+        the offender.
         """
-        if not self.drag or self.delta_drag_GHz in (None, 0.0):
-            return float("inf")
+        floors = self.drag_detuning_floors(n)
+        return min(floors) if floors else float("inf")
+
+    def drag_detuning_floors(self, n: int = 257) -> list:
+        """``min_t |Delta_j(t)|`` per resolved channel, in rad/ns; ``[]`` when off."""
+        chs = self.drag_channels_resolved()
+        if not chs:
+            return []
         t_g = float(getattr(self.envelope, "t_g", 0.0)) or 1.0
         ts = np.linspace(0.0, t_g, int(n))
-        return float(np.min(np.abs(np.asarray(self.drag_detuning(ts, np)))))
+        return [float(np.min(np.abs(np.asarray(self.channel_detuning(ch, ts, np)))))
+                for ch in chs]

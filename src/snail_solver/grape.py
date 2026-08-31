@@ -130,6 +130,22 @@ def _tone_n_pump(cpl) -> int:
     return int(getattr(tones[0], "drag_n_pump", 1)) if tones else 1
 
 
+def _tone_drag_channels(cpl) -> tuple:
+    """Recursive-DRAG channels on this coupler's tone, or ``()``.
+
+    Third companion to `_tone_chirp`/`_tone_n_pump`, for the same reason: the
+    baseline must be built from the pulse the solver actually plays.
+
+    Returns ``()`` for the historical single-channel first-order case, so
+    `_raised_cosine_eta` keeps taking its original code path and the baseline number
+    is unchanged for every existing point.
+    """
+    tones = getattr(cpl, "_pump_tones", None)
+    if not tones or getattr(tones[0], "is_legacy_drag", False):
+        return ()
+    return tuple(tones[0].drag_channels_resolved())
+
+
 def _H(t: float, eta: complex,
 
  terms, H_anh: np.ndarray,
@@ -219,7 +235,7 @@ def _score(U: np.ndarray, cpl) -> Tuple[float, float]:
 
 def _raised_cosine_eta(t_g: float, peak: float, n_ctrl: int,
                        drag_beat_GHz: Optional[float], chirp=None,
-                       drag_n_pump: int = 1) -> np.ndarray:
+                       drag_n_pump: int = 1, channels=None) -> np.ndarray:
     """DRAG-shaped raised-cosine envelope sampled at control-slice midpoints.
 
     This builds the BASELINE pulse -- the gate every reported ``dF_grape`` is measured
@@ -228,10 +244,28 @@ def _raised_cosine_eta(t_g: float, peak: float, n_ctrl: int,
     (see ``envelope.PumpTone.drag_detuning``); dividing by the static beat here would
     quietly score the optimizer against a baseline the coupler would never produce.
 
+    The same reasoning extends to RECURSIVE DRAG: when the tone carries several
+    channels (`channels`, read off the coupler by :func:`_tone_drag_channels`), the
+    baseline must be the composed pulse, not a single-derivative stand-in -- otherwise
+    the optimizer is credited for improving on a gate the device never runs. When
+    `channels` is None the historical first-order arithmetic below runs unchanged.
+
     The returned samples carry the AMPLITUDE only -- no chirp phase. `_propagate`
-    applies that on its fine grid, so pass the same `chirp` to both.
+    applies that on its fine grid, so pass the same `chirp` to both. Midpoints are
+    strictly interior, so the envelope never vanishes at a sampled time.
     """
     ts = (np.arange(n_ctrl) + 0.5) * (t_g / n_ctrl)
+    if channels:
+        from snail_solver import drag as _drag
+        from snail_solver.envelope import PumpTone, RaisedCosine
+        env = RaisedCosine(peak, t_g)
+        tone = PumpTone(w_p_GHz=0.0, envelope=env, chirp=chirp,
+                        drag_channels=list(channels))
+        order = _drag.required_order(channels)
+        return np.asarray(_drag.apply_drag(
+            env.jet_at(ts, order, np),
+            [tone.channel_detuning_jet(c, ts, order, np) for c in channels],
+            channels, np), dtype=complex)
     rc = 0.5 * (1.0 - np.cos(2.0 * np.pi * ts / t_g))
     eta = peak * rc.astype(complex)
     if drag_beat_GHz:                       # add the first-order DRAG quadrature
@@ -425,7 +459,7 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     ts = (np.arange(n_time) + 0.5) * (t_g / n_time)
     eta_opt = np.array([eta_np(t, p_star) for t in ts], dtype=complex)
     eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz, chirp,
-                              _tone_n_pump(cpl))
+                              _tone_n_pump(cpl), _tone_drag_channels(cpl))
     Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub,
                                  chirp=chirp), cpl)
     F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub,
@@ -728,7 +762,7 @@ def _optimize_jax(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     eta_np = _iq_ansatz(t_g, peak, n_basis, xp=np)
     eta_opt = np.array([eta_np(t, p_star) for t in ts], dtype=complex)
     eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz, chirp,
-                              _tone_n_pump(cpl))
+                              _tone_n_pump(cpl), _tone_drag_channels(cpl))
     # the optimized chirp supersedes the device one; the BASELINE keeps the device
     # chirp, since that is the gate the improvement is measured against
     chirp_star = chirp_opt if n_chirp else chirp
@@ -857,6 +891,7 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
     rng = np.random.default_rng(seed)
     tone = cpl._pump_tones[0]
     env_saved, drag_saved, chirp_saved = tone.envelope, tone.drag, tone.chirp
+    channels_saved = getattr(tone, "drag_channels", None)
     amp = float(env_saved.amp)
     n_chirp = max(int(chirp_degree), 0)          # free coefficients: c_1 .. c_D
     chirp_bound_GHz = float(chirp_bound_GHz)
@@ -904,6 +939,11 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
         freqs = _crab_frequencies(n_basis, t_g, rng)
         env = IQFourierEnvelope(amp, t_g, freqs=freqs)
         tone.envelope, tone.drag = env, False   # ansatz carries its own quadrature
+        # Clearing `drag` alone is NOT enough once recursive DRAG exists: an explicit
+        # channel list WINS over the legacy flags in `drag_channels_resolved`, so the
+        # recursion would keep firing on top of the CRAB ansatz -- double-counting the
+        # correction the ansatz is meant to discover for itself.
+        tone.drag_channels = None
         # The optimizer's own chirp object, mutated in place by `_apply`. Installing it
         # on the tone is what makes both scoring backends see it.
         opt_chirp = Chirp(np.zeros(n_chirp + 1), t_g) if n_chirp else None
@@ -1046,6 +1086,7 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
     finally:
         # never leave the caller's coupler holding the optimizer's pulse OR its chirp
         tone.envelope, tone.drag, tone.chirp = env_saved, drag_saved, chirp_saved
+        tone.drag_channels = channels_saved
 
 
 def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
@@ -1170,7 +1211,7 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
 
     peak = float(cpl.peak_eta())
     eta0 = _raised_cosine_eta(t_g, peak, n_ctrl, drag_beat_GHz, chirp,
-                            _tone_n_pump(cpl))
+                            _tone_n_pump(cpl), _tone_drag_channels(cpl))
     U0 = _propagate(eta0, t_g, terms, H_anh, idx, n_sub, chirp=chirp)
     F0, leak0 = _score(U0, cpl)
 

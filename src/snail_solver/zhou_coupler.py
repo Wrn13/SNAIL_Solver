@@ -98,9 +98,11 @@ import numpy as np
 # Envelopes, chirps and the pump-tone container live in envelope.py (the single
 # source of truth) and are re-exported below, so the established
 # `from zhou_coupler import RaisedCosine, PumpTone, ...` call sites keep working.
+from snail_solver import drag
 from snail_solver.envelope import (  # noqa: F401
     Chirp,
     ConstantPulse,
+    DragChannel,
     Envelope,
     IQFourierEnvelope,
     PumpTone,
@@ -599,14 +601,34 @@ class ZhouCoupler:
         mis-weights the quadrature by O(k delta / Delta_0), which is a ~10%
         correction for a 100-300 MHz beat but order-unity near a collision, i.e.
         exactly where DRAG is doing the most work. See `PumpTone.drag_detuning`.
+
+        With SEVERAL channels the tone applies recursive multi-derivative DRAG --
+        one substitution per suppressed process, composed innermost-first (see
+        :mod:`snail_solver.drag`). Everything above still holds term by term: the
+        chirp phase is still applied last and never differentiated, and each
+        channel's denominator still moves with the chirp at its own ``n_pump``.
+
+        The single-channel first-order case keeps its own closed-form branch below.
+        That is not an optimization -- jet arithmetic reaches the same value by a
+        different sequence of floating-point operations, so routing the legacy case
+        through it would perturb every previously recorded result in the last ulp.
+        The two are asserted equal to 1e-13 in the tests, which turns the general
+        path's correctness into a checked claim rather than an assumption.
         """
         omega_p = tone.w_p_GHz * TWO_PI
         omega_s = self.omega[self.coupler_index]
         prefactor = 1.0 if tone.is_eta else (2 * omega_p / (omega_p ** 2 - omega_s ** 2))
         amplitude = tone.envelope.value_at(t, xp)
-        if tone.drag and tone.delta_drag_GHz not in (None, 0.0):
+        channels = tone.drag_channels_resolved()
+        if tone.is_legacy_drag:
             detuning = tone.drag_detuning(t, xp)               # rad/ns, time-dependent
             amplitude = amplitude - 1j * tone.envelope.deriv_at(t, xp) / detuning
+        elif channels:
+            order = drag.required_order(channels)
+            amplitude = drag.apply_drag(
+                tone.envelope.jet_at(t, order, xp),
+                tone.channel_detuning_jets(channels, t, order, xp),
+                channels, xp)
         if tone.chirp is not None:
             # A chirped carrier w_p + delta(t) is exactly the fixed carrier w_p
             # times e^{-i Phi(t)} on the amplitude; the sign matches the
