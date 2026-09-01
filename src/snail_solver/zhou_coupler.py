@@ -1040,6 +1040,29 @@ class ZhouCoupler:
         dims = [self.dims, self.dims]
         pump_tones = list(self._pump_tones)
 
+        # One eta evaluation per (tone, t), shared across every Hamiltonian term.
+        #
+        # Each term gets its own coefficient closure, but the solver evaluates ALL of
+        # them at the same t before stepping, and each one was recomputing eta from
+        # scratch -- 12 identical evaluations per timestep on a bare 3-mode pair.
+        # That was invisible while eta was a couple of trig calls; recursive DRAG
+        # makes it the dominant cost of the whole solve.
+        #
+        # One slot per tone (not a growing dict): consecutive calls share a t, so a
+        # single slot captures all of it in O(1) memory, and a solver that interleaves
+        # times simply misses instead of going stale. The cache lives exactly as long
+        # as this QobjEvo -- every solve path rebuilds it -- so a tone mutated in
+        # place between solves (as `grape` does) cannot be served a stale value.
+        eta_cache: Dict[int, Tuple[float, complex]] = {}
+
+        def eta_of(tone_index: int, t: float) -> complex:
+            hit = eta_cache.get(tone_index)
+            if hit is not None and hit[0] == t:
+                return hit[1]
+            value = self._eta(pump_tones[tone_index], t)
+            eta_cache[tone_index] = (t, value)
+            return value
+
         def make_coeff(omega: float, pump_signature: Tuple[Tuple[int, bool], ...]
                        ) -> Callable[[float], complex]:
             if _SOLVER_BACKEND["gpu"]:
@@ -1063,7 +1086,7 @@ class ZhouCoupler:
             def coeff(t: float, **kwargs: Any) -> complex:
                 value = cmath.exp(-1j * omega * t)
                 for tone_index, is_conjugate in pump_signature:
-                    eta = self._eta(pump_tones[tone_index], t)
+                    eta = eta_of(tone_index, t)
                     value *= eta.conjugate() if is_conjugate else eta
                 return value
             return coeff

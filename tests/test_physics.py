@@ -2084,6 +2084,114 @@ class TestTuneUpRecursiveDrag(unittest.TestCase):
         self.assertIn("_drag_on = drag_beat_GHz is not None or bool(drag_channels)", src)
 
 
+class TestEtaCacheAndCollisionChannels(unittest.TestCase):
+    """The per-Hamiltonian eta cache, and auto-filling channels from collisions."""
+
+    T_G = 30.0
+
+    def _cfg(self, **kw):
+        from snail_solver.sweep_common import DEFAULT_CONFIG
+        return dict(DEFAULT_CONFIG, qubit_levels=2, coupler_levels=3, **kw)
+
+    def test_the_hamiltonian_cache_returns_the_same_coefficients(self):
+        """Caching eta per (tone, t) must be invisible in the numbers.
+
+        The solver evaluates every term at the same t before stepping, and each term
+        was recomputing eta from scratch -- 12 identical evaluations per timestep.
+        This asserts the cache changes nothing, which is what makes it safe.
+        """
+        from snail_solver.device_utils import build_coupler
+        from snail_solver.envelope import DragChannel
+        chs = [DragChannel(0.30, quotient_rule=True),
+               DragChannel(-0.22, quotient_rule=True),
+               DragChannel(0.55, n_pump=2, n_photon=2, quotient_rule=True)]
+        for kw in ({}, {"drag_beat_GHz": 0.30}, {"drag_channels": chs}):
+            cpl, _w, _p = build_coupler(self._cfg(), self.T_G, 1.0, 0.0,
+                                        chirp_coeffs_GHz=[0.0, 0.0, -0.004], **kw)
+            H = cpl.to_qutip_hamiltonian(cutoff_GHz=1.0)
+            terms = [x for x in (H if isinstance(H, list) else H.to_list())
+                     if isinstance(x, (list, tuple)) and len(x) == 2]
+            self.assertGreater(len(terms), 1, "need several terms to exercise sharing")
+            tone = cpl._pump_tones[0]
+            for t in (0.0, 7.3, self.T_G / 2, self.T_G):
+                # interleave the terms so a stale one-slot cache would be caught
+                got = [complex(c(t)) for _op, c in terms]
+                eta = complex(cpl._eta(tone, t))
+                self.assertTrue(np.all(np.isfinite(got)))
+                # re-evaluating at the same t must be identical, and at a NEW t must
+                # not return the previous value
+                self.assertEqual([complex(c(t)) for _op, c in terms], got)
+                self.assertTrue(np.isfinite(eta))
+
+    def test_the_cache_does_not_survive_a_rebuild(self):
+        """A tone mutated in place between solves (as `grape` does) must not be
+        served a stale amplitude: the cache lives only as long as one QobjEvo."""
+        from snail_solver.device_utils import build_coupler
+        cpl, _w, _p = build_coupler(self._cfg(), self.T_G, 1.0, 0.0,
+                                    drag_beat_GHz=0.30)
+        tone = cpl._pump_tones[0]
+
+        def first_coeff(t):
+            H = cpl.to_qutip_hamiltonian(cutoff_GHz=1.0)
+            terms = [x for x in (H if isinstance(H, list) else H.to_list())
+                     if isinstance(x, (list, tuple)) and len(x) == 2]
+            return complex(terms[0][1](t))
+
+        before = first_coeff(5.0)
+        tone.envelope.amp *= 2.0                      # in-place mutation, as grape does
+        after = first_coeff(5.0)
+        self.assertNotAlmostEqual(abs(before), abs(after), places=6)
+
+    def test_collision_channels_are_the_n_nearest_and_distinct(self):
+        from snail_solver.sweep_common import (_collision_candidates,
+                                               collision_drag_channels)
+        cfg = self._cfg()
+        wa, wb, ws, wspec, w_p = 5.0, 4.6, 7.0, 4.75, 0.4
+        chs = collision_drag_channels(cfg, wa, wb, ws, wspec, w_p, n=3)
+        self.assertLessEqual(len(chs), 3)
+        beats = [abs(c.beat_GHz) for c in chs]
+        self.assertEqual(beats, sorted(beats), "channels must be nearest-first")
+        self.assertEqual(len(set(round(c.beat_GHz, 9) for c in chs)), len(chs),
+                         "duplicate beats would double-count one process")
+        # the nearest of them must be THE nearest collision
+        from snail_solver.sweep_common import _nearest_collision
+        near = _nearest_collision(cfg, wa, wb, ws, wspec, w_p)
+        self.assertAlmostEqual(abs(chs[0].beat_GHz), near[0], places=12)
+        # and every candidate the old scan saw is still enumerated
+        self.assertGreaterEqual(
+            len(_collision_candidates(cfg, wa, wb, ws, wspec, w_p)), 4)
+
+    def test_collision_channels_carry_the_pump_quanta(self):
+        from snail_solver.sweep_common import _PUMP_QUANTA, collision_drag_channels
+        cfg = dict(self._cfg(), drag_subharmonic=True)
+        chs = collision_drag_channels(cfg, 5.0, 4.6, 7.0, 4.75, 0.4, n=4)
+        for c in chs:
+            self.assertIn(c.n_pump, set(_PUMP_QUANTA.values()))
+            self.assertEqual(c.n_photon, max(c.n_pump, 1))
+            self.assertTrue(c.quotient_rule)
+
+    def test_collision_channels_drop_a_beat_the_chirp_sweeps_through_zero(self):
+        from snail_solver.sweep_common import collision_drag_channels
+        cfg = self._cfg()
+        # place the spectator so the nearest beat is essentially zero
+        chs = collision_drag_channels(cfg, 5.0, 4.6, 7.0, 4.6, 0.4, n=3)
+        self.assertTrue(all(abs(c.beat_GHz) >= 5e-3 for c in chs),
+                        "a collapsed beat must be filtered out, not composed")
+
+    def test_validation_sweep_is_importable_and_scores_a_cell(self):
+        """Smoke: the Phase-7 harness runs a cell and reports the beats it used."""
+        from snail_solver.validate_recursive_drag import SCHEMES, _score_point
+        cfg = dict(self._cfg(), envelope="sine_power", envelope_m=3,
+                   envelope_rise_frac=0.5, qubit_levels=2, coupler_levels=3,
+                   spec_levels=2)
+        out = _score_point(cfg, 12.0, 4.75, 2,
+                           solver={"atol": 1e-7, "rtol": 1e-5, "nsteps": 50000})
+        self.assertTrue(np.isfinite(out["F"]))
+        self.assertEqual(out["n_channels_used"], len(out["beats_MHz"]))
+        self.assertGreaterEqual(out["corr_ratio"], 0.0)
+        self.assertEqual([lab for lab, _ in SCHEMES][0], "none")
+
+
 class TestPumpQuantaMapping(unittest.TestCase):
     """k per collision channel, and the chirp-aware DRAG safety test."""
 

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_physics.py -q -k \"PumpQuanta or Collision or Sweep\")",
+      "Bash(timeout 570 python -u -m snail_solver.validate_recursive_drag --t-g 30 --points 5 --span-GHz 0.4)",
+      "Bash(timeout 500 python -u -m snail_solver.validate_recursive_drag --target-eta 1.0 --points 3 --span-GHz 0.3 --atol 1e-8 --rtol 1e-6)",
+      "Bash(python -m snail_solver.validate_recursive_drag --help)",
+      "Bash(nohup python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 5 --span-GHz 0.5 --atol 1e-8 --rtol 1e-6 --out C:/Users/Warren/AppData/Local/Temp/claude/c--Users-Warren-Desktop-SNAIL-Solver/19f78cba-a5fe-444b-9568-41a3320e4936/scratchpad/recdrag.json)",
+      "Bash(echo \"launched pid $!\")",
+      "Bash(timeout 500 python -m pytest tests/test_physics.py -q -k \"EtaCacheAndCollision\")",
+      "Bash(timeout 400 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)",
+      "Bash(timeout 500 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)",
+      "Bash(timeout 520 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)"
+    ]
+  }
+}

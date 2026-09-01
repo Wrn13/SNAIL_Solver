@@ -383,16 +383,30 @@ def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
         ``(|beat|, signed beat, kind, target_label, target_idx)`` for the nearest
         channel; ``kind`` in {"onepump", "static", "subharm"}.
     """
+    cands = _collision_candidates(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, w_p_GHz)
+    # strict `<` when scanning, so ties keep the FIRST candidate; a stable sort on
+    # |beat| over the same candidate order reproduces that exactly.
+    return min(cands, key=lambda c: c[0]) if cands else (0.0, 0.0, "none", "-", -1)
+
+
+def _collision_candidates(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
+                          ws_GHz: float, wspec_GHz: float, w_p_GHz: float) -> list:
+    """Every spectator/mode collision channel, in the canonical scan order.
+
+    Factored out of :func:`_nearest_collision` (which is now `min` over this) so that
+    RECURSIVE DRAG can suppress the N nearest processes rather than only the single
+    nearest -- see :func:`collision_drag_channels`. The candidate set, its ordering
+    and its beat conventions are unchanged.
+    """
     a, b, coupler, spec = 0, 1, 2, 3
-    nearest = None
+    out = []
     no_spec = bool(config.get("no_spectator", False))
     if not no_spec:
         for q_idx, q_freq, q_label in ((a, wa_GHz, "a"), (b, wb_GHz, "b")):
             sep = abs(q_freq - wspec_GHz)
             for kind, harm in (("onepump", w_p_GHz), ("static", 0.0)):
                 beat = sep - harm
-                if nearest is None or abs(beat) < nearest[0]:
-                    nearest = (abs(beat), float(beat), kind, q_label, q_idx)
+                out.append((abs(beat), float(beat), kind, q_label, q_idx))
     if no_spec or bool(config.get("drag_subharmonic", False)):
         # no_spectator: the only channels are the subharmonics; default to the SNAIL one.
         sub_modes = config.get("subharmonic_modes") or (["s"] if no_spec
@@ -404,11 +418,44 @@ def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
             if lab == "spec" and no_spec:               # no spectator mode present
                 continue
             beat = wi - 2.0 * w_p_GHz                    # detuning of the 2-pump drive: w_i - 2 w_p
-            if nearest is None or abs(beat) < nearest[0]:
-                nearest = (abs(beat), float(beat), "subharm", lab, idx)
-    if nearest is None:
-        nearest = (0.0, 0.0, "none", "-", -1)
-    return nearest
+            out.append((abs(beat), float(beat), "subharm", lab, idx))
+    return out
+
+
+def collision_drag_channels(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
+                            ws_GHz: float, wspec_GHz: float, w_p_GHz: float, *,
+                            n: int = 3, chirp_coeffs_GHz=None, t_g: float = 1.0,
+                            quotient_rule: bool = True) -> tuple:
+    """The `n` nearest collisions as :class:`envelope.DragChannel` objects.
+
+    This is the auto-fill path for recursive DRAG: one derivative correction per
+    nearby process, which is exactly the situation Li/Calarco/Motzoi show a single
+    correction cannot handle (it can only trade one process's error against
+    another's).
+
+    Channels whose beat is too small -- or which a chirp would sweep through zero
+    mid-pulse -- are dropped rather than disabling DRAG wholesale, since the
+    composition is still well defined on the survivors
+    (:func:`_drag_channels_filtered`).
+
+    Distinct beats only: several candidate channels can coincide (e.g. the same
+    separation reached by two labels), and composing the same substitution twice
+    would double-count the correction rather than suppress a second process.
+    """
+    from snail_solver.envelope import DragChannel
+    cands = sorted(_collision_candidates(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz,
+                                         w_p_GHz), key=lambda c: c[0])
+    chans, seen = [], set()
+    for _absb, beat, kind, _lab, _idx in cands:
+        key = round(float(beat), 9)
+        if key in seen:
+            continue
+        seen.add(key)
+        chans.append(DragChannel.from_collision(float(beat), kind,
+                                                quotient_rule=quotient_rule))
+        if len(chans) >= int(n):
+            break
+    return _drag_channels_filtered(config, chans, chirp_coeffs_GHz, t_g)
 
 def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
                    config: Dict[str, Any], drag_beat_GHz: Optional[float] = None,
