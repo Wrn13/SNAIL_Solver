@@ -10,7 +10,14 @@
       "Bash(timeout 500 python -m pytest tests/test_physics.py -q -k \"EtaCacheAndCollision\")",
       "Bash(timeout 400 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)",
       "Bash(timeout 500 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)",
-      "Bash(timeout 520 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)"
+      "Bash(timeout 520 python -u -m snail_solver.validate_recursive_drag --device devices/evan_device.json --points 2 --span-GHz 0.3 --atol 1e-7 --rtol 1e-5)",
+      "Bash(cd \"c:/Users/Warren/Desktop/SNAIL_Solver\" && sed -n '/aq = float\\(config.get\\(\"anharm_qubit_GHz\"/,/cpl = ZhouCoupler/p' src/snail_solver/device_utils.py)",
+      "Bash(cd \"C:/Users/Warren/.claude/projects/c--Users-Warren-Desktop-SNAIL-Solver/memory\" && ls -1 2>/dev/null && echo \"--- MEMORY.md ---\" && cat MEMORY.md 2>/dev/null)",
+      "Read(//c/Users/Warren/.claude/projects/c--Users-Warren-Desktop-SNAIL-Solver/memory/**)",
+      "Bash(python -c ' *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\Warren\\Desktop\\SNAIL_Solver\\src\\snail_solver"
     ]
   }
 }
