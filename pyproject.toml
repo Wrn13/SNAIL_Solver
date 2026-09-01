@@ -19,7 +19,7 @@ dependencies = [
     "lovelyplots",
     "joblib>=1.5.3",
     "jax>=0.4.30",
-    "qutip-qoc>=0.2.0",
+    "qutip-qoc",
     "qutip-jax>=0.0.1",
     "scipy",
     "diffrax>=0.6",
@@ -79,3 +79,13 @@ profile = "black"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+# Built from the tag rather than taken from PyPI because qutip-qoc 0.2.0 ships no
+# manylinux aarch64 wheel (only macos arm64, linux x86_64/i686, musl and win), and
+# this project runs on aarch64 Grace-Hopper nodes. The package has a Cython
+# extension (qutip_qoc.pulse), so with no matching wheel `uv` has nothing to
+# install; pointing at the git tag forces a source build, which compiles cleanly
+# on aarch64. Same code as the release -- v0.2.0 is the tag the wheels were cut
+# from -- so this changes nothing for x86_64 users beyond building from source.
+qutip-qoc = { git = "https://github.com/qutip/qutip-qoc.git", rev = "v0.2.0" }
