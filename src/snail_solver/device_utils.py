@@ -337,7 +337,7 @@ def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
                          spec_abs_GHz: Optional[float] = None,
                          drag_beat_GHz: Optional[float] = None,
                          chirp_coeffs_GHz: Optional[Sequence[float]] = None,
-                         drag_n_pump: int = 1) -> float:
+                         drag_n_pump: int = 1, drag_channels=None) -> float:
     """Single-shot swap probability P(|01> -> |10>) at t_g (QuTiP sesolve): a fast
     one-trajectory proxy for the rotation angle, used as a search objective.
 
@@ -363,6 +363,16 @@ def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
         `build_coupler`; pass it explicitly to probe a chirp the config does not
         carry. Without this the search objective would disagree with the gate it is
         calibrating.
+    drag_n_pump : int, default 1
+        Pump quanta carried by the process DRAG suppresses; sets how the beat moves
+        under a chirp. See `build_coupler`.
+    drag_channels : sequence of DragChannel, optional
+        Several processes to suppress at once, via recursive multi-derivative DRAG.
+        OVERRIDES `drag_beat_GHz`/`drag_n_pump`, which remain the one-channel
+        shorthand. Forwarded verbatim to `build_coupler`, so a search objective and
+        the gate it calibrates see the SAME pulse -- the whole point of this
+        function. Omitting it was a real bug: `tune_up.length_rabi` passes it, so
+        the length fit raised TypeError on every tune-up.
 
     Returns
     -------
@@ -372,7 +382,8 @@ def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
     cpl, _w_p, _eta = build_coupler(config, t_g, amp_scale, wp_offset_GHz,
                                     spec_abs_GHz, drag_beat_GHz,
                                     chirp_coeffs_GHz=chirp_coeffs_GHz,
-                                    drag_n_pump=drag_n_pump)
+                                    drag_n_pump=drag_n_pump,
+                                    drag_channels=drag_channels)
     tail = [0] if spec_abs_GHz is not None else []       # spectator stays in |0>
     state = cpl.evolve_state([1, 0, 0] + tail, t_g, **solver)
     return float(np.abs(state[cpl.fock_index([0, 1, 0] + tail)]) ** 2)

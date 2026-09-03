@@ -189,6 +189,83 @@ def fixed_span_MHz(config: Dict[str, Any], target_eta: float, eta_hi: float = 1.
     return 2.0 * float(span_linewidths) * linewidth_MHz
 
 
+def ridge_span_MHz(config: Dict[str, Any], target_eta: float, *, eta_lo: float = 0.3,
+                   eta_hi: float = 1.0, span_linewidths: float = 4.0,
+                   wp_points: int = 25, pts_per_hwhm: float = 3.0,
+                   logger=None) -> tuple:
+    """The fixed ``wp_span_MHz`` :func:`plot_chirp_ridge` needs, AND the ``wp_points``
+    that span demands -- returned together because using one without the other is a
+    trap.
+
+    :func:`fixed_span_MHz` alone is not enough. Going from per-row adaptive spans to
+    one fixed span does not just oversample the weak rows, it UNDERSAMPLES them
+    relative to their own linewidth, because the span is sized for the strongest row
+    and the HWHM shrinks with the drive:
+
+        pts per HWHM (adaptive, any row) = (wp_points - 1) / (2 span_linewidths)
+        pts per HWHM (fixed, weakest row) = that x (eta_lo / eta_hi)
+
+    At the defaults (wp_points=25, span_linewidths=4) the adaptive scheme gives every
+    row 3.0 points per HWHM; the fixed span gives the weakest row 3.0 eta_lo/eta_hi
+    -- only 0.9 at eta_lo=0.3. A Lorentzian fitted to ~1 point on the feature is not
+    a fit: :func:`fit_chevron_center` returns junk, :func:`chevron_quality` drops the
+    row as ``poor_fit``, and if enough rows survive to be fitted anyway the ridge
+    fails the r2 floor in :func:`rabi_shift_table`. That trades a loud ValueError
+    from the plotter for a confidently WRONG chirp, which is strictly worse.
+
+    So the compensating point count is
+
+        wp_points >= 1 + 2 span_linewidths pts_per_hwhm (eta_hi / eta_lo)
+
+    = 61 at eta_lo=0.4 and 81 at eta_lo=0.3, versus 25 for the adaptive default. That
+    is affordable: :func:`find_stark_resonance.scan` fans out over pump offsets, so
+    on a many-core box extra ``wp_points`` cost no wall-clock at all, while
+    ``amp_points`` (the rows) are serial and do.
+
+    What "HWHM" means here, and why this is deliberately conservative
+    ----------------------------------------------------------------
+    ``pts_per_hwhm`` is counted against the MODEL linewidth :func:`fixed_span_MHz`
+    uses -- ``1e3 / (2 nominal_t_g(|eta|))`` -- not against the Lorentzian HWHM
+    :func:`fit_chevron_center` actually fits. The two differ by roughly a constant
+    factor: on 1Gate4.2SNAIL at target_eta=1.2 the weakest row (|eta|=0.48) has a
+    model linewidth of 1.73 MHz against a fitted HWHM of 2.88 MHz, i.e. ~1.6x
+    broader, so its measured sampling was 2.0 points per true HWHM where the
+    warning below reported 1.20.
+
+    That factor cancels out of everything this function decides. It is common to
+    both rows, so the adaptive scheme still lands every row on the SAME sampling
+    whatever the drive, and the fixed span still costs the weakest row exactly
+    ``eta_lo / eta_hi`` of it -- the ratio is what sets ``want``. Only the absolute
+    number is pessimistic, and in the safe direction: the default
+    ``pts_per_hwhm=3.0`` buys about 4.8 points across the true HWHM. Do not "correct"
+    it by lowering the default without re-measuring fitted HWHMs on the device in
+    hand; the 1.6 is an observation, not a derivation.
+
+    Returns
+    -------
+    (float, int)
+        ``(span_MHz, want_points)``. A warning is logged when ``wp_points`` is below
+        ``want_points``; nothing is raised, because the caller may knowingly accept a
+        coarser weak row.
+    """
+    span = fixed_span_MHz(config, target_eta, eta_hi=eta_hi,
+                          span_linewidths=span_linewidths)
+    want = int(np.ceil(1.0 + 2.0 * float(span_linewidths) * float(pts_per_hwhm)
+                       * (float(eta_hi) / float(eta_lo))))
+    if logger is not None and int(wp_points) < want:
+        got = (int(wp_points) - 1) * (float(eta_lo) / float(eta_hi)) \
+            / (2.0 * float(span_linewidths))
+        logger.warning(
+            f"  fixed span {span:.2f} MHz leaves the WEAKEST Rabi row "
+            f"(|eta|={eta_lo * target_eta:.2f}) only {got:.2f} points per MODEL "
+            f"linewidth at wp_points={int(wp_points)}; want >= {want} for "
+            f"{pts_per_hwhm:.1f}. Fitted HWHMs run ~1.6x broader, so this is a "
+            f"conservative floor, not the sampling you will read off the rows. "
+            f"Expect dropped rows or a failed r2. Offsets fan out over the process "
+            f"pool, so raising --wp-points to {want} is close to free.")
+    return float(span), want
+
+
 # ===========================================================================
 # Part 0 -- does the nominal eta still mean sqrt(n_s)?
 # ===========================================================================
@@ -906,7 +983,23 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
             f"half-width) -- raise --span-linewidths. A railed ridge produces a "
             f"confident, wrong chirp.", partial)
 
-    fit = fit_shift_curve(eta, ridge, weights=quality)
+    # Too few surviving rows is a RabiFitError like every other one here: the
+    # measurement ran, only the interpretation failed. Re-raised with the table
+    # attached so main() can still save and DRAW the chevrons -- which is the whole
+    # point, since "which rows were dropped, and why" is the diagnosis. A bare
+    # ValueError escaping here left the one device that hit it un-inspectable.
+    try:
+        fit = fit_shift_curve(eta, ridge, weights=quality)
+    except ValueError as exc:
+        dropped = [f"|eta|={c['eta']:.3f} {c['dropped']}"
+                   for c in partial["chevrons"] if c.get("dropped")]
+        raise RabiFitError(
+            f"{exc}. Dropped rows: {', '.join(dropped) if dropped else 'none'}. "
+            f"Inspect the chevrons: 'multi_peak' means a competing resonance sits "
+            f"in the window, 'low_contrast' means the probe never completed a swap "
+            f"there. Widen --wp-span-MHz if the ridge is leaving the window, or "
+            f"lower --eta-hi to stay inside the drive range that still swaps.",
+            partial) from exc
     partial["fit"] = fit
     stability = shift_curve_stability(eta, ridge, weights=quality, target_eta=target_eta,
                                       cutoffs=stability_cutoffs)
@@ -1532,8 +1625,12 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
                 "plot_chirp_ridge does not interpolate, so every row needs the "
                 "SAME offsets -- this table was swept with a per-row adaptive "
                 "span. Rerun rabi_shift_table/run_tune_up with "
-                "wp_span_MHz=fixed_span_MHz(config, target_eta) so every row "
-                "shares one grid, then replot.")
+                "wp_span_MHz, wp_points = ridge_span_MHz(config, target_eta, "
+                "eta_lo=..., eta_hi=...) so every row shares one grid, then "
+                "replot. The CLI does this for you: `--plot-ridge` sizes the span "
+                "automatically unless you pass --wp-span-MHz yourself. Use "
+                "ridge_span_MHz, not fixed_span_MHz -- the fixed span also needs "
+                "MORE wp_points, or the weakest row is undersampled.")
     Z = np.stack([np.asarray(c["metric"], dtype=float) for c in chevrons], axis=0)
 
     ts = np.linspace(0.0, float(t_g), 400)
@@ -2189,7 +2286,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 quartic_warn: float = 0.25,
                 eta_lo: float = 0.3, eta_hi: float = 1.0,
                 amp_points: int = 9, wp_span_MHz: Optional[float] = None,
-                wp_points: int = 25, tg_points: int = 13, max_drag_iters: int = 4,
+                wp_points: int = 25, tg_points: int = 13,
+                tg_lo: float = 0.7, tg_hi: float = 1.3, max_drag_iters: int = 4,
                 window_tg: float = 2.0, n_time: int = 161,
                 span_linewidths: float = 4.0, drag_shift_points: int = 0,
                 contrast_min: float = 0.35,
@@ -2340,10 +2438,20 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                              drag_n_pump=drag_n_pump, drag_channels=drag_channels,
                              spec_abs_GHz=spec_abs_GHz,
                              solver=solver, logger=log,
-                             t_g_grid=t_g0 * np.linspace(0.7, 1.3, int(tg_points)))
+                             t_g_grid=t_g0 * np.linspace(float(tg_lo), float(tg_hi),
+                                                         int(tg_points)))
         t_g = float(length["t_g_ns"])
         if length["railed"]:
-            log.info("  WARNING: the length optimum railed against the scan window")
+            edge = "lower" if t_g <= float(length["t_g_grid"][0]) else "upper"
+            log.warning(
+                f"  the length optimum railed against the {edge} edge of the scan "
+                f"window [{tg_lo:g}, {tg_hi:g}] x t_g0 = [{tg_lo * t_g0:.1f}, "
+                f"{tg_hi * t_g0:.1f}] ns. A maximum on the grid EDGE is not a "
+                f"maximum: the true full swap lies outside it, so this t_g_ns is a "
+                f"bound, not a calibration. t_g0 = 2A/eta* assumes the leading-order "
+                f"rate 6 g3 la lb |eta|; a device whose dressed rate differs needs a "
+                f"wider window -- rerun with --tg-{'lo' if edge == 'lower' else 'hi'} "
+                f"past {tg_lo if edge == 'lower' else tg_hi:g}.")
 
         dc = (float("inf") if prev_chirp is None
               else float(np.max(np.abs(np.array(chirp) - prev_chirp))))
@@ -2445,7 +2553,9 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                  f"t_g/amp_scale/wp_offset -- leakage {1 - length['transfer']:.2e} "
                  f"vs {1 - flat_transfer:.2e}")
     except Exception as exc:                                  # never fatal: it is a check
-        log.info(f"  chirp ablation skipped: {exc}")
+        # Name the TYPE: this except once hid a TypeError from a transfer_probability
+        # signature drift, so the ablation silently reported nothing for every run.
+        log.info(f"  chirp ablation skipped: {type(exc).__name__}: {exc}")
 
     pair = list(np.asarray(config["qubit_freqs_GHz"], dtype=float))
     record = {
@@ -2564,6 +2674,13 @@ def main() -> None:
                          "'DRAG only adds drive' (already in the chirp); anything "
                          "else is a mechanism the quadrature model does not contain")
     ap.add_argument("--tg-points", type=int, default=13)
+    ap.add_argument("--tg-lo", type=float, default=0.7,
+                    help="length-scan window low edge, as a fraction of t_g0 [0.7]")
+    ap.add_argument("--tg-hi", type=float, default=1.3,
+                    help="length-scan window high edge, as a fraction of t_g0. "
+                         "Widen when the scan rails: t_g0 = 2A/eta* assumes the "
+                         "leading-order rate, so a device whose dressed rate differs "
+                         "puts the real full swap outside the default +/-30%% [1.3]")
     ap.add_argument("--max-drag-iters", type=int, default=4)
     ap.add_argument("--skip-time-rabi", action="store_true")
     ap.add_argument("--coupler-levels", type=int, default=None)
@@ -2631,6 +2748,21 @@ def main() -> None:
         if args.coupler_levels is not None:
             config = {**config, "coupler_levels": int(args.coupler_levels)}
 
+        # plot_chirp_ridge does not interpolate, so it needs every chevron row on ONE
+        # offset axis -- which only happens with a fixed span. Size it here rather
+        # than letting the run finish and then refuse to draw: the plot call is the
+        # very last thing main() does, so the alternative is throwing away the whole
+        # sweep over a missing flag. Only when the ridge was actually asked for; an
+        # explicit --wp-span-MHz still wins, and without --plot-ridge the per-row
+        # adaptive spans (better sampling, no shared axis) are left alone.
+        if args.plot_ridge and args.wp_span_MHz is None:
+            args.wp_span_MHz, _want = ridge_span_MHz(
+                config, args.target_eta, eta_lo=args.eta_lo, eta_hi=args.eta_hi,
+                span_linewidths=args.span_linewidths, wp_points=args.wp_points,
+                logger=logger)
+            logger.info(f"  --plot-ridge: fixing wp_span_MHz="
+                        f"{args.wp_span_MHz:.2f} so every row shares one offset axis")
+
         from snail_solver import find_stark_resonance as FSR
         print(f"device={args.device}  target_eta={args.target_eta}  "
               f"jobs={FSR._resolve_jobs(args.jobs)}{' GPU' if args.gpu else ''}")
@@ -2648,7 +2780,8 @@ def main() -> None:
                 eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
                 contrast_min=args.contrast_min,
                 wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
-                tg_points=args.tg_points, max_drag_iters=args.max_drag_iters,
+                tg_points=args.tg_points, tg_lo=args.tg_lo, tg_hi=args.tg_hi,
+                max_drag_iters=args.max_drag_iters,
                 do_time_rabi=not args.skip_time_rabi, jobs=args.jobs,
                 post_chirp_points=args.post_chirp_points,
                 solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},

@@ -2942,5 +2942,756 @@ class TestPlotPostChirpSmoke(unittest.TestCase):
                                   "compare_flat": False}, "unused.png")
 
 
+class TestTransferProbabilityForwardsDragChannels(unittest.TestCase):
+    """`transfer_probability` must accept AND forward `drag_channels`.
+
+    It did not, while `tune_up.length_rabi` passed it unconditionally -- so step 4
+    of every tune-up died with `TypeError: unexpected keyword argument
+    'drag_channels'`, and `run_tune_up` could not complete at all. The same call in
+    `chirp_ablation` sat inside a bare `except Exception`, so that check silently
+    reported nothing instead of failing loudly.
+
+    Nothing in this file touched `transfer_probability` or `length_rabi` before,
+    which is exactly why the bug shipped.
+    """
+
+    def test_signature_accepts_drag_channels(self):
+        import inspect
+        from snail_solver.device_utils import transfer_probability
+        params = inspect.signature(transfer_probability).parameters
+        self.assertIn("drag_channels", params,
+                      "length_rabi passes drag_channels= on every call")
+        self.assertIsNone(params["drag_channels"].default)
+
+    def test_length_rabi_forwards_drag_channels_to_the_probe(self):
+        """The search objective must see the SAME pulse as the gate it calibrates."""
+        from unittest import mock
+        from snail_solver.envelope import DragChannel
+        from snail_solver import tune_up
+
+        config = {"g3_GHz": 0.06, "lam_a": 0.1, "lam_b": 0.1,
+                  "envelope": "raised_cosine"}
+        channels = [DragChannel(beat_GHz=0.3)]
+        # autospec binds the REAL signature to the mock, so this fails with the same
+        # TypeError the live code did if drag_channels ever goes missing again --
+        # a bare Mock would happily swallow any kwarg and pass either way.
+        with mock.patch("snail_solver.device_utils.transfer_probability",
+                        autospec=True, return_value=0.5) as m_tp:
+            tune_up.length_rabi(config, 1.0, [90.0, 100.0, 110.0],
+                                drag_channels=channels, refine=False)
+        self.assertTrue(m_tp.called)
+        self.assertEqual(m_tp.call_args.kwargs["drag_channels"], channels)
+
+
+class TestRidgeSpanMHz(unittest.TestCase):
+    """`ridge_span_MHz` returns the fixed span AND the point count it demands.
+
+    Switching from per-row adaptive spans to one fixed span is what
+    `plot_chirp_ridge` needs (it does not interpolate), but the fixed span is sized
+    for the STRONGEST row, so the weakest row -- whose linewidth is smaller by
+    eta_lo/eta_hi -- gets proportionally fewer points across its own HWHM. Using
+    the span without raising `wp_points` turns a loud ValueError from the plotter
+    into a quietly wrong chirp.
+    """
+
+    CONFIG = {"g3_GHz": 0.06, "lam_a": 0.1, "lam_b": 0.1,
+              "envelope": "raised_cosine"}
+
+    def test_span_matches_fixed_span_MHz(self):
+        from snail_solver.tune_up import fixed_span_MHz, ridge_span_MHz
+        span, _ = ridge_span_MHz(self.CONFIG, 1.8, eta_lo=0.4, eta_hi=1.0)
+        self.assertAlmostEqual(
+            span, fixed_span_MHz(self.CONFIG, 1.8, eta_hi=1.0), places=9)
+
+    def test_span_is_linear_in_target_eta(self):
+        """t_g ~ 1/eta, so the linewidth -- and the span -- scale WITH the drive."""
+        from snail_solver.tune_up import ridge_span_MHz
+        s12, _ = ridge_span_MHz(self.CONFIG, 1.2)
+        s18, _ = ridge_span_MHz(self.CONFIG, 1.8)
+        self.assertAlmostEqual(s18 / s12, 1.5, places=9)
+
+    def test_want_points_is_the_undersampling_floor(self):
+        """want = 1 + 2 span_linewidths pts_per_hwhm (eta_hi/eta_lo)."""
+        from snail_solver.tune_up import ridge_span_MHz
+        for eta_lo, want in ((0.3, 81), (0.4, 61), (0.5, 49)):
+            _, got = ridge_span_MHz(self.CONFIG, 1.8, eta_lo=eta_lo, eta_hi=1.0,
+                                    span_linewidths=4.0)
+            self.assertEqual(got, want, f"eta_lo={eta_lo}")
+
+    def test_warns_only_when_wp_points_is_below_the_floor(self):
+        from unittest import mock
+        from snail_solver.tune_up import ridge_span_MHz
+        log = mock.Mock()
+        ridge_span_MHz(self.CONFIG, 1.8, eta_lo=0.4, wp_points=25, logger=log)
+        log.warning.assert_called_once()
+        log.reset_mock()
+        ridge_span_MHz(self.CONFIG, 1.8, eta_lo=0.4, wp_points=61, logger=log)
+        log.warning.assert_not_called()
+
+
+class TestTuneUpRidgeSpanWiring(unittest.TestCase):
+    """--plot-ridge must size wp_span_MHz itself, because the plot call is the LAST
+    thing main() does: without this the whole sweep is computed and then thrown
+    away over a missing flag. Mirrors TestTuneUpGpuFlag -- run_tune_up is mocked,
+    so no QuTiP.
+    """
+
+    @staticmethod
+    def _run_main(extra_argv):
+        from unittest import mock
+        from snail_solver import tune_up
+
+        fake_out = {
+            "operating_point": {
+                "target_eta": 1.8, "t_g_ns": 77.0, "amp_scale": 1.0,
+                "wp_offset_GHz": 0.0, "chirp_coeffs_GHz": [0.0, 0.0],
+                "drag_beat_GHz": None, "drag_n_pump": 1, "score": 1.0,
+            },
+            # plot_chirp_ridge is mocked, but main() still indexes these
+            "t_g0_ns": 77.0, "drag": None,
+            "stages": {"rabi": {}, "chirp": {}},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            device_path = os.path.join(d, "dev.json")
+            with open(device_path, "w") as fh:
+                json.dump({"g3_GHz": 0.06, "lam_a": 0.1, "lam_b": 0.1}, fh)
+            argv = ["tune_up", "--device", device_path, "--target-eta", "1.8",
+                    *extra_argv]
+            with mock.patch("snail_solver.tune_up.run_tune_up",
+                            return_value=fake_out) as m_run, \
+                 mock.patch("snail_solver.tune_up.plot_chirp_ridge",
+                            return_value="fig.png"), \
+                 mock.patch.object(sys, "argv", argv):
+                tune_up.main()
+        return m_run
+
+    def test_plot_ridge_fixes_the_span(self):
+        m_run = self._run_main(["--plot-ridge", "fig.png"])
+        # fixed_span_MHz = 2 * 4 * 1e3 / (2 * auto_t_g(eta_hi * eta*)) = 28.8 * eta*
+        self.assertAlmostEqual(m_run.call_args.kwargs["wp_span_MHz"],
+                               28.8 * 1.8, places=6)
+
+    def test_without_plot_ridge_the_span_stays_adaptive(self):
+        m_run = self._run_main([])
+        self.assertIsNone(m_run.call_args.kwargs["wp_span_MHz"])
+
+    def test_an_explicit_span_wins(self):
+        m_run = self._run_main(["--plot-ridge", "fig.png", "--wp-span-MHz", "40"])
+        self.assertAlmostEqual(m_run.call_args.kwargs["wp_span_MHz"], 40.0)
+
+
+class TestEtaSweepHelpers(unittest.TestCase):
+    """`tune_up_sweep`'s grid parsing and filename tags."""
+
+    def test_parse_etas_colon_form(self):
+        from snail_solver.tune_up_sweep import parse_etas
+        self.assertEqual(parse_etas("1.2:2.0:9"),
+                         [round(v, 10) for v in np.linspace(1.2, 2.0, 9)])
+
+    def test_parse_etas_comma_form(self):
+        from snail_solver.tune_up_sweep import parse_etas
+        self.assertEqual(parse_etas("1.2,1.5,1.8"), [1.2, 1.5, 1.8])
+
+    def test_parse_etas_rejects_nonpositive(self):
+        """t_g0 = 2A/eta* divides by it."""
+        from snail_solver.tune_up_sweep import parse_etas
+        with self.assertRaises(ValueError):
+            parse_etas("0,1.5")
+
+    def test_eta_tag_has_no_dot(self):
+        """The tag goes into filenames and operating-point names."""
+        from snail_solver.tune_up_sweep import eta_tag
+        self.assertEqual(eta_tag(1.8), "eta1p8")
+        self.assertEqual(eta_tag(2.0), "eta2")
+        self.assertNotIn(".", eta_tag(1.25))
+
+    def test_score_gate_rejects_none_chirp(self):
+        """None means 'inherit the device chirp' in build_coupler -- so a caller
+        asking for NO chirp must say [], and passing None must not silently score
+        a device-level chirp instead."""
+        from snail_solver.tune_up_sweep import score_gate
+        with self.assertRaises(ValueError):
+            score_gate({}, {"target_eta": 1.0, "t_g_ns": 77.0, "amp_scale": 1.0,
+                            "wp_offset_GHz": 0.0}, None)
+
+
+class TestPlotEtaSweepSmoke(unittest.TestCase):
+    """`plot_eta_sweep` must render from a hand-built doc, including a failed eta
+    (which must be drawn, not silently dropped) -- mirrors TestPlotPostChirpSmoke.
+    """
+
+    @staticmethod
+    def _row(eta, F=0.99, leak=1e-3, refit=False):
+        scores = {"t_g_ns": 138.889 / eta, "amp_scale": 1.0, "wp_offset_GHz": 0.0,
+                  "peak_eta": eta, "chirp_coeffs_GHz": [], "F_avg": F,
+                  "leakage": leak, "transfer": F, "refit_length": False}
+        row = {"target_eta": eta, "ok": True, "error": None,
+               "chirped": dict(scores),
+               "flat": dict(scores, F_avg=F - 0.01, leakage=leak * 2),
+               "rabi_fit": {"r2": 0.98, "delta0": 0.0, "k2": 5.0, "k4": 0.0},
+               "chirp": {"quartic_fraction": 0.03},
+               "length": {"t_g_ns": 138.889 / eta, "railed": False},
+               "n_dropped": 0}
+        if refit:
+            row["flat_refit"] = dict(scores, F_avg=F - 0.005)
+        return row
+
+    def _doc(self, rows):
+        return {"rows": rows, "summary": {"n_ok": 1, "n_failed": 0}}
+
+    def test_renders_two_series(self):
+        from snail_solver.tune_up_sweep import plot_eta_sweep
+        doc = self._doc([self._row(1.2), self._row(1.5, F=0.97, leak=5e-3)])
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_eta_sweep(doc, out=os.path.join(d, "q.png"))
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_renders_three_series_and_a_failed_eta(self):
+        from snail_solver.tune_up_sweep import plot_eta_sweep
+        rows = [self._row(1.2, refit=True), self._row(1.5, F=0.9, refit=True),
+                {"target_eta": 1.8, "ok": False,
+                 "error": {"type": "RabiFitError", "stage": "rabi", "message": "x"}}]
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_eta_sweep(self._doc(rows), out=os.path.join(d, "q.png"))
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_all_failed_raises(self):
+        from snail_solver.tune_up_sweep import plot_eta_sweep
+        doc = self._doc([{"target_eta": 1.8, "ok": False,
+                          "error": {"type": "RabiFitError", "message": "x"}}])
+        with self.assertRaises(ValueError):
+            plot_eta_sweep(doc, "unused.png")
+
+    def test_t_g_axis_stays_aligned_when_a_failed_eta_widens_the_plot(self):
+        """The top t_g axis is a twiny: it does NOT track its parent, it keeps
+        whatever limits it was given. The dotted rule marking a failed eta OUTSIDE
+        the successful ones widens the shared x axis, so building the twiny before
+        those rules slides every t_g label off the eta it belongs to -- a silently
+        mislabelled figure, which is worse than a missing one.
+        """
+        from unittest import mock
+        import numpy as np
+        from snail_solver.tune_up_sweep import plot_eta_sweep
+
+        rows = [self._row(1.2), self._row(1.5),
+                {"target_eta": 1.8, "ok": False,
+                 "error": {"type": "RabiFitError", "message": "x"}}]
+        got = []
+        with tempfile.TemporaryDirectory() as d:
+            # plot_eta_sweep closes the figure; intercept it to inspect the axes.
+            with mock.patch("matplotlib.pyplot.close", side_effect=got.append):
+                plot_eta_sweep(self._doc(rows), out=os.path.join(d, "q.png"))
+        fig = got[0]
+        ax, axt = fig.axes[0], fig.axes[-1]      # the twiny is built last, on purpose
+        self.assertEqual(len(axt.get_xticks()), 2, "one t_g tick per successful eta")
+        self.assertGreater(ax.get_xlim()[1], 1.8, "the failed eta widened the axis")
+        self.assertTrue(np.allclose(axt.get_xlim(), ax.get_xlim()),
+                        f"t_g axis {axt.get_xlim()} drifted from eta axis "
+                        f"{ax.get_xlim()}")
+
+    def test_replot_needs_no_solver(self):
+        """--replot must regenerate the figure from the JSON alone: it returns
+        before the device or any solver module is touched."""
+        from unittest import mock
+        from snail_solver import tune_up_sweep
+        doc = self._doc([self._row(1.2), self._row(1.5)])
+        with tempfile.TemporaryDirectory() as d:
+            js, png = os.path.join(d, "s.json"), os.path.join(d, "s.png")
+            with open(js, "w") as fh:
+                json.dump(doc, fh)
+            argv = ["tune_up_sweep", "--replot", js, "--plot", png]
+            with mock.patch("snail_solver.tune_up_sweep.run_eta_sweep") as m_run, \
+                 mock.patch.object(sys, "argv", argv):
+                tune_up_sweep.main()
+            m_run.assert_not_called()
+            self.assertTrue(os.path.getsize(png) > 5000)
+
+
+class TestSubharmonicAxis(unittest.TestCase):
+    """`subharmonic_convergence`'s axis: w_b is what moves, and Delta_sub is exact.
+
+    The whole map is indexed by Delta_sub = w_s - 2 w_p, so an off-by-a-factor in
+    w_b(Delta_sub) would silently mislabel every column -- the figure would still
+    render and still look monotone.
+    """
+
+    CFG = dict(qubit_freqs_GHz=[3.5, 3.8], coupler_freq_GHz=4.5, g3_GHz=0.06,
+               coupler_levels=5, qubit_levels=3, lam_a=0.1, lam_b=0.1,
+               min_detuning_GHz=0.05, envelope="raised_cosine")
+
+    def test_round_trip_through_the_axis(self):
+        from snail_solver.subharmonic_convergence import (
+            config_at_detuning, subharmonic_detuning_GHz)
+        for d in (0.1, 0.75, 2.2, -0.4):
+            cfg = config_at_detuning(self.CFG, d)
+            self.assertAlmostEqual(subharmonic_detuning_GHz(cfg), d, places=12)
+
+    def test_both_branches_give_the_same_detuning(self):
+        """The pump is |w_b - w_a|, so mirroring the partner under the anchor is a
+        different allocation at the SAME Delta_sub."""
+        from snail_solver.subharmonic_convergence import (
+            config_at_detuning, subharmonic_detuning_GHz)
+        above = config_at_detuning(self.CFG, 0.8, branch="above")
+        below = config_at_detuning(self.CFG, 0.8, branch="below")
+        self.assertAlmostEqual(subharmonic_detuning_GHz(above), 0.8, places=12)
+        self.assertAlmostEqual(subharmonic_detuning_GHz(below), 0.8, places=12)
+        self.assertGreater(above["qubit_freqs_GHz"][1], 3.5)
+        self.assertLess(below["qubit_freqs_GHz"][1], 3.5)
+
+    def test_pump_is_independent_of_the_detuning_only_through_the_rate(self):
+        """t_g0 = 2A/eta* must be identical along the axis: the iSWAP rate is
+        6 g3 lam_a lam_b eta, with no w_p in it. That invariance is the reason this
+        module moves the pump rather than the SNAIL, so it is worth pinning."""
+        from snail_solver.subharmonic_convergence import config_at_detuning
+        from snail_solver.tune_up import nominal_t_g
+        t0 = nominal_t_g(config_at_detuning(self.CFG, 0.1), 1.2)
+        t1 = nominal_t_g(config_at_detuning(self.CFG, 2.2), 1.2)
+        self.assertAlmostEqual(t0, t1, places=12)
+
+    def test_rejects_a_detuning_past_the_degenerate_qubits(self):
+        from snail_solver.subharmonic_convergence import wb_for_detuning
+        with self.assertRaises(ValueError):
+            wb_for_detuning(self.CFG, 4.5)          # w_p = 0
+        with self.assertRaises(ValueError):
+            wb_for_detuning(self.CFG, 5.0)          # w_p < 0
+
+    def test_rejects_a_pump_inside_the_collision_floor(self):
+        from snail_solver.subharmonic_convergence import config_at_detuning
+        with self.assertRaises(ValueError):
+            config_at_detuning(self.CFG, 4.45)      # w_p = 0.025 < 0.05
+
+    def test_does_not_mutate_the_input_and_strips_a_device_chirp(self):
+        """build_coupler treats chirp_coeffs_GHz=None as 'inherit the device
+        chirp', so leaving a chirp calibrated at another pump in the copy would
+        apply it silently at the new w_b -- the None-vs-[] trap tune_up_sweep
+        documents, one level up."""
+        from snail_solver.subharmonic_convergence import config_at_detuning
+        src = dict(self.CFG, chirp_coeffs_GHz=[0.0, 0.0, 0.001])
+        out = config_at_detuning(src, 0.5, levels=9)
+        self.assertIsNone(out["chirp_coeffs_GHz"])
+        self.assertEqual(out["coupler_levels"], 9)
+        self.assertEqual(src["chirp_coeffs_GHz"], [0.0, 0.0, 0.001])
+        self.assertEqual(src["qubit_freqs_GHz"], [3.5, 3.8])
+        kept = config_at_detuning(src, 0.5, chirp_coeffs_GHz=[0.0, 0.002])
+        self.assertEqual(kept["chirp_coeffs_GHz"], [0.0, 0.002])
+
+
+class TestSubharmonicLandmarks(unittest.TestCase):
+    """The other resonances the pump walks past. A fidelity dip at one of these is
+    a collision, not a truncation failure, so mislocating them would misattribute
+    the whole map."""
+
+    CFG = TestSubharmonicAxis.CFG
+
+    def _by_delta(self):
+        from snail_solver.subharmonic_convergence import collision_landmarks
+        return {round(lm["delta_sub_GHz"], 6): lm
+                for lm in collision_landmarks(self.CFG)}
+
+    def test_the_subharmonic_itself_lands_at_zero(self):
+        """2 w_p = w_s must come back at exactly Delta_sub = 0 -- the consistency
+        check on the affine solve."""
+        lm = self._by_delta()[0.0]
+        self.assertEqual(lm["n_pump"], 2)
+        self.assertTrue(lm["coupler"])
+        self.assertAlmostEqual(lm["w_p_GHz"], 2.25, places=12)
+
+    def test_known_landmarks_for_this_device(self):
+        """Hand-derived for w_a = 3.5, w_s = 4.5: 2 w_p = w_a at 1.0; the a<->s
+        conversion (w_p = w_s - w_a = 1.0, where w_b also lands on w_s) at 2.5;
+        the b<->s conversion (w_b = 4.0) at 3.5."""
+        got = self._by_delta()
+        self.assertAlmostEqual(got[1.0]["w_p_GHz"], 1.75, places=12)
+        self.assertFalse(got[1.0]["coupler"])
+        self.assertAlmostEqual(got[2.5]["w_p_GHz"], 1.0, places=12)
+        self.assertAlmostEqual(got[2.5]["w_b_GHz"], 4.5, places=12)
+        self.assertTrue(got[2.5]["coupler"])
+        self.assertAlmostEqual(got[3.5]["w_b_GHz"], 4.0, places=12)
+        self.assertTrue(got[3.5]["coupler"])
+
+    def test_every_landmark_is_a_real_resonance(self):
+        """Independent check: at the reported w_p, some process really is resonant.
+        Rebuild the condition from the mode frequencies rather than from the solve."""
+        from snail_solver.subharmonic_convergence import collision_landmarks
+        wa, ws = 3.5, 4.5
+        for lm in collision_landmarks(self.CFG):
+            w_p, n = lm["w_p_GHz"], lm["n_pump"]
+            wb = wa + w_p
+            nets = [ws, wa, wb, ws - wa, ws - wb, wb - wa,
+                    wa + ws, wb + ws, wa + wb]
+            self.assertTrue(any(abs(abs(net) - n * w_p) < 1e-9 for net in nets),
+                            f"{lm['name']} at w_p={w_p} is not resonant")
+
+    def test_names_are_terminal_safe_and_labels_are_mathtext(self):
+        from snail_solver.subharmonic_convergence import collision_landmarks
+        for lm in collision_landmarks(self.CFG):
+            self.assertNotIn("$", lm["name"])
+            self.assertIn("label", lm)
+
+    def test_nearest_landmark_skips_the_axis_origin(self):
+        """Delta_sub = 0 is the axis, not a contaminant: reporting it as the
+        nearest collision would flag every near-resonant column as unusable."""
+        from snail_solver.subharmonic_convergence import (
+            collision_landmarks, nearest_landmark)
+        lms = collision_landmarks(self.CFG)
+        near = nearest_landmark(lms, 0.05)
+        self.assertNotAlmostEqual(near["delta_sub_GHz"], 0.0, places=6)
+        self.assertAlmostEqual(nearest_landmark(lms, 0.05, skip_origin=False)
+                               ["delta_sub_GHz"], 0.0, places=12)
+
+
+class TestSubharmonicHelpers(unittest.TestCase):
+    """Grid parsing, the displacement and the level count it predicts."""
+
+    def test_displacement_matches_the_measured_case(self):
+        """3 g3 eta^2 / Delta = 0.743 at g3 = 0.06, eta = 1.12, Delta = 0.304 --
+        the number the leakage analysis measured and attributed."""
+        from snail_solver.subharmonic_convergence import displacement_alpha
+        self.assertAlmostEqual(
+            displacement_alpha({"g3_GHz": 0.06}, 0.304, 1.12), 0.743, places=3)
+        self.assertEqual(displacement_alpha({"g3_GHz": 0.06}, 0.0, 1.0),
+                         float("inf"))
+
+    def test_displacement_is_sign_blind(self):
+        """Delta_sub < 0 is the other side of the same resonance."""
+        from snail_solver.subharmonic_convergence import displacement_alpha
+        self.assertAlmostEqual(displacement_alpha({"g3_GHz": 0.06}, +0.5, 1.0),
+                               displacement_alpha({"g3_GHz": 0.06}, -0.5, 1.0))
+
+    def test_predicted_levels(self):
+        from snail_solver.subharmonic_convergence import predicted_levels
+        self.assertAlmostEqual(predicted_levels(0.0), 1.0)
+        self.assertAlmostEqual(predicted_levels(1.0), 6.0)
+        self.assertGreater(predicted_levels(2.0), predicted_levels(1.0))
+
+    def test_parse_detunings_forms(self):
+        from snail_solver.subharmonic_convergence import parse_detunings
+        self.assertEqual(parse_detunings("0.1,0.5,2.0"), [0.1, 0.5, 2.0])
+        self.assertEqual(len(parse_detunings("0.1:2.0:5")), 5)
+        log = parse_detunings("0.1:10:3:log")
+        self.assertAlmostEqual(log[1], 1.0, places=12)
+        neg = parse_detunings("-0.1:-10:3:log")
+        self.assertAlmostEqual(neg[1], -1.0, places=12)
+
+    def test_parse_detunings_composes_segments(self):
+        """Extending an axis must not re-solve what is cached, so a range segment
+        has to reproduce the same floats it did on its own."""
+        from snail_solver.subharmonic_convergence import parse_detunings
+        base = parse_detunings("0.15:0.8:8:log")
+        both = parse_detunings("0.15:0.8:8:log,1.15,1.6")
+        self.assertEqual(len(both), 10)
+        self.assertEqual(base, both[:8])          # bit-for-bit, not just close
+        self.assertEqual(both[-2:], [1.15, 1.6])
+
+    def test_parse_detunings_sorts_and_dedupes_a_composed_grid(self):
+        from snail_solver.subharmonic_convergence import parse_detunings
+        self.assertEqual(parse_detunings("2.0,0.5,2.0,1.0"), [0.5, 1.0, 2.0])
+
+    def test_parse_detunings_rejects_log_through_the_resonance(self):
+        """Delta_sub = 0 IS the resonance: it cannot be a grid point, and a log
+        grid spanning it is a sign error, not a wide scan."""
+        from snail_solver.subharmonic_convergence import parse_detunings
+        for bad in ("0:2:5:log", "-1:1:5:log", "0.1:2:0"):
+            with self.assertRaises(ValueError):
+                parse_detunings(bad)
+
+    def test_parse_levels_needs_a_comparison(self):
+        """Convergence is |F(N) - F(N_ref)|; one truncation has nothing to be
+        measured against, and returning it would produce an all-converged map."""
+        from snail_solver.subharmonic_convergence import parse_levels
+        self.assertEqual(parse_levels("9,3,5,5"), [3, 5, 9])
+        self.assertEqual(parse_levels("3:11:5"), [3, 5, 7, 9, 11])
+        for bad in ("7", "1,7", ""):
+            with self.assertRaises(ValueError):
+                parse_levels(bad)
+
+    def test_tags_have_no_dots(self):
+        from snail_solver.subharmonic_convergence import cell_tag, delta_tag
+        self.assertEqual(delta_tag(0.35), "d0p35")
+        self.assertEqual(delta_tag(-0.2), "dm0p2")
+        self.assertEqual(cell_tag(0.35, 7), "d0p35_N7")
+        self.assertNotIn(".", cell_tag(1.25, 11))
+
+
+def _subharm_doc(rows, *, levels=(3, 5, 9), ref=9, tol=2e-3):
+    """A hand-built map document. `rows` is {delta: {levels: F}}."""
+    cols = []
+    for d, F_by_N in rows.items():
+        F_ref = F_by_N.get(ref)
+        cells = []
+        for N, F in sorted(F_by_N.items()):
+            spread = None if F_ref is None else abs(F - F_ref)
+            cells.append({"levels": int(N), "F_avg": float(F), "leakage": 1e-3,
+                          "transfer": float(F), "n_coupler": 0.1,
+                          "t_g_ns": 200.0, "spread": spread,
+                          "converged": None if spread is None else spread <= tol})
+        cols.append({"delta_sub_GHz": float(d), "tag": "t", "ok": True,
+                     "error": None, "w_b_GHz": 3.5 + 0.5 * (4.5 - d),
+                     "w_p_GHz": 0.5 * (4.5 - d), "alpha_pred": 0.18 / abs(d),
+                     "levels_pred": 2.0, "F_ref": F_ref, "cells": cells,
+                     "calibration": {"t_g_ns": 200.0, "amp_scale": 1.0,
+                                     "wp_offset_GHz": 0.0, "target_eta": 1.2,
+                                     "chirp_coeffs_GHz": []}})
+    doc = {"source": "subharmonic_convergence", "device": None,
+           "settings": {"levels": list(levels), "ref_levels": ref, "tol": tol,
+                        "target_eta": 1.2, "g3_GHz": 0.06,
+                        "device_delta_sub_GHz": 3.9, "branch": "above",
+                        "w_a_GHz": 3.5, "w_s_GHz": 4.5},
+           "landmarks": [{"delta_sub_GHz": 1.0, "w_p_GHz": 1.75, "w_b_GHz": 5.25,
+                          "n_pump": 2, "name": "qubit a excitation",
+                          "label": r"qubit $a$ excitation", "coupler": False},
+                         {"delta_sub_GHz": 0.0, "w_p_GHz": 2.25, "w_b_GHz": 5.75,
+                          "n_pump": 2, "name": "SNAIL excitation",
+                          "label": "SNAIL excitation", "coupler": True}],
+           "columns": cols,
+           "summary": {"n_columns": len(cols), "n_ok": len(cols),
+                       "n_cells": sum(len(c["cells"]) for c in cols),
+                       "seconds": 1.0}}
+    from snail_solver.subharmonic_convergence import convergence_boundary
+    doc["boundary"] = convergence_boundary(doc)
+    return doc
+
+
+class TestConvergenceBoundary(unittest.TestCase):
+    """The boundary must be read from the FAR end inward."""
+
+    def test_boundary_is_the_edge_of_the_converged_run(self):
+        from snail_solver.subharmonic_convergence import convergence_boundary
+        doc = _subharm_doc({
+            0.1: {3: 0.50, 5: 0.70, 9: 0.90},        # nothing agrees
+            0.5: {3: 0.86, 5: 0.8985, 9: 0.90},      # 5 agrees, 3 does not
+            2.0: {3: 0.9005, 5: 0.9002, 9: 0.90},    # both agree
+        })
+        b = convergence_boundary(doc)
+        self.assertAlmostEqual(b["5"]["delta_sub_GHz"], 0.5)
+        self.assertAlmostEqual(b["3"]["delta_sub_GHz"], 2.0)
+        self.assertTrue(b["9"]["is_reference"])
+
+    def test_a_lone_converged_cell_inside_a_bad_run_is_not_a_boundary(self):
+        """Next to a collision the spread can dip through the tolerance by
+        cancellation. Quoting that as 'converged from here' is exactly the
+        truncation-as-regularizer trap this module exists to expose."""
+        from snail_solver.subharmonic_convergence import convergence_boundary
+        doc = _subharm_doc({
+            0.1: {3: 0.9001, 9: 0.90},               # accidental agreement
+            0.5: {3: 0.50, 9: 0.90},                 # still broken further out
+            2.0: {3: 0.9002, 9: 0.90},
+        })
+        self.assertAlmostEqual(
+            convergence_boundary(doc)["3"]["delta_sub_GHz"], 2.0)
+
+    def test_never_converged_reports_none(self):
+        from snail_solver.subharmonic_convergence import convergence_boundary
+        doc = _subharm_doc({0.1: {3: 0.2, 9: 0.9}, 2.0: {3: 0.4, 9: 0.9}})
+        b = convergence_boundary(doc)
+        self.assertIsNone(b["3"]["delta_sub_GHz"])
+        self.assertEqual(b["3"]["n_converged"], 0)
+
+    def test_tolerance_can_be_overridden_without_re_solving(self):
+        from snail_solver.subharmonic_convergence import convergence_boundary
+        doc = _subharm_doc({0.1: {3: 0.89, 9: 0.90}, 2.0: {3: 0.899, 9: 0.90}})
+        self.assertIsNone(convergence_boundary(doc, tol=1e-4)["3"]["delta_sub_GHz"])
+        self.assertAlmostEqual(
+            convergence_boundary(doc, tol=2e-2)["3"]["delta_sub_GHz"], 0.1)
+
+
+class TestSubharmonicPlotSmoke(unittest.TestCase):
+    """`plot_convergence_map` must render from a hand-built doc, and must refuse
+    to draw an empty one -- a blank map reads as a converged map."""
+
+    ROWS = {0.1: {3: 0.50, 5: 0.70, 9: 0.90},
+            0.5: {3: 0.86, 5: 0.8985, 9: 0.90},
+            2.0: {3: 0.9005, 5: 0.9002, 9: 0.90}}
+
+    def test_renders_the_map(self):
+        from snail_solver.subharmonic_convergence import plot_convergence_map
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_convergence_map(_subharm_doc(self.ROWS),
+                                       out=os.path.join(d, "m.png"))
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_renders_with_a_failed_column_and_a_linear_axis(self):
+        from snail_solver.subharmonic_convergence import plot_convergence_map
+        doc = _subharm_doc(self.ROWS)
+        doc["columns"].append({"delta_sub_GHz": 3.0, "ok": False, "cells": [],
+                               "error": {"type": "ValueError", "message": "x"}})
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_convergence_map(doc, out=os.path.join(d, "m.png"),
+                                       xscale="linear", annotate=False)
+            self.assertTrue(os.path.getsize(out) > 5000)
+
+    def test_no_cells_raises(self):
+        from snail_solver.subharmonic_convergence import plot_convergence_map
+        doc = _subharm_doc(self.ROWS)
+        for col in doc["columns"]:
+            col["cells"] = []
+        with self.assertRaises(ValueError):
+            plot_convergence_map(doc, "unused.png")
+
+    def test_print_map_survives_a_failed_column(self):
+        from snail_solver.subharmonic_convergence import print_map
+        doc = _subharm_doc(self.ROWS)
+        doc["columns"].append({"delta_sub_GHz": 3.0, "ok": False, "cells": [],
+                               "error": {"type": "ValueError", "message": "x"}})
+        print_map(doc)                       # must not raise on the missing keys
+
+    def test_replot_needs_no_solver(self):
+        """--replot must regenerate the figure from the JSON alone: it returns
+        before the device or any solver module is touched."""
+        from unittest import mock
+        from snail_solver import subharmonic_convergence as SC
+        with tempfile.TemporaryDirectory() as d:
+            js, png = os.path.join(d, "c.json"), os.path.join(d, "c.png")
+            with open(js, "w") as fh:
+                json.dump(_subharm_doc(self.ROWS), fh)
+            argv = ["subharmonic_convergence", "--replot", js, "--plot", png]
+            with mock.patch.object(SC, "run_convergence_map") as m_run, \
+                 mock.patch.object(sys, "argv", argv):
+                SC.main()
+            m_run.assert_not_called()
+            self.assertTrue(os.path.getsize(png) > 5000)
+
+
+class TestSubharmonicDryRun(unittest.TestCase):
+    """`--dry-run` is the guard on an expensive submission: it must report the
+    collisions the axis crosses and warn when the chosen drive cannot excite the
+    effect being measured."""
+
+    CFG = TestSubharmonicAxis.CFG
+
+    def test_describe_grid_flags_a_column_on_a_collision(self):
+        from snail_solver.subharmonic_convergence import describe_grid
+        txt = describe_grid(self.CFG, [0.2, 0.98, 2.2], [3, 5, 9], 1.2)
+        self.assertIn("ON IT", txt)                  # 0.98 is 20 MHz from 1.0
+        self.assertIn("a->s conversion", txt)
+        self.assertIn("exact solves", txt)
+
+    def test_describe_grid_warns_when_the_drive_is_too_weak(self):
+        """At small eta the displacement never approaches a photon, so the map is
+        flat by construction and the run is wasted cluster time."""
+        from snail_solver.subharmonic_convergence import describe_grid
+        txt = describe_grid(self.CFG, [1.0, 2.0], [3, 5, 9], 0.2)
+        self.assertIn("WARNING", txt)
+        self.assertIn("flat by construction", txt)
+
+    def test_describe_grid_reports_an_impossible_column(self):
+        from snail_solver.subharmonic_convergence import describe_grid
+        txt = describe_grid(self.CFG, [0.5, 4.6], [3, 5, 9], 1.2)
+        self.assertIn("SKIPPED", txt)
+
+class TestSubharmonicCacheGuard(unittest.TestCase):
+    """The per-point caches are keyed by (Delta_sub, levels) ALONE, so without a
+    guard a re-run into the same outdir at a different drive would be served the
+    previous run's physics -- silently, straight into the map and the figure.
+    """
+
+    def test_matching_record_is_reused(self):
+        from snail_solver.subharmonic_convergence import _cache_load
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w") as fh:
+                json.dump({"target_eta": 1.2, "branch": "above",
+                           "calib_levels": 13, "chirp_coeffs_GHz": [],
+                           "t_g_ns": 100.0}, fh)
+            got = _cache_load(p, {"target_eta": 1.2, "branch": "above",
+                                  "calib_levels": 13, "chirp_coeffs_GHz": []})
+            self.assertEqual(got["t_g_ns"], 100.0)
+
+    def test_a_different_drive_is_not_reused(self):
+        from snail_solver.subharmonic_convergence import _cache_load
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w") as fh:
+                json.dump({"target_eta": 1.2, "t_g_ns": 100.0}, fh)
+            self.assertIsNone(_cache_load(p, {"target_eta": 0.6}))
+
+    def test_a_record_missing_the_key_is_not_reused(self):
+        """An older cache cannot be verified, so it cannot be trusted."""
+        from snail_solver.subharmonic_convergence import _cache_load
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w") as fh:
+                json.dump({"t_g_ns": 100.0}, fh)
+            self.assertIsNone(_cache_load(p, {"fit_virtual_z": True}))
+
+    def test_a_changed_calibration_invalidates_its_cells(self):
+        """A cell is tied to the operating point it was scored at."""
+        from snail_solver.subharmonic_convergence import _cache_load
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w") as fh:
+                json.dump({"levels": 5, "t_g_ns": 100.0, "amp_scale": 1.0,
+                           "F_avg": 0.9}, fh)
+            self.assertIsNotNone(_cache_load(p, {"levels": 5, "t_g_ns": 100.0}))
+            self.assertIsNone(_cache_load(p, {"levels": 5, "t_g_ns": 101.0}))
+
+    def test_a_truncated_cache_file_is_not_a_cache(self):
+        from snail_solver.subharmonic_convergence import _cache_load
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w") as fh:
+                fh.write('{"target_eta": 1.2,')
+            self.assertIsNone(_cache_load(p, {"target_eta": 1.2}))
+        self.assertIsNone(_cache_load(None, {"target_eta": 1.2}))
+
+    def test_json_round_trip_does_not_break_equality(self):
+        """A tuple comes back a list and an int comes back an int; neither is a
+        physics change, and treating one as such would re-solve the whole grid."""
+        from snail_solver.subharmonic_convergence import _same
+        self.assertTrue(_same([0.0, 0.002], (0.0, 0.002)))
+        self.assertTrue(_same(13, 13.0))
+        self.assertTrue(_same("above", "above"))
+        self.assertFalse(_same([0.0], [0.0, 0.002]))
+        self.assertFalse(_same(True, 1.0))
+        self.assertFalse(_same("above", "below"))
+        self.assertFalse(_same(None, 0.0))
+
+class TestSubharmonicCalibrationHealth(unittest.TestCase):
+    """A column whose CALIBRATION failed must be flagged, not read as a
+    truncation failure: all its cells score one bad operating point, so the
+    spread down that column is not evidence either way. Measured on the real
+    eta=1.2 run at Delta_sub = 1.6 GHz, where the length scan landed on a branch
+    with transfer 0.688 and the six cells then scattered over F = 0.02 .. 0.82.
+    """
+
+    ROWS = {0.5: {3: 0.50, 5: 0.70, 9: 0.90}, 2.0: {3: 0.9005, 5: 0.9002, 9: 0.90}}
+
+    def _doc(self, transfer):
+        doc = _subharm_doc(self.ROWS)
+        doc["columns"][0]["calibration"]["transfer"] = transfer
+        doc["columns"][1]["calibration"]["transfer"] = 0.99
+        return doc
+
+    def test_table_flags_a_sick_column(self):
+        from snail_solver.subharmonic_convergence import format_map
+        txt = format_map(self._doc(0.688))
+        self.assertIn("badly-calibrated pulse", txt)
+        self.assertIn("0.500", txt)
+        self.assertIn("transfer", txt)
+
+    def test_table_is_quiet_when_every_column_is_healthy(self):
+        from snail_solver.subharmonic_convergence import format_map
+        self.assertNotIn("badly-calibrated",
+                         format_map(self._doc(0.995)))
+
+    def test_threshold_is_adjustable(self):
+        from snail_solver.subharmonic_convergence import format_map
+        self.assertNotIn("badly-calibrated",
+                         format_map(self._doc(0.688), health_min=0.5))
+
+    def test_a_calibration_with_no_transfer_recorded_is_not_flagged(self):
+        """Absence of the field is not evidence of a bad calibration."""
+        from snail_solver.subharmonic_convergence import format_map
+        doc = _subharm_doc(self.ROWS)
+        txt = format_map(doc)
+        self.assertNotIn("badly-calibrated", txt)
+
+    def test_figure_renders_the_rug(self):
+        from snail_solver.subharmonic_convergence import plot_convergence_map
+        with tempfile.TemporaryDirectory() as d:
+            out = plot_convergence_map(self._doc(0.688),
+                                       out=os.path.join(d, "m.png"))
+            self.assertTrue(os.path.getsize(out) > 5000)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -109,6 +109,7 @@ prepare-time and run-time; `slurm/snail_sweep.slurm` documents which is which.
 | Module | Purpose |
 | --- | --- |
 | [tune_up](src/snail_solver/tune_up.py) | Hardware-order tune-up: Rabi → chirp → **fix the amplitude** → fit the length |
+| [tune_up_sweep](src/snail_solver/tune_up_sweep.py) | Re-runs the whole tune-up at each `target_eta` and scores the gate: the speed/leakage trade-off curve |
 | [stark_chirp](src/snail_solver/stark_chirp.py) | Legendre chirp that tracks the AC-Stark shift through the pulse |
 | [calibrate_gate](src/snail_solver/calibrate_gate.py) | End-to-end tune-up mirroring the experiment (frequency chevron, then Rabi) |
 | [find_stark_resonance](src/snail_solver/find_stark_resonance.py) | Locate the AC-Stark-shifted iSWAP resonance |
@@ -121,6 +122,11 @@ peak drive |η| instead, which makes the pulse shape in normalized gate time
 independent of `t_g` and so decouples the frequency calibration from the length
 calibration — leaving the length as the only free parameter, as in the lab.
 
+`tune_up_sweep` sits one level above both: it re-runs the entire tune-up at every
+`target_eta` — new Rabi sweep, new chirp, new offset, new length — and scores the
+resulting gate, because the chirp and the carrier offset are themselves functions
+of the drive, so a range of drives cannot be scored against one calibration.
+
 **Analysis and figures**
 
 | Module | Purpose |
@@ -132,6 +138,7 @@ calibration — leaving the length as the only free parameter, as in the lab.
 | [spectator_audit](src/snail_solver/spectator_audit.py) | Channel audit: *how strong* each parasitic process is |
 | [spectroscopy](src/snail_solver/spectroscopy.py) | Power-vs-frequency spectroscopy map |
 | [stark_vs_detuning](src/snail_solver/stark_vs_detuning.py) | How the Stark-shifted resonance moves as a spectator is walked |
+| [subharmonic_convergence](src/snail_solver/subharmonic_convergence.py) | Coupler levels vs distance from the SNAIL subharmonic: *how far must the gate be detuned before a truncated model is trustworthy* |
 | [calibration_plots](src/snail_solver/calibration_plots.py) | The chevron figure that shows the Stark shift explicitly |
 | [validate_engines](src/snail_solver/validate_engines.py) | Measure the JAX engine against the QuTiP reference |
 
@@ -172,6 +179,7 @@ are tuned to the device they name and run as written.
 | `snail_calibrate_gate.slurm` | Per-device gate tune-up |
 | `snail_tune_up.slurm` / `submit_tune_up.sh` | Hardware-order tune-up (fast explore → exact confirm) |
 | `snail_calibration_map.slurm` / `snail_gpu_scan.slurm` | Calibration landscape (CPU / GPU) |
+| `snail_subharmonic.slurm` | Truncation convergence vs subharmonic detuning (resumable; run `DRY=1` first) |
 | `snail_stark.slurm` / `snail_stark_detuning.slurm` | Stark resonance and its detuning dependence |
 | `snail_grape.slurm` | Single-point optimal control |
 | `snail_spectroscopy.slurm` | Sharded spectroscopy map |
@@ -183,7 +191,7 @@ are tuned to the device they name and run as written.
 uv run pytest -q
 ```
 
-51 tests, deliberately QuTiP-free and ~10 s, so they can gate a cluster
+239 tests, deliberately QuTiP-free and ~1 min, so they can gate a cluster
 submission. Each one encodes an invariant that a real bug once violated (beat
 sign conventions, collision labelling, the subharmonic factor of 2, blank
 spectator plumbing) — a failure means a specific known-bad behaviour is back.
@@ -197,6 +205,14 @@ spectator plumbing) — a failure means a specific known-bad behaviour is back.
   the spectator's beat detuning. It is *skipped* within 0.5 MHz of a collision:
   on resonance the answer is frequency allocation, not DRAG. It helps in the
   off-resonant-but-close window, roughly the inner 100 MHz.
+- `g3 X^3` necessarily contains `3 g3 eta^2 s^dag` at the **subharmonic
+  detuning** `Delta_sub = w_s - 2 w_p` — a linear drive on the SNAIL with no
+  participation suppression, where the gate itself is down by `lam^2 ~ 0.01`. It
+  displaces the coupler by `|alpha| ~ 3 g3 eta^2 / Delta_sub`, and a coherent
+  state has weight on every Fock level, so close to the subharmonic the answer is
+  set by `coupler_levels` rather than by the physics. `subharmonic_convergence`
+  measures how far the gate has to be detuned before a given truncation converges;
+  the diagnosis is in [docs/chirped-recursive-drag.md](docs/chirped-recursive-drag.md).
 - At realistic pump strengths (`|eta| ~ 1–1.5`) the open-loop normalization is
   not accurate: the pulse over-rotates and the AC-Stark shift moves the
   resonance, and the two couple because the shift grows as `|eta|^2`. Calibrate
