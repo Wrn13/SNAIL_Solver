@@ -103,6 +103,7 @@ prepare-time and run-time; `slurm/snail_sweep.slurm` documents which is which.
 | [device_utils](src/snail_solver/device_utils.py) | Device JSON I/O, coupler construction, 1-D maximizer |
 | [operating_points](src/snail_solver/operating_points.py) | Named calibrated operating points inside a device JSON |
 | [paths](src/snail_solver/paths.py) | `devices/` and `results/` resolution |
+| [h5_io](src/snail_solver/h5_io.py) | Run files: nested results ↔ HDF5, with the run's figures stored inside them |
 
 **Calibration and optimal control**
 
@@ -121,6 +122,19 @@ prepare-time and run-time; `slurm/snail_sweep.slurm` documents which is which.
 peak drive |η| instead, which makes the pulse shape in normalized gate time
 independent of `t_g` and so decouples the frequency calibration from the length
 calibration — leaving the length as the only free parameter, as in the lab.
+
+A run's outputs — the operating point, every chevron's traces, and the figures
+drawn from them — go into ONE HDF5 file (`--out run.h5`), so a run is a single
+artefact that cannot be separated from its own pictures:
+
+```
+python -m snail_solver.h5_io results/run.h5                  # what is in there
+python -m snail_solver.h5_io results/run.h5 --extract figs/  # the PNGs back out
+```
+
+A sweep keeps every η's complete tune-up in the same file, each addressable on its
+own as `eta_sweep.h5:/runs/eta1p8` wherever a path is taken (`tune_up --replot`,
+`post_chirp --from-tuneup`). `--out name.json` still writes the old text format.
 
 `tune_up_sweep` sits one level above both: it re-runs the entire tune-up at every
 `target_eta` — new Rabi sweep, new chirp, new offset, new length — and scores the

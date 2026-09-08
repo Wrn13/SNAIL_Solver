@@ -126,7 +126,11 @@
 #   JOBS        parallel workers (default: --cpus-per-task)
 #   GPU         set to 1 to run via qutip-jax/diffrax (forces --jobs 1; also
 #               uncomment #SBATCH --gres=gpu:1 above and load CUDA)      [0]
-#   OUT         JSON path for the full record + per-stage data  [tuneup_<dev>.json]
+#   OUT         HDF5 path for the full record + per-stage data  [tuneup_<dev>.h5]
+#               (a .json suffix still writes the old text format instead). The
+#               figures below are embedded in it as well as written to their own
+#               paths, so this one file is the whole run:
+#                 python -m snail_solver.h5_io results/<out>.h5 --extract figs/
 #   PLOT        set to 0 to skip rendering the Rabi sweep                  [1]
 #   PLOT_OUT    figure path; defaults to its OWN folder per device+eta so
 #               fanned-out runs never overwrite each other's plot
@@ -179,7 +183,7 @@ DRAG_N_PUMP="${DRAG_N_PUMP:-1}"
 MAX_DRAG_ITERS="${MAX_DRAG_ITERS:-4}"
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-1}}"
 GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax (forces --jobs 1)
-OUT="${OUT:-tuneup_${DEVICE%.json}.json}"
+OUT="${OUT:-tuneup_${DEVICE%.json}.h5}"
 PLOT="${PLOT:-1}"
 # Own folder per device+eta, so DEVICE/TARGET_ETA alone -- with no other override --
 # already keeps fanned-out runs (e.g. from submit_tune_up.sh) from clobbering each

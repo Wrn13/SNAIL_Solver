@@ -51,6 +51,29 @@ together.
 The partner qubit is placed at ``w_b = w_a + (w_s - Delta_sub)/2`` (``--branch
 below`` mirrors it under ``w_a``), so the requested detuning is exact.
 
+Isolating the subharmonic: sample BOTH sides
+--------------------------------------------
+The subharmonic drive depends on ``|Delta_sub|`` alone --
+``|alpha| = 3 g3 eta^2 / |Delta_sub|`` -- while every other pump-activated
+channel has a detuning that moves monotonically with ``w_p``, and ``w_p``
+differs between the two sides of the resonance
+(``w_p = (w_s -/+ |Delta_sub|)/2``). So a grid of MIRRORED PAIRS separates them
+with no further modelling:
+
+* pairs that AGREE cannot be driven by any ``w_p``-dependent channel, because
+  those channels are at different detunings on the two sides;
+* pairs that DISAGREE localise the confounder, and the size of the disagreement
+  bounds its contribution.
+
+:func:`mirror_pairs` finds the pairs and :func:`format_mirror` reports them, with
+the per-pair ``F(N_ref)`` difference against the tolerance. Two further classes
+of confounder are excluded by construction rather than by measurement: a channel
+whose detuning is CONSTANT along the axis cannot produce ``Delta_sub``
+dependence at all, and on this axis both the ``b <-> s`` conversion
+(``|w_p - |w_s - w_b|| = w_s - w_a`` identically, for ``w_p > w_s - w_a``) and
+the anharmonicity-shifted ``|11> -> |02>`` leakage (detuned by ``alpha``) are of
+that kind.
+
 Other collisions cross the axis
 -------------------------------
 Moving ``w_p`` moves the gate past every OTHER pump-activated resonance too, and
@@ -79,6 +102,28 @@ truncation in the grid), because the experiment calibrates against hardware, not
 against a truncated model -- so a cell's error is truncation error alone.
 ``--recalibrate-per-cell`` answers the other reading of the question ("what would
 a simulation run entirely at N levels have told me?") at one calibration per cell.
+
+GPU: measured, and it does not pay here
+---------------------------------------
+``--gpu-levels-min N`` routes the cells at ``N`` coupler levels and above through
+qutip-jax / diffrax (serially, in-process -- a CUDA context does not survive the
+fork the CPU pool needs) and leaves the smaller truncations in the pool. It is
+implemented because the big truncations are the obvious candidates, but on this
+problem it is a LOSS, measured on an NVIDIA GH200 at ``t_g = 209 ns``,
+``Delta_sub = 0.538 GHz``:
+
+===========  =============  =============
+truncation   CPU (QuTiP)    GPU (diffrax)
+===========  =============  =============
+13 levels    128 s          761 s
+===========  =============  =============
+
+-- a 6x slowdown at 95% device utilisation, with ``F`` agreeing to six digits
+(0.996610 both). That is the crossover ``zhou_coupler.use_gpu`` already warns
+about: a dim-162 Hilbert space with a time-dependent coefficient is far too small
+to amortise the per-step JAX overhead, and the CPU alternative is not one core but
+``jobs`` of them on independent cells. Reach for the GPU here only as a
+cross-check of the CPU path, or if the Hilbert space grows by orders of magnitude.
 
 Usage
 -----
@@ -112,6 +157,22 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+if __name__ == "__main__":
+    # Pin the BLAS thread pools BEFORE numpy is imported, and only when this
+    # module is the CLI -- a library import must not reconfigure its caller.
+    #
+    # Not a micro-optimisation. Every worker here runs ONE independent solve, so
+    # the parallelism is already at the process level and a threaded BLAS on top
+    # multiplies it. Measured on a 72-core box, 15 workers at 18 coupler levels
+    # (dim 162 -- big enough for numpy to go threaded where 13 was not): 127
+    # threads per worker, ~1900 threads total, load average 107, each worker
+    # burning 310% CPU to do the work of one. With fork the child inherits the
+    # parent's already-initialised BLAS, so setting this inside the worker is
+    # too late; it has to happen here.
+    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_var, "1")
+
 import numpy as np
 
 #: Coupler truncations scored by default. The largest is the reference every
@@ -130,11 +191,17 @@ DEFAULT_TOL = 2.0e-3
 #: remove: "the gate got worse" vs "the calibration stopped being measurable".
 DEFAULT_HEALTH_MIN = 0.9
 
-_C_INK = "#52514e"
-_C_COUPLER = "#c0392b"          # a landmark that excites the SNAIL
-_C_QUBIT = "#7f7f7f"            # a landmark that does not
-_C_PRED = "#2a78d6"             # the analytic prediction
-_C_MEAS = "#1baf7a"             # a measured trace
+# One role per colour, so nothing in the figure has to be looked up twice.
+# Structure (the boundary, the predicted level count, the frequency rules) is
+# INK -- it is annotation on the heatmap, not data of its own. Red is reserved
+# for a failure of the calibration. The only two actual series in the figure are
+# the pair in the lower panel, and they get the two hues.
+_C_INK = "#3f3e3c"              # structure drawn over the map
+_C_RULE = "#a9a7a3"             # another process is resonant here
+_C_RULE_S = "#6f6d69"           # ... and it excites the SNAIL (also dash-dotted)
+_C_BAD = "#c0392b"              # RESERVED: this column's calibration failed
+_C_PRED = "#2a78d6"             # lower panel: the analytic |alpha|^2
+_C_MEAS = "#1baf7a"             # lower panel: the measured <n_s>
 
 
 def _plain(o: Any) -> Any:
@@ -365,15 +432,15 @@ def predicted_levels(alpha: float, margin: float = 4.0) -> float:
 #: which is what separates "this dip is another coupler-exciting channel" from
 #: "this dip is a qubit collision".
 _PROCESSES = (
-    ("SNAIL excitation", "SNAIL excitation", ("s",), True),
-    ("qubit a excitation", r"qubit $a$ excitation", ("a",), False),
-    ("qubit b excitation", r"qubit $b$ excitation", ("b",), False),
-    ("a->s conversion", r"$a\!\to\!s$ conversion", ("s", "-a"), True),
-    ("b->s conversion", r"$b\!\to\!s$ conversion", ("s", "-b"), True),
-    ("a->b exchange", r"$a\!\to\!b$ exchange", ("b", "-a"), False),
-    ("a+s pair creation", r"$a{+}s$ pair creation", ("a", "s"), True),
-    ("b+s pair creation", r"$b{+}s$ pair creation", ("b", "s"), True),
-    ("a+b pair creation", r"$a{+}b$ pair creation", ("a", "b"), False),
+    ("SNAIL excitation", r"$\omega_s$", ("s",), True),
+    ("qubit a excitation", r"$\omega_a$", ("a",), False),
+    ("qubit b excitation", r"$\omega_b$", ("b",), False),
+    ("a->s conversion", r"$a\!\to\!s$", ("s", "-a"), True),
+    ("b->s conversion", r"$b\!\to\!s$", ("s", "-b"), True),
+    ("a->b exchange", r"$a\!\to\!b$", ("b", "-a"), False),
+    ("a+s pair creation", r"$a{+}s$", ("a", "s"), True),
+    ("b+s pair creation", r"$b{+}s$", ("b", "s"), True),
+    ("a+b pair creation", r"$a{+}b$", ("a", "b"), False),
 )
 
 
@@ -396,8 +463,9 @@ def collision_landmarks(config: Dict[str, Any], *, branch: str = "above",
     -------
     list of dict
         ``delta_sub_GHz``, ``w_p_GHz``, ``w_b_GHz``, ``n_pump``, ``name`` (plain,
-        for a terminal), ``label`` (mathtext, for the figure) and ``coupler``
-        (bool), sorted by ``delta_sub_GHz``. Deduplicated on
+        for a terminal), ``label`` (a SHORT mathtext chip -- it is drawn over the
+        cells, where a sentence is noise) and ``coupler`` (bool), sorted by
+        ``delta_sub_GHz``. Deduplicated on
         ``Delta_sub``, keeping the lowest pump order (the strongest process) and
         preferring a coupler-exciting label, since a coincidence there is the
         physically relevant one.
@@ -436,9 +504,33 @@ def collision_landmarks(config: Dict[str, Any], *, branch: str = "above",
     return sorted(found.values(), key=lambda r: r["delta_sub_GHz"])
 
 
+def landmarks_from_settings(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Re-derive :func:`collision_landmarks` from a document's ``settings``.
+
+    ``w_a``, ``w_s`` and the branch are all the solve depends on, and all three
+    are recorded, so a document written by an older version -- or one whose
+    labels have since been reworded -- can be re-read rather than re-solved.
+    The partner frequency is not needed: along this axis it IS the variable.
+    """
+    return collision_landmarks(
+        {"qubit_freqs_GHz": [float(settings["w_a_GHz"]),
+                             float(settings["w_a_GHz"])],
+         "coupler_freq_GHz": float(settings["w_s_GHz"])},
+        branch=str(settings.get("branch", "above")))
+
+
 def nearest_landmark(landmarks: Sequence[Dict[str, Any]], delta_sub_GHz: float,
                      *, skip_origin: bool = True) -> Optional[Dict[str, Any]]:
     """The landmark closest to `delta_sub_GHz`, with its signed distance.
+
+    Two distances come back, and the SMALLER one is the one that matters:
+
+    * ``distance_GHz`` -- along this figure's axis, ``Delta_sub``.
+    * ``detuning_GHz`` -- how far the spurious channel actually sits off
+      resonance, which is the distance in ``w_p``. Since
+      ``Delta_sub = w_s - 2 w_p``, that is HALF the axis distance. A column
+      reading "500 MHz clear" on the axis is a channel detuned by only 250 MHz,
+      and it is the latter that appears in ``|Omega/Delta|``.
 
     The subharmonic itself (``Delta_sub = 0``) is skipped by default: it is the
     axis, not a contaminant.
@@ -449,7 +541,7 @@ def nearest_landmark(landmarks: Sequence[Dict[str, Any]], delta_sub_GHz: float,
             continue
         d = float(delta_sub_GHz) - float(lm["delta_sub_GHz"])
         if best is None or abs(d) < abs(best["distance_GHz"]):
-            best = dict(lm, distance_GHz=float(d))
+            best = dict(lm, distance_GHz=float(d), detuning_GHz=float(d) / 2.0)
     return best
 
 
@@ -614,12 +706,23 @@ def _calib_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _cell_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """One cell's score, exceptions captured as data."""
+    """One cell's score, exceptions captured as data.
+
+    ``payload["gpu"]`` routes this cell through qutip-jax / diffrax. The caller
+    must run GPU payloads with ONE worker, i.e. in this process: a CUDA context
+    does not survive a fork, and several processes would contend for one device
+    anyway. :func:`_run_pool` at ``workers=1`` runs in-process, which is what
+    :func:`run_convergence_map` relies on.
+    """
     try:
+        if payload.get("gpu"):
+            from snail_solver import zhou_coupler
+            zhou_coupler.use_gpu(True)
         t0 = time.perf_counter()
         cell = score_cell(payload["config"], payload["delta_sub_GHz"],
                           payload["levels"], payload["record"], **payload["kw"])
         cell["seconds"] = time.perf_counter() - t0
+        cell["engine"] = "gpu" if payload.get("gpu") else "cpu"
         return {"ok": True, "cell": cell}
     except Exception as exc:
         return {"ok": False, "levels": payload["levels"],
@@ -697,6 +800,7 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
                         calib_levels: Optional[int] = None,
                         recalibrate_per_cell: bool = False,
                         tol: float = DEFAULT_TOL,
+                        gpu_levels_min: Optional[int] = None,
                         chirp_coeffs_GHz: Sequence[float] = (),
                         wp_points: int = 41, wp_span_MHz: Optional[float] = None,
                         span_linewidths: float = 4.0, n_time: int = 161,
@@ -798,6 +902,9 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
 
     def _cell_expect(delta: float, lvls: int,
                      rec: Dict[str, Any]) -> Dict[str, Any]:
+        # NB `engine` is recorded but deliberately not required to match: the two
+        # backends integrate the same Hamiltonian to the same tolerances, so a
+        # cached CPU cell is still valid when this run would have used the GPU.
         # The operating point ties a cell to the calibration it was scored at, so
         # a re-calibrated column re-scores rather than reusing stale cells.
         return {"delta_sub_GHz": float(delta), "levels": int(lvls),
@@ -887,7 +994,13 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
                                            f"{ref} levels"}
 
     # ---- phase B: one score per cell -------------------------------------
-    want, payloads = [], []
+    # Two batches, because the big truncations belong on the GPU and the small
+    # ones belong in the CPU pool: a dim-162 propagator is where qutip-jax /
+    # diffrax pays off, while a dim-27 one is dominated by dispatch and is far
+    # better off as one of N parallel processes. GPU LAST and single-worker --
+    # `use_gpu` in the parent is permanent, and a CUDA context does not survive
+    # the fork the CPU pool needs.
+    cpu_want, cpu_payloads, gpu_want, gpu_payloads = [], [], [], []
     for col in [c for c in columns if c["ok"]]:
         for N in lv:
             rec = (col["calibration_per_cell"].get(str(N))
@@ -900,13 +1013,22 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
             if got is not None:
                 col["cells"].append(got)
                 continue
-            want.append((col, path))
-            payloads.append({"config": config, "delta_sub_GHz": col["delta_sub_GHz"],
-                             "levels": int(N), "record": rec, "kw": cell_kw})
-    if payloads:
-        log.info(f"phase B: scoring {len(payloads)} cell(s) over "
-                 f"{min(n_jobs, len(payloads))} worker(s)")
-        got = _run_pool(_cell_worker, payloads, min(n_jobs, len(payloads)))
+            on_gpu = (gpu_levels_min is not None and int(N) >= int(gpu_levels_min))
+            payload = {"config": config, "delta_sub_GHz": col["delta_sub_GHz"],
+                       "levels": int(N), "record": rec, "kw": cell_kw,
+                       "gpu": bool(on_gpu)}
+            (gpu_want if on_gpu else cpu_want).append((col, path))
+            (gpu_payloads if on_gpu else cpu_payloads).append(payload)
+
+    for tag, want, payloads, workers in (
+            ("CPU", cpu_want, cpu_payloads, min(n_jobs, max(1, len(cpu_payloads)))),
+            ("GPU", gpu_want, gpu_payloads, 1)):
+        if not payloads:
+            continue
+        log.info(f"phase B ({tag}): scoring {len(payloads)} cell(s) over "
+                 f"{workers} worker(s)"
+                 + (f", levels >= {gpu_levels_min}" if tag == "GPU" else ""))
+        got = _run_pool(_cell_worker, payloads, workers)
         for (col, path), res in zip(want, got):
             if not res["ok"]:
                 col.setdefault("cell_errors", []).append(res)
@@ -946,6 +1068,7 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
             "span_linewidths": span_linewidths, "n_time": n_time,
             "tg_points": tg_points, "tg_lo": tg_lo, "tg_hi": tg_hi,
             "passes": passes, "occupation": bool(occupation),
+            "gpu_levels_min": gpu_levels_min,
             "fit_virtual_z": bool(fit_virtual_z), "jobs": n_jobs,
             "solver": solver, "qubit_levels": config.get("qubit_levels"),
             "device_delta_sub_GHz": float(subharmonic_detuning_GHz(config)),
@@ -956,6 +1079,7 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
         "columns": columns,
     }
     doc["boundary"] = convergence_boundary(doc)
+    doc["boundary_signed"] = boundary_by_branch(doc)
     n_ok = sum(1 for c in columns if c["ok"])
     doc["summary"] = {
         "n_columns": len(columns), "n_ok": n_ok,
@@ -966,45 +1090,88 @@ def run_convergence_map(config: Dict[str, Any], detunings: Sequence[float],
     return doc
 
 
-def convergence_boundary(doc: Dict[str, Any],
-                         tol: Optional[float] = None) -> Dict[str, Any]:
+def convergence_boundary(doc: Dict[str, Any], tol: Optional[float] = None,
+                         *, sign: int = 0) -> Dict[str, Any]:
     """Per truncation, the smallest ``|Delta_sub|`` from which it stays converged.
 
-    Defined from the FAR end inward: walk the columns in decreasing
-    ``|Delta_sub|`` while every cell at that truncation agrees with the reference,
-    and report the last one. A single converged cell sitting inside a
-    non-converged run is not a boundary -- next to a collision the spread can dip
-    through the tolerance by cancellation, and quoting that as "converged here"
-    is exactly the truncation-as-regularizer trap this module exists to expose.
+    Read from the FAR end inward: walk the rungs in decreasing ``|Delta_sub|``
+    while every cell at that truncation agrees with the reference, and report the
+    last one. A single converged cell sitting inside a non-converged run is not a
+    boundary -- next to a collision the spread can dip through the tolerance by
+    cancellation, and quoting that as "converged here" is exactly the
+    truncation-as-regularizer trap this module exists to expose.
+
+    A RUNG is one ``|Delta_sub|``, not one column. On a two-sided grid the
+    mirrored pair share a rung, and it passes only if BOTH pass: the coordinate
+    here is a distance from the subharmonic, so "converged from 0.25 GHz out"
+    has to mean converged at 0.25 on either side. Treating the two as separate
+    rungs let the walk count the good one and report its ``|Delta_sub|`` while
+    its mirror image failed at the same distance -- measured on the mirror run,
+    where 7 levels was reported converged from 0.25 GHz while the +0.25 column
+    was off by 0.36.
+
+    Parameters
+    ----------
+    sign : int, default 0
+        ``0`` uses every column. ``+1`` / ``-1`` restrict to one branch of the
+        axis, which is what to read when the two sides do not behave alike; see
+        :func:`format_mirror`.
 
     Returns
     -------
     dict
         ``{str(levels): {"delta_sub_GHz": float or None, "n_converged": int,
-        "n_scored": int}}``. ``None`` means the truncation never held anywhere on
-        the sampled axis.
+        "n_converged_any": int, "n_scored": int, "is_reference": bool}}``, counted
+        in RUNGS. ``None`` means the truncation never held anywhere sampled.
     """
     tol = float(doc["settings"]["tol"] if tol is None else tol)
     ref = int(doc["settings"]["ref_levels"])
     out: Dict[str, Any] = {}
     for N in [int(v) for v in doc["settings"]["levels"]]:
-        pairs = []
+        rungs: Dict[float, List[float]] = {}
         for col in doc["columns"]:
+            d = float(col["delta_sub_GHz"])
+            if sign > 0 and d < 0:
+                continue
+            if sign < 0 and d > 0:
+                continue
             for c in col["cells"]:
                 if int(c["levels"]) == N and c.get("spread") is not None:
-                    pairs.append((abs(float(col["delta_sub_GHz"])),
-                                  float(c["spread"])))
-        pairs.sort(key=lambda p: p[0])
+                    rungs.setdefault(round(abs(d), 9), []).append(float(c["spread"]))
+        ordered = sorted(rungs.items())
         edge: Optional[float] = None
         n_conv = 0
-        for absd, spread in reversed(pairs):        # from the far end inward
-            if spread > tol:
-                break
+        for absd, spreads in reversed(ordered):     # from the far end inward
+            if max(spreads) > tol:                 # the rung is only as good as
+                break                              # its worst column
             edge, n_conv = absd, n_conv + 1
-        out[str(N)] = {"delta_sub_GHz": edge, "n_converged": int(n_conv),
-                       "n_scored": len(pairs),
-                       "is_reference": bool(N == ref)}
+        out[str(N)] = {
+            "delta_sub_GHz": edge, "n_converged": int(n_conv),
+            # Also count the rungs that pass INDIVIDUALLY. One anomalous outermost
+            # rung makes the contiguous run empty, and reporting only that reads
+            # as "this truncation never works", which is a different claim --
+            # measured at eta = 0.6, where 3 levels agrees to 4e-5 at
+            # Delta_sub = 0.538 GHz while the outermost column disagrees by 8e-3.
+            "n_converged_any": int(sum(1 for _, sp in ordered
+                                       if max(sp) <= tol)),
+            "n_scored": len(ordered), "is_reference": bool(N == ref)}
     return out
+
+
+def boundary_by_branch(doc: Dict[str, Any],
+                       tol: Optional[float] = None) -> Dict[str, Any]:
+    """Per-branch boundaries, or ``{}`` when the grid is one-sided.
+
+    The two sides of the subharmonic need not behave alike -- measured, they do
+    not -- so on a two-sided grid the single ``|Delta_sub|`` boundary is the
+    conservative envelope of two different answers, and both are worth having.
+    """
+    signs = {int(np.sign(float(c["delta_sub_GHz"]))) for c in doc["columns"]
+             if c.get("cells")}
+    if not ({+1, -1} <= signs):
+        return {}
+    return {"positive": convergence_boundary(doc, tol, sign=+1),
+            "negative": convergence_boundary(doc, tol, sign=-1)}
 
 
 # ===========================================================================
@@ -1018,28 +1185,61 @@ def plot_convergence_map(doc: Dict[str, Any],
                          health_min: float = DEFAULT_HEALTH_MIN) -> str:
     r"""Coupler levels vs subharmonic detuning, coloured by fidelity.
 
-    (a) The map. One cell per (``Delta_sub``, ``coupler_levels``), coloured by
+    Two panels sharing one x axis, and one visual role per colour: the map's
+    colour carries the fidelity, everything drawn ON the map is structure in ink,
+    red means only that a calibration failed, and the two hues belong to the two
+    series in the lower panel. Nothing has to be looked up twice.
+
+    Under the shared ``Delta_sub`` axis runs a second scale in ``|alpha|``, the
+    displacement ``3 g3 eta^2 / Delta_sub``. That is the coordinate convergence
+    actually tracks, so it is the only axis on which two runs at DIFFERENT drives
+    can be compared: the same ``|alpha|`` tick means the same physics in every
+    figure, where the same ``Delta_sub`` does not.
+
+    (a) The map -- one cell per (``Delta_sub``, ``coupler_levels``), coloured by
         ``1 - F_avg`` on a log scale (the repo's fidelity-heatmap encoding, as in
-        ``plot_results``/``plot_fidelity_map``: perceptually uniform, dark = good)
-        and labelled with ``F_avg`` itself. Cells whose ``|F(N) - F(N_ref)|``
-        exceeds the tolerance are hatched -- those are the truncations that are
-        still lying -- and the staircase traces the convergence boundary (drawn
-        only on a one-sided axis: the boundary is a distance ``|Delta_sub|``, so a
-        grid straddling the resonance has one per side, and the hatching carries
-        it instead). The
-        reference row is marked, since it cannot disagree with itself. Dashed rules
-        mark where OTHER processes become resonant along the axis (red when they
-        excite the SNAIL), because a dip there is a collision, not a truncation
-        failure. The blue curve is the analytic ``|alpha|^2 + 4|alpha| + 1`` level
-        count. A red rug along the bottom edge marks a column whose
-        CALIBRATION failed (``transfer < health_min``): its cells all score
-        one bad operating point, so its spread says nothing about the
-        truncation.
+        ``plot_results`` / ``plot_fidelity_map``: perceptually uniform, dark =
+        good) and labelled with ``F_avg``.
+
+        * greyed cells -- ``|F(N) - F(N_ref)|`` exceeds the tolerance: the
+          truncations that are still lying. Their fidelity is not a fidelity, so
+          it is not given full colour.
+        * a black outline -- the converged region, every edge it shares with a
+          greyed cell or with the outside, so a region with a hole in it is drawn
+          as it is. The per-row numeric answer is repeated at the right edge.
+        * the reference row -- plain: full colour, no outline, no veil. It agrees
+          with itself by construction.
+        * grey rules (dash-dotted when they excite the SNAIL) -- where ANOTHER
+          process is resonant. A dip there is a collision, not a truncation
+          failure. They are drawn unlabelled on purpose: :func:`format_map` and
+          the ``landmarks`` block in the JSON name each one, and a chip over the
+          cells is unreadable at any size the figure is actually viewed at.
+
+        The ``|alpha|^2 + 4|alpha| + 1`` level-count estimate is NOT drawn here.
+        It is a scaling argument that this device's measurement contradicts on
+        one branch, and over the cells it read as something the data was being
+        scored against. :func:`describe_grid` reports it per column as
+        ``N_pred``.
+        * a red rug on the bottom edge -- this column's CALIBRATION failed
+          (``transfer < health_min``), so all of its cells score one bad
+          operating point and its spread says nothing about the truncation.
 
     (b) Coupler occupation, predicted against measured, on one axis in one unit
-        (photons): ``|alpha|^2 = (3 g3 eta^2 / Delta_sub)^2`` and the ``<n_s>`` the
-        reference truncation actually reaches at ``t_g``. Where these part company
-        the displacement picture has stopped being the whole story.
+        (PHOTONS). The subharmonic term is a linear drive on the coupler, so its
+        forced response is a coherent displacement of amplitude
+        ``alpha = Omega/Delta_sub = 3 g3 eta^2 / Delta_sub`` -- dimensionless --
+        and the occupation that displacement implies is ``|alpha|^2``. That is
+        what makes it comparable with ``<n_s>``, the occupation the reference
+        truncation actually reaches at ``t_g``; plotting ``|alpha|`` here would
+        put an amplitude against a photon number. Where the two part
+        company the displacement picture has stopped being the whole story.
+
+        ``<n_s>`` is read at ``t_g``, where the forced response has partly
+        returned -- the leakage analysis measured 2.36 quanta mid-gate against
+        0.95 at ``t_g`` -- so it is a LOWER bound on what the ladder had to hold
+        during the pulse, and it sits under ``|alpha|^2`` for that reason alone.
+        It also comes from the calibrated pulse, so a rugged column is not
+        running the gate this curve assumes.
 
     Raises
     ------
@@ -1052,6 +1252,7 @@ def plot_convergence_map(doc: Dict[str, Any],
     import matplotlib.pyplot as plt
     from matplotlib import patheffects as pe
     from matplotlib.colors import LogNorm
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle
     try:
         from snail_solver.plot_results import set_literature_style
@@ -1079,13 +1280,38 @@ def plot_convergence_map(doc: Dict[str, Any],
             if c.get("spread") is not None:
                 spread[i, j] = float(c["spread"])
 
-    # x edges: midpoints, in whatever space the axis is drawn in, with the outer
+    # x edges: midpoints in whatever space the axis is drawn in, with the outer
     # edges mirrored so the first and last cells are as wide as their neighbours.
-    if xscale is None:
-        xscale = "log" if (np.all(x > 0) or np.all(x < 0)) and x.size > 1 else "linear"
     same_sign = bool(np.all(x > 0) or np.all(x < 0))
+    if xscale is None:
+        # A two-sided grid on a LINEAR axis crams every interesting column into a
+        # sliver either side of zero (measured: 15 columns over [-2, +0.63] put
+        # the six that matter inside 4% of the width). Symlog keeps the physical
+        # positions -- so the collision rules still land truthfully -- while
+        # giving the mirrored pairs comparable width.
+        # A two-sided grid gets EQUAL-WIDTH columns. Drawn to physical scale it
+        # is unreadable whatever the scale: |Delta_sub| spans 0.06 to 2.0 GHz, so
+        # linear collapses the six inner columns into a smear, and symlog only
+        # moves the crowding around (measured: the +/-0.06 and +/-0.10 cells came
+        # out ~8 px wide, below the width of their own labels). The detunings are
+        # not lost -- they are the tick labels, with |alpha| on a second row.
+        xscale = "log" if same_sign and x.size > 1 else "index"
     use_log = (xscale == "log" and same_sign)
+    use_symlog = (xscale == "symlog" and x.size > 1)
+    categorical = (xscale == "index" and x.size > 1)
     sign = 1.0 if np.all(x >= 0) else -1.0
+    linthresh = float(np.min(np.abs(x[np.abs(x) > 0]))) if np.any(x) else 1.0
+
+    if use_symlog:
+        from matplotlib.scale import SymmetricalLogTransform
+        _fwd = SymmetricalLogTransform(10, linthresh, 1.0)
+        _inv = _fwd.inverted()
+
+        def _to(v):
+            return _fwd.transform(np.asarray(v, float).reshape(-1, 1)).ravel()
+
+        def _from(u):
+            return _inv.transform(np.asarray(u, float).reshape(-1, 1)).ravel()
 
     def _edges(v: np.ndarray) -> np.ndarray:
         if v.size == 1:
@@ -1096,182 +1322,332 @@ def plot_convergence_map(doc: Dict[str, Any],
             mid = 0.5 * (u[:-1] + u[1:])
             return sign * np.exp(np.concatenate(
                 ([u[0] - (mid[0] - u[0])], mid, [u[-1] + (u[-1] - mid[-1])])))
+        if use_symlog:
+            # Midpoints in the coordinate the axis is actually drawn in, so the
+            # cells tile without gaps and the pair straddling zero meets at 0.
+            u = _to(v)
+            mid = 0.5 * (u[:-1] + u[1:])
+            return _from(np.concatenate(
+                ([u[0] - (mid[0] - u[0])], mid, [u[-1] + (u[-1] - mid[-1])])))
         mid = 0.5 * (v[:-1] + v[1:])
         return np.concatenate(([v[0] - (mid[0] - v[0])], mid,
                                [v[-1] + (v[-1] - mid[-1])]))
 
-    xe = _edges(x)
+    if categorical:
+        xpos = np.arange(len(cols), dtype=float)
+        xe = np.arange(len(cols) + 1, dtype=float) - 0.5
+    else:
+        xpos = x
+        xe = _edges(x)
+
+    def _to_axis(v):
+        """Physical ``Delta_sub`` -> the coordinate the axis is drawn in.
+
+        Identity unless the columns are categorical, in which case it is the
+        (linear) interpolation onto column index. Values outside the sampled
+        range come back NaN, so a landmark off the axis is simply not drawn.
+        """
+        if not categorical:
+            return v
+        return np.interp(v, x, xpos, left=np.nan, right=np.nan)
+
     ye = np.arange(len(lv) + 1, dtype=float) - 0.5
+    halo = [pe.withStroke(linewidth=2.6, foreground="white")]
 
     fig, (ax, axn) = plt.subplots(
-        2, 1, figsize=(7.6, 6.6), sharex=True, layout="constrained",
-        gridspec_kw={"height_ratios": [3.0, 1.0]})
+        2, 1, figsize=(7.8, 6.4), sharex=True, layout="constrained",
+        gridspec_kw={"height_ratios": [3.2, 1.0]})
 
     # -- (a) the map -------------------------------------------------------
     infid = np.clip(1.0 - F, 1e-5, 1.0)
     finite = infid[np.isfinite(infid)]
     vmin = max(float(np.nanmin(finite)) * 0.7, 1e-5) if finite.size else 1e-4
     vmax = min(max(float(np.nanmax(finite)) * 1.4, vmin * 10.0), 1.0)
-    # a cell whose solve failed is grey, never a colour that reads as a fidelity
     cmap = plt.get_cmap("magma").with_extremes(bad="0.85")
     norm = LogNorm(vmin=vmin, vmax=vmax)
     im = ax.pcolormesh(xe, ye, np.ma.masked_invalid(infid), shading="flat",
                        cmap=cmap, norm=norm)
-    cb = fig.colorbar(im, ax=[ax, axn], shrink=0.62, pad=0.015, aspect=28,
+    cb = fig.colorbar(im, ax=[ax, axn], shrink=0.55, pad=0.012, aspect=26,
                       location="right")
     cb.set_label(r"$1 - F_{\mathrm{avg}}$")
 
     if use_log:
         ax.set_xscale("log")
+    elif use_symlog:
+        ax.set_xscale("symlog", linthresh=linthresh, linscale=0.6)
     ax.set_yticks(np.arange(len(lv)))
-    ax.set_yticklabels([f"{N}" + ("  (ref)" if N == ref else "") for N in lv])
+    ax.set_yticklabels([f"{N}" + ("  ref" if N == ref else "") for N in lv])
     ax.set_ylabel("coupler levels")
     ax.set_ylim(ye[0], ye[-1])
-    ax.set_title(title or (
-        r"Truncation convergence vs distance from the SNAIL subharmonic"
-        f"  ($|\\eta^*|$ = {st['target_eta']:g}, tol = {tol:g})"))
+    ax.set_title(title or
+                 (r"Coupler truncation vs distance from the SNAIL subharmonic"
+                  f"    $|\\eta^*|$ = {st['target_eta']:g}"))
 
-    # cell labels + hatching for the ones that still disagree with the reference
+    # cell labels, sized for the grid: 13 columns of 3 decimals is the point at
+    # which the numbers stop being readable and start being texture.
+    # Size the cell labels to the NARROWEST column, not to the column count: on a
+    # symlog axis the columns are not equally wide, and a count-based size
+    # overlapped the outermost pair. Below ~4 pt the numbers stop being readable
+    # and become texture, so drop them instead.
+    fig.canvas.draw()                       # transforms need a laid-out figure
+    _px = ax.transData.transform(np.column_stack([xe, np.zeros_like(xe)]))[:, 0]
+    _narrow = float(np.min(np.diff(_px))) if _px.size > 1 else 60.0
+    fs_auto = float(np.clip(_narrow / 6.2, 3.0, 6.6))
+
+    # WHICH CELLS ARE TRUSTWORTHY is the answer the figure exists to give, so it
+    # gets the strongest encoding available on top of a heatmap: the cells that
+    # do NOT agree with the reference are greyed out, and the region that does is
+    # outlined. Hatching them instead put stripes next to solid colour, which
+    # competes with the fidelity ramp rather than reading over it -- and a veil
+    # is also the honest rendering, since a non-converged cell's fidelity is not
+    # a fidelity.
+    ok_cell = np.isfinite(F) & np.isfinite(spread) & (spread <= tol)
+    # The reference row agrees with itself by construction, so outlining it would
+    # claim a measurement that was never made. It is drawn plain: full colour, no
+    # outline, no veil -- it is the yardstick, not a result.
+    i_ref = lv.index(ref)
+    is_ref = np.zeros_like(ok_cell)
+    is_ref[i_ref, :] = True
+    ok_cell &= ~is_ref
+    fs = fs_auto
+    if annotate and fs < 4.0:
+        annotate = False                    # texture, not information
+    n_veiled = 0
     for i in range(len(lv)):
         for j in range(len(cols)):
             if not np.isfinite(F[i, j]):
                 continue
-            rgba = cmap(norm(infid[i, j]))
-            lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
-            if annotate:
-                ax.text(x[j], i, f"{F[i, j]:.3f}", ha="center", va="center",
-                        fontsize=6.4, color=("white" if lum < 0.55 else "0.12"))
-            bad = (np.isfinite(spread[i, j]) and spread[i, j] > tol)
-            if bad:
+            veiled = not (ok_cell[i, j] or is_ref[i, j])
+            if veiled:
+                n_veiled += 1
+                # Blend toward mid grey, not white: a light cell darkens and a
+                # dark cell lightens, so both land on "do not trust" instead of
+                # one of them landing on the colour of a missing cell.
                 ax.add_patch(Rectangle(
-                    (xe[j], ye[i]), xe[j + 1] - xe[j], 1.0, facecolor="none",
-                    edgecolor=(0.55, 0.55, 0.55, 0.95), hatch="//////", lw=0.0,
-                    zorder=2.5))
+                    (xe[j], ye[i]), xe[j + 1] - xe[j], 1.0, lw=0.0,
+                    facecolor=(0.62, 0.61, 0.60, 0.62), edgecolor="none",
+                    zorder=2.4))
+            if annotate:
+                rgba = cmap(norm(infid[i, j]))
+                lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+                colour = ("0.22" if veiled
+                          else ("white" if lum < 0.55 else "0.12"))
+                ax.text(xpos[j], i, f"{F[i, j]:.3f}", ha="center", va="center",
+                        fontsize=fs, color=colour, zorder=2.6,
+                        alpha=(0.85 if veiled else 1.0))
 
-    # the boundary staircase: the left edge of the first converged cell per row
-    halo = [pe.withStroke(linewidth=3.4, foreground="white")]
-    verts: List[Tuple[float, float]] = []
-    for i, N in enumerate(lv if same_sign else []):
-        row = doc.get("boundary", {}).get(str(N), {})
-        b = row.get("delta_sub_GHz")
-        # The reference row cannot disagree with itself, so its "boundary" is the
-        # whole axis and drawing it would imply a measurement that was never made.
-        if b is None or row.get("is_reference"):
-            continue
-        j = int(np.argmin(np.abs(np.abs(x) - float(b))))
-        left = xe[j] if sign > 0 else xe[j + 1]
-        verts.append((left, ye[i]))
-        verts.append((left, ye[i + 1]))
-    if not same_sign:
-        ax.annotate("axis straddles the resonance: the boundary is a distance "
-                    "|$\\Delta_{\\rm sub}$|, one per side -- read the hatching",
-                    (0.5, 1.0), xycoords="axes fraction", ha="center", va="bottom",
-                    fontsize=6.5, color=_C_INK)
-    if len(verts) >= 2:
-        vx = [v[0] for v in verts]
-        vy = [v[1] for v in verts]
-        ax.plot(vx, vy, "-", color="#111111", lw=1.8, zorder=4,
-                path_effects=halo, solid_joinstyle="miter",
-                label="convergence boundary")
+    # One outline around the converged REGION -- every edge it shares with a
+    # non-converged cell or with the outside. A staircase could only mark the
+    # leftmost converged cell per row, which silently misdraws a region with a
+    # hole in it (measured: at eta = 0.6, 7 and 9 levels converge at
+    # Delta_sub = 0.538 but not at 0.800, the column further out).
+    edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    for i in range(len(lv)):
+        for j in range(len(cols)):
+            if not ok_cell[i, j]:
+                continue
+            x0, x1, y0, y1 = xe[j], xe[j + 1], ye[i], ye[i + 1]
+            if j == 0 or not ok_cell[i, j - 1]:
+                edges.append(((x0, y0), (x0, y1)))
+            if j == len(cols) - 1 or not ok_cell[i, j + 1]:
+                edges.append(((x1, y0), (x1, y1)))
+            if i == 0 or not ok_cell[i - 1, j]:
+                edges.append(((x0, y0), (x1, y0)))
+            if i == len(lv) - 1 or not ok_cell[i + 1, j]:
+                edges.append(((x0, y1), (x1, y1)))
+    for (px0, py0), (px1, py1) in edges:
+        ax.plot([px0, px1], [py0, py1], "-", color="#111111", lw=1.7, zorder=4,
+                solid_capstyle="projecting",
+                path_effects=[pe.withStroke(linewidth=3.3, foreground="white")])
 
-    # where OTHER processes become resonant on this axis
-    lo, hi = min(xe[0], xe[-1]), max(xe[0], xe[-1])
+    # where ANOTHER process is resonant: structure, so grey -- and dash-dotted
+    # when it excites the SNAIL, which is the case that also breaks truncation.
+    lo, hi = ((float(np.min(x)), float(np.max(x))) if categorical
+              else (min(xe[0], xe[-1]), max(xe[0], xe[-1])))
+    n_rules = 0
     for lm in doc.get("landmarks", []):
         d = float(lm["delta_sub_GHz"])
         if not (lo < d < hi) or abs(d) < 1e-9:
             continue
-        colour = _C_COUPLER if lm.get("coupler") else _C_QUBIT
+        d = float(_to_axis(d))
+        if not np.isfinite(d):
+            continue
+        on_s = bool(lm.get("coupler"))
+        n_rules += 1
+        # The rule alone, unlabelled. A chip naming the process is a rotated
+        # 6-point smudge over the cells at any realistic figure size, and the
+        # dash pattern already separates the case that matters (it excites the
+        # SNAIL) from the case that does not. Which process, exactly, is in
+        # `format_map`'s landmark table and in the document's `landmarks` block.
         for a in (ax, axn):
-            a.axvline(d, ls="--", lw=1.0, color=colour, alpha=0.75, zorder=3)
-        ax.annotate(f"{lm.get('label') or lm['name']} ({lm['n_pump']}p)",
-                    (d, ye[-1]),
-                    textcoords="offset points", xytext=(-3, -4), ha="right",
-                    va="top", rotation=90, fontsize=6, color=colour,
-                    # a chip, not a halo: the rule crosses cells at both ends of
-                    # the colour ramp, and a white stroke reads as a smudge on the
-                    # dark (good-fidelity) end.
-                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.78,
-                              pad=1.0))
+            a.axvline(d, ls=("-." if on_s else "--"), lw=1.0, zorder=3,
+                      color=(_C_RULE_S if on_s else _C_RULE))
 
-    # the analytic level count, in the same categorical y coordinates
+    # The `|alpha|^2 + 4|alpha| + 1` level-count estimate is deliberately NOT
+    # drawn on the map. It is a scaling argument, and on this device it is out by
+    # ~2x in Delta_sub and on the wrong branch entirely -- it predicts damage
+    # symmetric in |Delta_sub| where the measurement finds it only for
+    # 2 w_p < w_s. Overlaid on the cells it read as a prediction the data was
+    # being judged against. It is still computed, and reported as `N_pred` per
+    # column by :func:`describe_grid`, which is where a scaling estimate belongs.
     eta = float(st["target_eta"])
     g3 = float(st["g3_GHz"])
-    dd = (np.geomspace(abs(x[0]), abs(x[-1]), 200) * sign if use_log and x.size > 1
-          else np.linspace(x[0], x[-1], 200))
-    n_pred = np.array([predicted_levels(3.0 * g3 * eta ** 2 / max(abs(v), 1e-12))
-                       for v in dd])
-    y_pred = np.interp(n_pred, lv, np.arange(len(lv)),
-                       left=np.nan, right=np.nan)
-    ax.plot(dd, y_pred, "-", color=_C_PRED, lw=1.4, alpha=0.95, zorder=3.5,
-            path_effects=[pe.withStroke(linewidth=2.6, foreground="white")],
-            label=r"$|\alpha|^2+4|\alpha|+1$")
+    # The dense grid the lower panel's |alpha|^2 curve is drawn on.
+    if categorical:
+        # AT the columns, not between them: with equal-width cells the space
+        # between two columns is not a detuning, and interpolating the 1/Delta
+        # cusp across the pair straddling zero draws a smear that reads as data.
+        dd = x.copy()
+    elif use_log and x.size > 1:
+        dd = np.geomspace(abs(x[0]), abs(x[-1]), 200) * sign
+    elif use_symlog:
+        dd = _from(np.linspace(_to(x)[0], _to(x)[-1], 400))
+        dd = dd[np.abs(dd) > 1e-9]
+    else:
+        dd = np.linspace(x[0], x[-1], 200)
 
-    # A rug along the bottom edge for columns whose CALIBRATION failed. Without
-    # it a scattered column reads as a truncation failure, when the cells are
-    # really all scoring one bad operating point (a length scan that landed on
-    # the wrong branch, say).
+    # A rug on the bottom edge for columns whose CALIBRATION failed. Without it a
+    # scattered column reads as a truncation failure, when its cells are really
+    # all scoring one bad operating point (a length scan that landed on the wrong
+    # branch, say). Red appears nowhere else in the figure.
     sick = [j for j, c in enumerate(cols)
             if float((c.get("calibration") or {}).get("transfer", 1.0)) < health_min]
     for j in sick:
-        ax.plot([xe[j], xe[j + 1]], [ye[0]] * 2, "-", color=_C_COUPLER, lw=3.2,
-                solid_capstyle="butt", zorder=6, clip_on=False,
-                label=(rf"calibrated transfer $< {health_min:g}$"
-                       if j == sick[0] else None))
-
-    # the device's own placement
-    d_dev = float(st.get("device_delta_sub_GHz", np.nan))
-    if np.isfinite(d_dev) and lo < d_dev < hi:
-        ax.plot([d_dev], [ye[0]], "^", ms=8, color="#111111", clip_on=False,
-                zorder=5, label="this device")
-
-    map_handles, map_labels = ax.get_legend_handles_labels()
-    map_handles = list(map_handles) + [
-        Rectangle((0, 0), 1, 1, facecolor="none",
-                  edgecolor=(0.45, 0.45, 0.45, 1.0), hatch="//////")]
-    map_labels = list(map_labels) + [rf"$|F(N)-F({ref})| > {tol:g}$"]
+        ax.plot([xe[j], xe[j + 1]], [ye[0]] * 2, "-", color=_C_BAD, lw=3.4,
+                solid_capstyle="butt", zorder=6, clip_on=False)
 
     if annotate:
         for i, N in enumerate(lv):
             b = doc.get("boundary", {}).get(str(N), {}).get("delta_sub_GHz")
-            txt = (r"$\geq$" + f"{b:.2f}" if b is not None else "never")
-            ax.annotate(txt if N != ref else "ref", (1.005, i),
-                        xycoords=("axes fraction", "data"), ha="left",
-                        va="center", fontsize=6.4, color=_C_INK)
+            txt = ("ref" if N == ref else
+                   (r"$\geq$" + f"{b:.2f}" if b is not None else "none"))
+            ax.annotate(txt, (1.004, i), xycoords=("axes fraction", "data"),
+                        ha="left", va="center", fontsize=6.2, color=_C_INK)
 
     # -- (b) coupler occupation, predicted vs measured ---------------------
     alpha2 = np.array([(3.0 * g3 * eta ** 2 / max(abs(v), 1e-12)) ** 2
                        for v in dd])
-    axn.plot(dd, alpha2, "-", color=_C_PRED, lw=1.6,
-             label=r"$|\alpha|^2 = (3g_3\eta^2/\Delta_{\rm sub})^2$")
+    # Named as the OCCUPATION it predicts, not as the algebra. This panel's unit
+    # is photons, and a coherent state of amplitude alpha holds <n> = |alpha|^2 --
+    # but |alpha| is also the second tick row, so without the bridge in the label
+    # the same symbol appears as two quantities within a centimetre of each other.
+    axn.plot(_to_axis(dd), alpha2, "-", color=_C_PRED, lw=1.8,
+             label=r"predicted $\langle n_s\rangle = |\alpha|^2$")
     n_meas = np.array([
         next((float(c["n_coupler"]) for c in col["cells"]
               if int(c["levels"]) == ref and np.isfinite(float(c["n_coupler"]))),
              np.nan) for col in cols])
     if np.any(np.isfinite(n_meas)):
-        axn.plot(x, n_meas, "-o", color=_C_MEAS, lw=1.4, ms=4.0,
-                 label=rf"$\langle n_s\rangle$ at $t_g$, {ref} levels")
+        axn.plot(xpos, n_meas, "-o", color=_C_MEAS, lw=1.6, ms=4.5,
+                 label=rf"measured $\langle n_s\rangle$ at $t_g$ "
+                       rf"({ref} levels)")
     axn.set_yscale("log")
+    # |alpha|^2 diverges at the resonance, and letting it set the limits flattens
+    # every measured point into the bottom decade. Scale to the DATA (the two
+    # series at the sampled columns) and let the curve run off the top.
+    seen = np.concatenate([
+        n_meas[np.isfinite(n_meas) & (n_meas > 0)],
+        np.array([(3.0 * g3 * eta ** 2 / max(abs(v), 1e-12)) ** 2 for v in x])])
+    if seen.size:
+        axn.set_ylim(max(float(np.min(seen)) / 4.0, 1e-6),
+                     float(np.max(np.minimum(seen, 1e3))) * 6.0)
     axn.set_ylabel("coupler photons")
-    axn.set_xlabel(r"subharmonic detuning  $\Delta_{\rm sub} = \omega_s - 2\omega_p$"
-                   "  (GHz)")
-    axn.grid(True, which="both", alpha=0.22, lw=0.4)
+    scale_alpha = 3.0 * g3 * eta ** 2
 
-    # ONE legend, outside both panels. In-axes it sat over the far columns --
-    # the converged corner the reader goes to the figure for.
-    nh, nl = axn.get_legend_handles_labels()
-    fig.legend(map_handles + list(nh), map_labels + list(nl),
-               loc="outside lower center", ncol=3, fontsize=7, frameon=False)
+    # A |alpha| scale under the axis. Delta_sub is the knob, but |alpha| is the
+    # quantity convergence actually tracks: |alpha| = 3 g3 eta^2 / Delta_sub, so
+    # two runs at different drives are only comparable here. Round |alpha| values
+    # rather than round detunings, so the same tick means the same physics in
+    # every figure.
+    # |alpha| = 3 g3 eta^2 / |Delta_sub| is not invertible across the resonance,
+    # so a two-sided axis gets no secondary scale -- and does not need one: a
+    # mirrored pair sits at the SAME |alpha| by construction, which is the whole
+    # point of sampling both sides.
+    scale = scale_alpha
+    if scale > 0 and not categorical and same_sign:
+        axa = axn.secondary_xaxis(
+            -0.34, functions=(lambda v: scale / np.where(np.abs(v) < 1e-12,
+                                                         np.nan, np.abs(v)),
+                              lambda a: scale / np.where(np.abs(a) < 1e-12,
+                                                         np.nan, np.abs(a))))
+        import matplotlib.ticker as mticker
+        want = [0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0]
+        # From the axis LIMITS, not the first and last column: the mapping is
+        # monotone decreasing, so x[0] is the largest |alpha|, and the cells
+        # extend past both end columns to their mirrored edges.
+        lim = np.abs([v for v in ax.get_xlim() if abs(v) > 1e-12])
+        amin, amax = sorted(scale / lim) if lim.size == 2 else (0.0, np.inf)
+        ticks = [a for a in want if amin <= a <= amax]
+        axa.xaxis.set_major_locator(mticker.FixedLocator(ticks))
+        axa.xaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda v, _pos: f"{v:g}"))
+        axa.set_xlabel(r"displacement  $|\alpha| = 3g_3\eta^2/\Delta_{\rm sub}$",
+                       fontsize=7.5, labelpad=1.5)
+        axa.tick_params(labelsize=7)
+        axa.minorticks_off()
+    axn.set_xlabel(
+        (r"subharmonic detuning  $\Delta_{\rm sub} = \omega_s - 2\omega_p$  (GHz)"
+         "\n" r"and displacement  $|\alpha| = 3g_3\eta^2/|\Delta_{\rm sub}|$"
+         if (categorical and scale_alpha > 0) else
+         r"subharmonic detuning  $\Delta_{\rm sub} = \omega_s - 2\omega_p$  (GHz)"),
+                   # clear the rotated tick labels; otherwise the label lands on
+                   # top of them and of the |alpha| row below
+                   labelpad=4.0)
+    axn.grid(True, which="both", alpha=0.2, lw=0.4)
+    axn.legend(loc="best", fontsize=7)
+
+    # Label the columns' own detunings. A log axis defaults to decade ticks with
+    # mantissas (6 x 10^-2), which names points the grid does not contain and
+    # omits every one it does.
+    axn.set_xticks(xpos)
+    if categorical and scale_alpha > 0:
+        # Delta_sub and |alpha| on two lines of ONE tick label. As a second axis
+        # this needed a hand-placed offset that either collided with the primary
+        # labels or floated off into the legend; equal-width columns leave room
+        # for both lines unrotated, which is legible and cannot collide.
+        axn.set_xticklabels(
+            [f"{v:.3g}\n{scale_alpha / abs(v):.2f}" for v in x],
+            fontsize=(6.8 if len(cols) <= 11 else 6.0), linespacing=1.5)
+    else:
+        axn.set_xticklabels([f"{v:.3g}" for v in x],
+                            fontsize=(7.0 if len(cols) <= 9 else 6.0),
+                            rotation=(0 if len(cols) <= 9 else 90))
+    axn.set_xticks([], minor=True)
+
+    # ONE legend for the map, under both panels. In-axes it sat over the far
+    # columns -- the converged corner the reader goes to the figure for.
+    handles, labels = (list(v) for v in ax.get_legend_handles_labels())
+    if np.any(ok_cell):
+        handles.append(Rectangle((0, 0), 1, 1, facecolor="none",
+                                 edgecolor="#111111", lw=1.7))
+        labels.append(rf"converged: $|F(N)-F({ref})| \leq {tol:g}$")
+    if n_veiled:
+        handles.append(Rectangle((0, 0), 1, 1, lw=0.0,
+                                 facecolor=(0.62, 0.61, 0.60, 0.62)))
+        labels.append("greyed: does not agree with the reference")
+    if n_rules:
+        handles.append(Line2D([0], [0], color=_C_RULE_S, ls="-.", lw=1.0))
+        labels.append("another process resonant")
+    if sick:
+        handles.append(Line2D([0], [0], color=_C_BAD, lw=3.0))
+        labels.append(rf"calibration failed ($P < {health_min:g}$)")
+    if handles:
+        fig.legend(handles, labels, loc="outside lower center",
+                   ncol=min(3, len(handles)), fontsize=7, frameon=False)
 
     # LAST, after every rule that can widen the shared x axis: a twiny copies the
     # limits it is given and does not track its parent, so building it earlier
     # slides every w_b label off its own column (the trap tune_up_sweep documents).
+    # Thin out the ticks rather than overlapping the labels.
     axt = ax.twiny()
     axt.set_xscale(ax.get_xscale())
     axt.set_xlim(ax.get_xlim())
-    axt.set_xticks(x)
-    axt.set_xticklabels([f"{c.get('w_b_GHz', float('nan')):.2f}" for c in cols],
-                        fontsize=6.6)
-    axt.set_xlabel(r"partner frequency $\omega_b$ (GHz)", fontsize=8)
+    step = 1 if len(cols) <= 9 else 2
+    axt.set_xticks(xpos[::step])
+    axt.set_xticklabels([f"{c.get('w_b_GHz', float('nan')):.2f}"
+                         for c in cols[::step]], fontsize=6.4)
+    axt.set_xlabel(r"partner frequency $\omega_b$ (GHz)", fontsize=7.5,
+                   labelpad=2.0)
     axt.minorticks_off()
 
     d = os.path.dirname(out)
@@ -1287,7 +1663,7 @@ def plot_convergence_map(doc: Dict[str, Any],
 # ===========================================================================
 def describe_grid(config: Dict[str, Any], detunings: Sequence[float],
                   levels: Sequence[int], target_eta: float, *,
-                  branch: str = "above", guard_GHz: float = 0.15,
+                  branch: str = "above", guard_GHz: float = 0.075,
                   wp_points: int = 41, tg_points: int = 13,
                   occupation: bool = True) -> str:
     """The grid, the collisions it crosses and what it will cost -- no solves.
@@ -1310,7 +1686,7 @@ def describe_grid(config: Dict[str, Any], detunings: Sequence[float],
         f"(w_s - Delta_sub)/2,  target_eta = {target_eta:g},  levels = {lv}",
         "",
         f"  {'Delta_sub':>10} {'w_b':>7} {'w_p':>7} {'|alpha|':>8} "
-        f"{'N_pred':>7}  nearest other resonance",
+        f"{'N_pred':>7}  nearest other resonance (detuning = half the axis gap)",
     ]
     n_ok = 0
     for d in detunings:
@@ -1325,10 +1701,15 @@ def describe_grid(config: Dict[str, Any], detunings: Sequence[float],
         lm = nearest_landmark(landmarks, d)
         note = "--"
         if lm is not None:
-            flag = "  <== ON IT" if abs(lm["distance_GHz"]) < guard_GHz else ""
+            # Flag on the channel's own detuning (half the axis distance), not on
+            # the axis distance: the axis is Delta_sub = w_s - 2 w_p, so a column
+            # that looks 500 MHz clear is a channel detuned by 250 MHz, and it is
+            # the detuning that sets |Omega/Delta|.
+            det = abs(lm["detuning_GHz"])
+            flag = "  <== ON IT" if det < guard_GHz else ""
             note = (f"{lm['name']} ({lm['n_pump']}p) at "
-                    f"{lm['delta_sub_GHz']:+.3f}, "
-                    f"{abs(lm['distance_GHz']) * 1e3:.0f} MHz away{flag}")
+                    f"{lm['delta_sub_GHz']:+.3f}, detuned "
+                    f"{det * 1e3:.0f} MHz{flag}")
         lines.append(f"  {d:>10.3f} {wb_:>7.3f} {abs(wb_ - wa_):>7.3f} "
                      f"{alpha:>8.3f} {predicted_levels(alpha):>7.1f}  {note}")
 
@@ -1370,6 +1751,92 @@ def describe_grid(config: Dict[str, Any], detunings: Sequence[float],
                      f"{lm['n_pump']}-pump {lm['name']}"
                      f"{'  [excites the SNAIL]' if lm['coupler'] else ''}")
     return "\n".join(lines)
+
+
+def mirror_pairs(doc: Dict[str, Any]) -> List[Tuple[float, Dict[str, Any],
+                                                    Dict[str, Any]]]:
+    """Columns sampled at BOTH ``+Delta_sub`` and ``-Delta_sub``, paired by
+    ``|Delta_sub|``.
+
+    This pairing is the isolation experiment. The subharmonic drive depends on
+    ``|Delta_sub|`` alone -- ``|alpha| = 3 g3 eta^2 / |Delta_sub|`` is identical
+    for a mirrored pair -- while every OTHER pump-activated channel has a
+    detuning that moves monotonically with ``w_p``, and ``w_p`` differs between
+    the two sides (``w_p = (w_s -/+ |Delta_sub|)/2``). So a pair that AGREES
+    cannot be being driven by any of those channels, and a pair that DISAGREES
+    localises the confounder without any further modelling.
+
+    Returns
+    -------
+    list of (float, dict, dict)
+        ``(|Delta_sub|, positive column, negative column)``, ascending, for the
+        detunings present on both sides.
+    """
+    by_abs: Dict[float, Dict[bool, Dict[str, Any]]] = {}
+    for col in doc["columns"]:
+        if not col.get("cells"):
+            continue
+        d = float(col["delta_sub_GHz"])
+        by_abs.setdefault(round(abs(d), 9), {})[d >= 0.0] = col
+    return [(k, v[True], v[False]) for k, v in sorted(by_abs.items())
+            if True in v and False in v]
+
+
+def format_mirror(doc: Dict[str, Any]) -> str:
+    """The mirror-pair comparison as a table. Empty when the grid is one-sided."""
+    pairs = mirror_pairs(doc)
+    if not pairs:
+        return ""
+    st = doc["settings"]
+    ref = int(st["ref_levels"])
+    tol = float(st["tol"])
+    eta, g3 = float(st["target_eta"]), float(st["g3_GHz"])
+
+    def _at(col, N, field):
+        for c in col["cells"]:
+            if int(c["levels"]) == N:
+                v = c.get(field)
+                return float("nan") if v is None else float(v)
+        return float("nan")
+
+    def _worst(col):
+        vals = [float(c["spread"]) for c in col["cells"]
+                if c.get("spread") is not None and int(c["levels"]) != ref]
+        return max(vals) if vals else float("nan")
+
+    out = ["\n=== mirror check: the same |alpha| on both sides of the "
+           "subharmonic ===",
+           "  The subharmonic depends on |Delta_sub| only, so a mirrored pair "
+           "shares |alpha|.",
+           "  Every other pump-activated channel sits at a different detuning on "
+           "the two sides",
+           "  (w_p differs), so agreement here rules them out as the cause.",
+           f"  {'|Delta|':>8} {'|alpha|':>8} {'F(' + str(ref) + ')+':>10} "
+           f"{'F(' + str(ref) + ')-':>10} {'|diff|':>9} {'spread+':>9} "
+           f"{'spread-':>9} {'n_s+':>8} {'n_s-':>8}"]
+    diffs = []
+    for absd, pos, neg in pairs:
+        fp, fn = _at(pos, ref, "F_avg"), _at(neg, ref, "F_avg")
+        d = abs(fp - fn)
+        if np.isfinite(d):
+            diffs.append(d)
+        out.append(f"  {absd:>8.3f} {3.0 * g3 * eta ** 2 / absd:>8.3f} "
+                   f"{fp:>10.5f} {fn:>10.5f} {d:>9.2e} "
+                   f"{_worst(pos):>9.2e} {_worst(neg):>9.2e} "
+                   f"{_at(pos, ref, 'n_coupler'):>8.4f} "
+                   f"{_at(neg, ref, 'n_coupler'):>8.4f}")
+    if diffs:
+        med = float(np.median(diffs))
+        out.append(f"  median |F(+) - F(-)| = {med:.2e} over {len(diffs)} pair(s), "
+                   f"against a tolerance of {tol:g}")
+        out.append("  -> " + ("the two sides agree: the truncation behaviour "
+                              "follows |alpha|, i.e. the subharmonic"
+                              if med <= tol else
+                              "the two sides DISAGREE: something w_p-dependent "
+                              "is contributing, so |alpha| is not the whole "
+                              "story -- compare the per-pair rows above against "
+                              "the landmark table"))
+    return "\n".join(out)
 
 
 def print_map(doc: Dict[str, Any],
@@ -1415,7 +1882,8 @@ def format_map(doc: Dict[str, Any],
             if c is None:
                 row += f"{'--':>9} "
                 continue
-            mark = "*" if (c.get("converged") is False) else " "
+            mark = ("*" if (c.get("spread") is not None
+                            and float(c["spread"]) > float(st["tol"])) else " ")
             row += f"{c['F_avg']:>8.5f}{mark} "
             if c.get("spread") is not None and N != ref:
                 spreads.append(float(c["spread"]))
@@ -1440,12 +1908,56 @@ def format_map(doc: Dict[str, Any],
         if b.get("is_reference"):
             out.append(f"  {N:>3} levels: reference")
         elif b["delta_sub_GHz"] is None:
-            out.append(f"  {N:>3} levels: NEVER converged on this axis "
-                       f"(0/{b['n_scored']} columns)")
+            got = int(b.get("n_converged_any", 0))
+            extra = (f"; it does agree at {got}/{b['n_scored']} individual "
+                     f"columns, so the outermost column is what breaks the run"
+                     if got else "")
+            out.append(f"  {N:>3} levels: no converged run from the far end "
+                       f"(0/{b['n_scored']} columns){extra}")
         else:
             out.append(f"  {N:>3} levels: converged for |Delta_sub| >= "
                        f"{b['delta_sub_GHz']:.3f} GHz "
                        f"({b['n_converged']}/{b['n_scored']} columns)")
+    signed = doc.get("boundary_signed") or {}
+    if signed:
+        out.append("\n=== convergence boundary, per branch ===")
+        out.append("  The two sides of the subharmonic need not agree, so the "
+                   "single boundary above is")
+        out.append("  the envelope of these two. 2 w_p < w_s is the positive "
+                   "branch.")
+        for name, key in (("2 w_p < w_s  (Delta_sub > 0)", "positive"),
+                          ("2 w_p > w_s  (Delta_sub < 0)", "negative")):
+            out.append(f"  {name}:")
+            for N in lv:
+                b = signed[key][str(N)]
+                if b.get("is_reference"):
+                    out.append(f"    {N:>3} levels: reference")
+                elif b["delta_sub_GHz"] is None:
+                    out.append(f"    {N:>3} levels: none of "
+                               f"{b['n_scored']} rung(s)")
+                else:
+                    out.append(f"    {N:>3} levels: |Delta_sub| >= "
+                               f"{b['delta_sub_GHz']:.3f} GHz "
+                               f"({b['n_converged']}/{b['n_scored']} rungs)")
+
+    mirror = format_mirror(doc)
+    if mirror:
+        out.append(mirror)
+
+    lms = [lm for lm in doc.get("landmarks", [])
+           if min(abs(float(c["delta_sub_GHz"])) for c in cols) - 0.5
+           <= lm["delta_sub_GHz"]
+           <= max(abs(float(c["delta_sub_GHz"])) for c in cols) + 0.5
+           or -max(abs(float(c["delta_sub_GHz"])) for c in cols) - 0.5
+           <= lm["delta_sub_GHz"] <= 0.0]
+    if lms:
+        out.append("\n=== other resonances near this axis ===")
+        for lm in lms:
+            out.append(f"  Delta_sub={lm['delta_sub_GHz']:+8.3f} GHz  "
+                       f"w_p={lm['w_p_GHz']:6.3f}  {lm['n_pump']}-pump "
+                       f"{lm['name']}"
+                       f"{'  [excites the SNAIL]' if lm['coupler'] else ''}")
+
     sm = doc["summary"]
     out.append(f"\n  {sm['n_ok']}/{sm['n_columns']} columns, {sm['n_cells']} "
                f"cells, {sm['seconds'] / 60:.1f} min")
@@ -1515,7 +2027,14 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=0,
                     help="worker processes (0 -> SLURM_CPUS_PER_TASK or CPU count)")
     ap.add_argument("--gpu", action="store_true",
-                    help="run via qutip-jax/diffrax (forces --jobs 1)")
+                    help="run EVERYTHING via qutip-jax/diffrax (forces --jobs 1); "
+                         "usually a loss -- prefer --gpu-levels-min, which keeps "
+                         "the cheap truncations in the CPU pool")
+    ap.add_argument("--gpu-levels-min", type=int, default=None, metavar="N",
+                    help="score cells with at least N coupler levels on the GPU "
+                         "(qutip-jax/diffrax), serially, while the smaller ones "
+                         "stay in the CPU pool. The big truncations are where the "
+                         "GPU pays off and where the CPU pool hurts most")
     ap.add_argument("--atol", type=float, default=1e-10)
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
@@ -1552,6 +2071,19 @@ def main() -> None:
     if args.replot:
         with open(args.replot) as fh:
             doc = json.load(fh)
+        # Re-read the boundary rather than trusting the one in the file: that is
+        # what makes --tol free. The spreads are already solved, so a different
+        # tolerance is a pure re-interpretation -- and it also refreshes fields
+        # that a document written by an older version does not carry.
+        tol = (args.tol if args.tol != DEFAULT_TOL
+               else float(doc["settings"].get("tol", DEFAULT_TOL)))
+        doc["settings"]["tol"] = tol
+        doc["boundary"] = convergence_boundary(doc, tol=tol)
+        doc["boundary_signed"] = boundary_by_branch(doc, tol=tol)
+        try:
+            doc["landmarks"] = landmarks_from_settings(doc["settings"])
+        except (KeyError, TypeError, ValueError):
+            pass                        # keep whatever the document carries
         print_map(doc, health_min=args.health_min)
         path = plot_convergence_map(
             doc, out=args.plot or "figs/convergence_map.png", xscale=args.xscale,
@@ -1583,9 +2115,15 @@ def main() -> None:
         return
 
     if args.gpu:
+        # Whole-run GPU: switch here, in the parent, and drop to one worker --
+        # a forked pool cannot inherit a CUDA context.
         from snail_solver import zhou_coupler
         zhou_coupler.use_gpu(True)
         args.jobs = 1
+        if args.gpu_levels_min is not None:
+            print("note: --gpu overrides --gpu-levels-min (everything is on the "
+                  "GPU already)")
+            args.gpu_levels_min = None
 
     from snail_solver.log_utils import setup_run_logger
 
@@ -1609,6 +2147,7 @@ def main() -> None:
         branch=args.branch, ref_levels=args.ref_levels,
         calib_levels=args.calib_levels,
         recalibrate_per_cell=args.recalibrate_per_cell, tol=args.tol,
+        gpu_levels_min=args.gpu_levels_min,
         chirp_coeffs_GHz=chirp, wp_points=args.wp_points,
         wp_span_MHz=args.wp_span_MHz, span_linewidths=args.span_linewidths,
         n_time=args.n_time, tg_points=args.tg_points, tg_lo=args.tg_lo,

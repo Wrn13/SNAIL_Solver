@@ -90,7 +90,16 @@
 #               flat carrier at fixed |eta|                             [1]
 #   CHIRP       Legendre chirp (GHz) to run in every column   [flat carrier]
 #   JOBS        parallel workers                     [--cpus-per-task]
-#   GPU         set to 1 for qutip-jax/diffrax (forces --jobs 1)         [0]
+#   GPU         set to 1 for qutip-jax/diffrax on EVERYTHING (forces --jobs 1) [0]
+#   GPU_LEVELS_MIN  score cells at this many coupler levels and above on the GPU,
+#               keeping the smaller ones in the CPU pool.        [off]
+#               MEASURED ON THIS PROBLEM IT IS A LOSS: on a GH200 at t_g = 209 ns,
+#               a 13-level cell took 761 s on the GPU against 128 s on one CPU
+#               core -- 6x slower at 95% device utilisation, with F agreeing to
+#               six digits. dim ~ 162 with a time-dependent coefficient is far
+#               below the JAX/diffrax crossover, and the CPU alternative is JOBS
+#               independent cells at once, not one core. Use it as a cross-check
+#               of the CPU path, not to go faster.
 #   OUTDIR      per-column and per-cell caches           [results/subharm_<dev>]
 #   OUT         the map JSON                        [<OUTDIR>/convergence.json]
 #   PLOT        set to 0 to skip the figure                             [1]
@@ -141,6 +150,7 @@ OPTS=""
 [ -n "${WP_SPAN:-}"      ] && OPTS="${OPTS} --wp-span-MHz ${WP_SPAN}"
 [ -n "${CHIRP:-}"        ] && OPTS="${OPTS} --chirp ${CHIRP}"
 [ -n "${GPU_FLAG}"       ] && OPTS="${OPTS} ${GPU_FLAG}"
+[ -n "${GPU_LEVELS_MIN:-}" ] && OPTS="${OPTS} --gpu-levels-min ${GPU_LEVELS_MIN}"
 [ "${PER_CELL:-0}"  = "1" ] && OPTS="${OPTS} --recalibrate-per-cell"
 [ "${OVERWRITE:-0}" = "1" ] && OPTS="${OPTS} --overwrite"
 [ "${DRY:-0}"       = "1" ] && OPTS="${OPTS} --dry-run"

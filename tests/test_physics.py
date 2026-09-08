@@ -3328,6 +3328,36 @@ class TestSubharmonicLandmarks(unittest.TestCase):
             self.assertNotIn("$", lm["name"])
             self.assertIn("label", lm)
 
+    def test_landmarks_re_derive_from_a_documents_settings(self):
+        """--replot has only the settings, not the device: w_a, w_s and the branch
+        have to be enough to rebuild the table, or an old document keeps stale
+        labels forever."""
+        from snail_solver.subharmonic_convergence import (
+            collision_landmarks, landmarks_from_settings)
+        want = collision_landmarks(self.CFG)
+        got = landmarks_from_settings({"w_a_GHz": 3.5, "w_s_GHz": 4.5,
+                                       "branch": "above"})
+        self.assertEqual([r["delta_sub_GHz"] for r in got],
+                         [r["delta_sub_GHz"] for r in want])
+        self.assertEqual([r["label"] for r in got], [r["label"] for r in want])
+
+    def test_nearest_landmark_reports_the_channel_detuning_not_just_the_axis_gap(self):
+        """Delta_sub = w_s - 2 w_p, so a gap of 500 MHz along the axis is a
+        channel detuned by 250 MHz. Reporting only the axis gap overstates every
+        margin by 2x, and it is the detuning that enters |Omega/Delta|."""
+        from snail_solver.subharmonic_convergence import (
+            collision_landmarks, nearest_landmark)
+        lms = collision_landmarks(self.CFG)
+        near = nearest_landmark(lms, -2.0)           # landmark at -2.5
+        self.assertAlmostEqual(near["distance_GHz"], 0.5, places=9)
+        self.assertAlmostEqual(near["detuning_GHz"], 0.25, places=9)
+
+    def test_describe_grid_flags_on_the_detuning(self):
+        from snail_solver.subharmonic_convergence import describe_grid
+        txt = describe_grid(self.CFG, [0.88], [3, 5], 0.6)   # 120 MHz axis gap
+        self.assertIn("detuned 60 MHz", txt)                 # -> 60 MHz detuning
+        self.assertIn("ON IT", txt)
+
     def test_nearest_landmark_skips_the_axis_origin(self):
         """Delta_sub = 0 is the axis, not a contaminant: reporting it as the
         nearest collision would flag every near-resonant column as unusable."""
@@ -3486,6 +3516,20 @@ class TestConvergenceBoundary(unittest.TestCase):
         b = convergence_boundary(doc)
         self.assertIsNone(b["3"]["delta_sub_GHz"])
         self.assertEqual(b["3"]["n_converged"], 0)
+        self.assertEqual(b["3"]["n_converged_any"], 0)
+
+    def test_an_anomalous_outermost_column_is_not_read_as_never_working(self):
+        """Measured at eta = 0.6: 3 levels agrees to 4e-5 at Delta_sub = 0.538
+        while the outermost column disagrees by 8e-3. The contiguous run is then
+        empty, but "never converged" would be the wrong claim."""
+        from snail_solver.subharmonic_convergence import convergence_boundary
+        from snail_solver.subharmonic_convergence import format_map
+        doc = _subharm_doc({0.5: {3: 0.9000, 9: 0.90},     # agrees
+                            2.0: {3: 0.8, 9: 0.90}})       # outermost does not
+        b = convergence_boundary(doc)
+        self.assertIsNone(b["3"]["delta_sub_GHz"])
+        self.assertEqual(b["3"]["n_converged_any"], 1)
+        self.assertIn("individual columns", format_map(doc))
 
     def test_tolerance_can_be_overridden_without_re_solving(self):
         from snail_solver.subharmonic_convergence import convergence_boundary
@@ -3692,6 +3736,531 @@ class TestSubharmonicCalibrationHealth(unittest.TestCase):
             out = plot_convergence_map(self._doc(0.688),
                                        out=os.path.join(d, "m.png"))
             self.assertTrue(os.path.getsize(out) > 5000)
+
+class TestSubharmonicMirrorCheck(unittest.TestCase):
+    """Sampling both sides of the subharmonic is the isolation experiment: a
+    mirrored pair shares |alpha| = 3 g3 eta^2 / |Delta_sub| exactly, while every
+    other pump-activated channel sits at a different detuning on the two sides
+    because w_p = (w_s -/+ |Delta_sub|)/2 differs. Agreement therefore rules the
+    others out; disagreement localises one.
+    """
+
+    def _two_sided(self, f_neg):
+        rows = {0.2: {3: 0.90, 9: 0.95}, -0.2: {3: f_neg, 9: 0.95},
+                0.6: {3: 0.99, 9: 0.99}}
+        return _subharm_doc(rows, levels=(3, 9), ref=9)
+
+    def test_pairs_are_found_and_singletons_ignored(self):
+        from snail_solver.subharmonic_convergence import mirror_pairs
+        pairs = mirror_pairs(self._two_sided(0.90))
+        self.assertEqual(len(pairs), 1)
+        absd, pos, neg = pairs[0]
+        self.assertAlmostEqual(absd, 0.2)
+        self.assertGreater(pos["delta_sub_GHz"], 0)
+        self.assertLess(neg["delta_sub_GHz"], 0)
+
+    def test_one_sided_grid_has_no_mirror_section(self):
+        from snail_solver.subharmonic_convergence import format_mirror
+        doc = _subharm_doc({0.2: {3: 0.9, 9: 0.95}, 0.6: {3: 0.99, 9: 0.99}},
+                           levels=(3, 9), ref=9)
+        self.assertEqual(format_mirror(doc), "")
+
+    def test_agreement_reads_as_the_subharmonic(self):
+        from snail_solver.subharmonic_convergence import format_mirror
+        txt = format_mirror(self._two_sided(0.95))     # both sides F(9) = 0.95
+        self.assertIn("the two sides agree", txt)
+        self.assertIn("follows |alpha|", txt)
+
+    def test_disagreement_is_reported_as_a_confounder(self):
+        from snail_solver.subharmonic_convergence import format_mirror
+        doc = self._two_sided(0.90)
+        doc["columns"][1]["cells"][1]["F_avg"] = 0.60   # F(9) at -0.2
+        txt = format_mirror(doc)
+        self.assertIn("DISAGREE", txt)
+        self.assertIn("w_p-dependent", txt)
+
+    def test_the_pair_shares_one_alpha(self):
+        """If the two sides did not share |alpha| the comparison would be
+        meaningless, so pin the identity the design rests on."""
+        from snail_solver.subharmonic_convergence import (
+            config_at_detuning, displacement_alpha)
+        cfg = TestSubharmonicAxis.CFG
+        for d in (0.06, 0.25, 0.63):
+            self.assertAlmostEqual(
+                displacement_alpha(config_at_detuning(cfg, +d), +d, 0.6),
+                displacement_alpha(config_at_detuning(cfg, -d), -d, 0.6),
+                places=12)
+
+    def test_the_pair_does_not_share_the_conversion_detuning(self):
+        """... and that the OTHER channels really do differ across the pair,
+        which is what gives the comparison its power. a<->s is resonant at
+        w_p = w_s - w_a, and w_p differs between the two sides."""
+        from snail_solver.subharmonic_convergence import config_at_detuning
+        cfg = TestSubharmonicAxis.CFG
+        wa, ws = 3.5, 4.5
+        det = []
+        for d in (+0.63, -0.63):
+            c = config_at_detuning(cfg, d)
+            w_p = abs(c["qubit_freqs_GHz"][1] - c["qubit_freqs_GHz"][0])
+            det.append(abs(w_p - (ws - wa)))
+        self.assertGreater(abs(det[0] - det[1]), 0.5)   # 0.935 vs 1.565 GHz
+
+    def test_report_includes_the_mirror_section_and_the_landmarks(self):
+        from snail_solver.subharmonic_convergence import format_map
+        txt = format_map(self._two_sided(0.95))
+        self.assertIn("mirror check", txt)
+        self.assertIn("other resonances near this axis", txt)
+
+
+class TestSubharmonicGpuRouting(unittest.TestCase):
+    """`--gpu-levels-min` must put the BIG truncations on the GPU and leave the
+    small ones in the CPU pool, and a GPU batch must never be forked (a CUDA
+    context does not survive fork).
+    """
+
+    def test_worker_switches_backend_only_when_asked(self):
+        from unittest import mock
+        from snail_solver import subharmonic_convergence as SC
+        payload = {"config": {}, "delta_sub_GHz": 0.5, "levels": 18,
+                   "record": {}, "kw": {}}
+        with mock.patch.object(SC, "score_cell",
+                               return_value={"F_avg": 0.9}) as m_score:
+            with mock.patch("snail_solver.zhou_coupler.use_gpu") as m_gpu:
+                res = SC._cell_worker(dict(payload, gpu=True))
+                m_gpu.assert_called_once_with(True)
+            self.assertEqual(res["cell"]["engine"], "gpu")
+            with mock.patch("snail_solver.zhou_coupler.use_gpu") as m_gpu:
+                res = SC._cell_worker(dict(payload, gpu=False))
+                m_gpu.assert_not_called()
+            self.assertEqual(res["cell"]["engine"], "cpu")
+        self.assertEqual(m_score.call_count, 2)
+
+    def test_gpu_batch_runs_in_process(self):
+        """_run_pool at workers=1 must NOT fork: that is what makes the GPU
+        branch safe, so it is an invariant, not an implementation detail."""
+        from unittest import mock
+        from snail_solver import subharmonic_convergence as SC
+        with mock.patch.object(SC, "ProcessPoolExecutor") as m_pool:
+            got = SC._run_pool(lambda p: p["v"], [{"v": 1}, {"v": 2}], 1)
+            m_pool.assert_not_called()
+        self.assertEqual(got, [1, 2])
+
+    def test_a_cached_cpu_cell_is_not_re_solved_for_the_gpu(self):
+        """The two backends integrate the same Hamiltonian, so `engine` is
+        provenance, not physics -- requiring it to match would re-solve a whole
+        grid for nothing."""
+        from snail_solver.subharmonic_convergence import _cache_load
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w") as fh:
+                json.dump({"levels": 18, "t_g_ns": 200.0, "engine": "cpu",
+                           "F_avg": 0.99}, fh)
+            self.assertIsNotNone(_cache_load(p, {"levels": 18,
+                                                 "t_g_ns": 200.0}))
+
+class TestSubharmonicThreadPinning(unittest.TestCase):
+    """The CLI must pin the BLAS thread pools; a library import must not.
+
+    Every worker in this module runs one independent solve, so the parallelism
+    is already at the process level. Measured without the pin, 15 workers at 18
+    coupler levels (dim 162) took 127 threads EACH -- ~1900 threads on 72 cores,
+    load average 107, 310% CPU per worker to do the work of one. With fork the
+    child inherits the parent's initialised BLAS, so the pin has to happen at
+    CLI import time, before numpy loads.
+    """
+
+    ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+
+    def _probe(self, code):
+        env = {k: v for k, v in os.environ.items() if k not in self.ENV}
+        return subprocess.run([sys.executable, "-c", code], capture_output=True,
+                              text=True, cwd=REPO_ROOT, env=env)
+
+    def test_library_import_does_not_touch_the_environment(self):
+        got = self._probe(
+            "import snail_solver.subharmonic_convergence as m, os\n"
+            "print('OMP=%s' % os.environ.get('OMP_NUM_THREADS'))\n")
+        self.assertIn("OMP=None", got.stdout, got.stderr[-400:])
+
+    def test_the_cli_pins_every_pool(self):
+        got = self._probe(
+            "import os, runpy, sys\n"
+            "sys.argv = ['subharmonic_convergence', '--help']\n"
+            "try:\n"
+            "    runpy.run_module('snail_solver.subharmonic_convergence',\n"
+            "                     run_name='__main__')\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            "print('PINNED=%s' % ','.join(\n"
+            "    '%s=%s' % (k, os.environ.get(k)) for k in\n"
+            "    ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')))\n")
+        self.assertIn("OMP_NUM_THREADS=1", got.stdout, got.stderr[-400:])
+        self.assertIn("OPENBLAS_NUM_THREADS=1", got.stdout)
+        self.assertIn("MKL_NUM_THREADS=1", got.stdout)
+
+    def test_an_explicit_setting_is_respected(self):
+        """setdefault, not assignment: a caller who asked for 4 threads gets 4."""
+        env = dict(os.environ, OMP_NUM_THREADS="4")
+        got = subprocess.run(
+            [sys.executable, "-c",
+             "import os, runpy, sys\n"
+             "sys.argv = ['x', '--help']\n"
+             "try:\n"
+             "    runpy.run_module('snail_solver.subharmonic_convergence',\n"
+             "                     run_name='__main__')\n"
+             "except SystemExit:\n"
+             "    pass\n"
+             "print('OMP=%s' % os.environ.get('OMP_NUM_THREADS'))\n"],
+            capture_output=True, text=True, cwd=REPO_ROOT, env=env)
+        self.assertIn("OMP=4", got.stdout, got.stderr[-400:])
+
+class TestConvergenceBoundaryRungs(unittest.TestCase):
+    """A rung is one |Delta_sub|, not one column.
+
+    On a two-sided grid the mirrored pair share a rung, and it passes only if
+    BOTH pass -- the coordinate is a DISTANCE from the subharmonic, so
+    "converged from 0.25 GHz out" has to hold on either side. Measured on the
+    mirror run: 7 levels was reported converged from |Delta_sub| = 0.25 while the
+    +0.25 column was off by 0.36, because the walk counted the good mirror and
+    reported its |Delta_sub|.
+    """
+
+    def _two_sided(self):
+        # +0.25 is broken at 3 levels, -0.25 is fine; both fine further out.
+        return _subharm_doc({+0.25: {3: 0.60, 9: 0.99},
+                             -0.25: {3: 0.9895, 9: 0.99},
+                             +0.60: {3: 0.9895, 9: 0.99},
+                             -0.60: {3: 0.9895, 9: 0.99}},
+                            levels=(3, 9), ref=9)
+
+    def test_a_rung_is_only_as_good_as_its_worst_column(self):
+        from snail_solver.subharmonic_convergence import convergence_boundary
+        b = convergence_boundary(self._two_sided())
+        self.assertAlmostEqual(b["3"]["delta_sub_GHz"], 0.60)
+        self.assertEqual(b["3"]["n_scored"], 2)          # rungs, not columns
+
+    def test_per_branch_boundaries_separate_the_two_sides(self):
+        from snail_solver.subharmonic_convergence import boundary_by_branch
+        got = boundary_by_branch(self._two_sided())
+        self.assertAlmostEqual(got["positive"]["3"]["delta_sub_GHz"], 0.60)
+        self.assertAlmostEqual(got["negative"]["3"]["delta_sub_GHz"], 0.25)
+
+    def test_a_one_sided_grid_has_no_per_branch_table(self):
+        from snail_solver.subharmonic_convergence import boundary_by_branch
+        doc = _subharm_doc({0.25: {3: 0.99, 9: 0.99}, 0.6: {3: 0.99, 9: 0.99}},
+                           levels=(3, 9), ref=9)
+        self.assertEqual(boundary_by_branch(doc), {})
+
+    def test_report_shows_the_per_branch_section_when_two_sided(self):
+        from snail_solver.subharmonic_convergence import (
+            boundary_by_branch, convergence_boundary, format_map)
+        doc = self._two_sided()
+        doc["boundary"] = convergence_boundary(doc)
+        doc["boundary_signed"] = boundary_by_branch(doc)
+        txt = format_map(doc)
+        self.assertIn("per branch", txt)
+        self.assertIn("2 w_p < w_s", txt)
+
+
+class TestRunFileHDF5(unittest.TestCase):
+    """Run outputs are HDF5, and the mapping to it is REVERSIBLE.
+
+    ``--replot`` (and ``post_chirp --from-tuneup``) re-run plotting code that was
+    written against the old JSON documents, so the encoding has to give back what
+    it was handed: a list must not come back an ndarray (the operating-point
+    record is written into a device JSON, which needs plain lists), an ndarray
+    must not come back a list of lists (callers read ``.shape``), and ``None`` --
+    which every optional field of a record uses -- must survive as ``None`` rather
+    than as NaN or the string "None".
+    """
+
+    def _doc(self):
+        return {
+            "operating_point": {"amp_scale": 1.25, "wp_offset_GHz": -7e-4,
+                                "t_g_ns": 78.5, "chirp_coeffs_GHz": [0.0, -0.013],
+                                "spec_abs_GHz": None, "drag_beat_GHz": None,
+                                "drag_n_pump": 1, "target_eta": 1.8,
+                                "metric": "transfer", "score": 0.987,
+                                "source": "tune_up"},
+            "t_g0_ns": 77.16,
+            "stages": {"rabi": {
+                "eta": np.linspace(0.5, 1.8, 5),
+                "delta_MHz": np.array([-0.7, -0.72, np.nan, -0.8, -0.9]),
+                "fit": {"delta0": -0.7, "k2": 0.1, "r2": 0.99, "n_used": 5},
+                "chevrons": [{"eta": 0.5, "metric": np.zeros(7),
+                              "P10": np.zeros((7, 3)),
+                              "quality": {"reject": None, "weight": 0.8}},
+                             {"eta": 1.8, "metric": np.ones(7),
+                              "P10": np.ones((7, 3)),
+                              "quality": {"reject": "low_contrast",
+                                          "weight": 0.0}}],
+                "dropped": [], "notes": ["row 3 widened"],
+                "railed": False, "traces": [[1.0, 2.0], [3.0, 4.0]]}}}
+
+    def _same(self, a, b, path=""):
+        if isinstance(a, dict):
+            self.assertIsInstance(b, dict, path)
+            self.assertEqual(set(a), set(b), path)
+            for k in a:
+                self._same(a[k], b[k], f"{path}/{k}")
+        elif isinstance(a, np.ndarray):
+            self.assertIsInstance(b, np.ndarray, path)      # NOT a list of lists
+            self.assertEqual(a.shape, b.shape, path)
+            self.assertTrue(np.allclose(a, b, equal_nan=True), path)
+        elif isinstance(a, list):
+            self.assertIsInstance(b, list, path)            # NOT an ndarray
+            self.assertEqual(len(a), len(b), path)
+            for i, (x, y) in enumerate(zip(a, b)):
+                self._same(x, y, f"{path}[{i}]")
+        elif a is None:
+            self.assertIsNone(b, path)
+        else:
+            self.assertIs(type(a), type(b), path)           # bool stays bool
+            self.assertEqual(a, b, path)
+
+    def test_round_trip_preserves_types_and_nulls(self):
+        from snail_solver.h5_io import load_doc, save_doc
+        doc = self._doc()
+        with tempfile.TemporaryDirectory() as d:
+            path = save_doc(os.path.join(d, "run.h5"), doc)
+            self._same(doc, load_doc(path))
+
+    def test_a_bare_name_becomes_h5_and_json_is_still_available(self):
+        """The suffix is the whole format switch, so a run never lands in an
+        ambiguous file: no suffix means HDF5, ``.json`` still means JSON."""
+        from snail_solver.h5_io import is_hdf5, load_doc, save_doc
+        doc = self._doc()
+        with tempfile.TemporaryDirectory() as d:
+            h5 = save_doc(os.path.join(d, "run"), doc)
+            self.assertTrue(h5.endswith(".h5"))
+            self.assertTrue(is_hdf5(h5))
+            js = save_doc(os.path.join(d, "run.json"), doc)
+            self.assertFalse(is_hdf5(js))
+            with open(js) as fh:                            # readable as plain JSON
+                self.assertEqual(json.load(fh)["operating_point"]["target_eta"], 1.8)
+            self.assertIsInstance(load_doc(js)["stages"]["rabi"]["eta"], list)
+
+    def test_old_json_runs_still_load(self):
+        """--replot must keep working on every run written before the switch, so
+        the loader dispatches on the file's CONTENT, not on its name."""
+        from snail_solver.h5_io import load_doc
+        with tempfile.TemporaryDirectory() as d:
+            # an HDF5 file that is not named like one, and a JSON one that is
+            mis = os.path.join(d, "run.json")
+            from snail_solver.h5_io import save_tree
+            save_tree(mis, {"stages": {"rabi": {"eta": np.zeros(3)}}})
+            self.assertIn("stages", load_doc(mis))
+            legacy = os.path.join(d, "legacy.h5")
+            with open(legacy, "w") as fh:
+                json.dump({"t_g0_ns": 77.0}, fh)
+            self.assertEqual(load_doc(legacy)["t_g0_ns"], 77.0)
+
+    def test_provenance_lands_outside_the_result_tree(self):
+        from snail_solver.h5_io import load_doc, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            path = save_doc(os.path.join(d, "run.h5"), self._doc(),
+                            attrs={"command": "python -m snail_solver.tune_up",
+                                   "device": "devices/1Gate4.2SNAIL.json"})
+            back = load_doc(path)
+            self.assertEqual(back["device"], "devices/1Gate4.2SNAIL.json")
+            self.assertNotIn("format", back)                 # describes the file
+            self.assertNotIn("command", back["stages"])      # never mixed into data
+
+    def test_replot_from_hdf5_needs_no_device_and_no_solver(self):
+        """The point of --replot: a figure from the run file alone. It must not
+        reach for the device JSON or the solver, on HDF5 as it did on JSON."""
+        from unittest import mock
+        from snail_solver import tune_up
+        from snail_solver.h5_io import save_doc
+        with tempfile.TemporaryDirectory() as d:
+            path = save_doc(os.path.join(d, "run.h5"), self._doc())
+            argv = ["tune_up", "--replot", path]
+            with mock.patch("snail_solver.tune_up.run_tune_up") as m_run, \
+                 mock.patch.object(sys, "argv", argv):
+                tune_up.main()
+            m_run.assert_not_called()
+
+
+class TestSweepRunsInOneFile(unittest.TestCase):
+    """A sweep is ONE file: the summary and every eta's full tune-up inside it.
+
+    The fan-out used to leave a directory of per-eta JSONs whose only link to the
+    sweep was a filename convention. Now each run is a group in the sweep's own
+    file, still in tune_up's --out schema and still addressable on its own, so
+    `tune_up --replot sweep.h5:/runs/eta1p8` keeps working -- that round trip is
+    what these tests pin, because it is the reason the runs are stored in that
+    schema at all.
+    """
+
+    def _run_doc(self, eta):
+        return {"operating_point": {"target_eta": eta, "t_g_ns": 100.0 / eta,
+                                    "amp_scale": 1.1, "wp_offset_GHz": -7e-4,
+                                    "chirp_coeffs_GHz": [0.0, -0.013],
+                                    "spec_abs_GHz": None, "drag_beat_GHz": None,
+                                    "score": 0.98, "source": "tune_up"},
+                "t_g0_ns": 96.0 / eta,
+                "stages": {"rabi": {"eta": np.linspace(0.3, 1.0, 5) * eta}}}
+
+    def test_addresses_split_only_on_the_group_separator(self):
+        from snail_solver.h5_io import split_address
+        self.assertEqual(split_address("results/eta_sweep.h5:/runs/eta1p8"),
+                         ("results/eta_sweep.h5", "runs/eta1p8"))
+        self.assertEqual(split_address("results/plain.h5"),
+                         ("results/plain.h5", None))
+
+    def test_each_run_is_written_without_disturbing_the_others(self):
+        """Runs are stored as each eta finishes, so a sweep killed part-way keeps
+        what it measured -- which means every write must APPEND, not truncate."""
+        from snail_solver.h5_io import load_doc, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "eta_sweep.h5")
+            a = save_doc(f, self._run_doc(1.2), group="runs/eta1p2")
+            b = save_doc(f, self._run_doc(1.8), group="runs/eta1p8")
+            save_doc(f, {"rows": [{"target_eta": 1.2}]}, group="sweep")
+            self.assertEqual(a, f + ":/runs/eta1p2")
+            self.assertEqual(sorted(load_doc(f)), ["runs", "sweep"])
+            self.assertEqual(load_doc(b)["operating_point"]["target_eta"], 1.8)
+            self.assertEqual(load_doc(a)["operating_point"]["target_eta"], 1.2)
+
+    def test_a_stored_run_is_still_a_tune_up_document(self):
+        """The whole point of the schema: one eta out of a sweep replots exactly
+        like a standalone tune_up --out, with no device and no solver."""
+        from unittest import mock
+        from snail_solver import tune_up
+        from snail_solver.h5_io import save_doc
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "eta_sweep.h5")
+            addr = save_doc(f, self._run_doc(1.8), group="runs/eta1p8")
+            with mock.patch("snail_solver.tune_up.run_tune_up") as m_run, \
+                 mock.patch.object(sys, "argv", ["tune_up", "--replot", addr]):
+                tune_up.main()
+            m_run.assert_not_called()
+
+    def test_json_cannot_swallow_a_group(self):
+        """A .json sweep summary must not silently flatten the runs into itself;
+        store_run puts them beside it instead."""
+        from snail_solver.h5_io import save_doc
+        from snail_solver.tune_up_sweep import store_run, sweep_holds_runs
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                save_doc(os.path.join(d, "s.json"), {"a": 1}, group="runs/x")
+            self.assertFalse(sweep_holds_runs(os.path.join(d, "eta_sweep.json")))
+            self.assertTrue(sweep_holds_runs(os.path.join(d, "eta_sweep.h5")))
+            got = store_run("eta1p8", self._run_doc(1.8),
+                            sweep_path=os.path.join(d, "eta_sweep.json"), outdir=d)
+            self.assertEqual(got, os.path.join(d, "tuneup_eta1p8.h5"))
+
+    def test_store_run_puts_it_in_the_sweep_file_when_it_can(self):
+        from snail_solver.h5_io import load_doc
+        from snail_solver.tune_up_sweep import store_run
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "eta_sweep.h5")
+            got = store_run("eta1p8", self._run_doc(1.8), sweep_path=f, outdir=d,
+                            attrs={"status": "ok"})
+            self.assertEqual(got, f + ":/runs/eta1p8")
+            self.assertEqual(os.listdir(d), ["eta_sweep.h5"])   # nothing beside it
+            self.assertEqual(load_doc(got)["status"], "ok")
+
+
+class TestEmbeddedFigures(unittest.TestCase):
+    """A run's figures live inside its own run file.
+
+    The failure this prevents is mundane and common: a directory of PNGs and a
+    directory of run files that drift apart, so months later a figure is read
+    against the wrong sweep. The embedded copy cannot drift -- it is in the group
+    the data is in -- and a run pulled out of a sweep file (`FILE:/runs/eta1p8`)
+    has to bring its own pictures, not the sweep's.
+    """
+
+    PNG = (b"\x89PNG\r\n\x1a\n" + b"fake png payload" * 40)
+
+    def _fig(self, d, name="rabi_chevrons.png"):
+        path = os.path.join(d, name)
+        with open(path, "wb") as fh:
+            fh.write(self.PNG)
+        return path
+
+    def test_a_figure_round_trips_byte_for_byte(self):
+        from snail_solver.h5_io import extract_figures, figure_names, save_doc
+        from snail_solver.h5_io import attach_figure
+        with tempfile.TemporaryDirectory() as d:
+            run = save_doc(os.path.join(d, "run.h5"), {"stages": {"rabi": {}}})
+            attach_figure(run, "rabi", self._fig(d))
+            self.assertEqual(figure_names(run), ["rabi"])
+            out = os.path.join(d, "back")
+            got = extract_figures(run, out)
+            self.assertEqual([os.path.basename(p) for p in got],
+                             ["rabi_chevrons.png"])       # keeps its own filename
+            with open(got[0], "rb") as fh:
+                self.assertEqual(fh.read(), self.PNG)     # byte-for-byte
+
+    def test_each_run_in_a_sweep_keeps_its_own(self):
+        """A sweep file holds one figures group per eta, addressed with the run."""
+        from snail_solver.h5_io import attach_figure, figure_names, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "eta_sweep.h5")
+            a = save_doc(f, {"t_g0_ns": 1.0}, group="runs/eta1p2")
+            b = save_doc(f, {"t_g0_ns": 2.0}, group="runs/eta1p8")
+            save_doc(f, {"rows": []}, group="sweep")
+            attach_figure(a, "rabi", self._fig(d))
+            attach_figure(b, "rabi", self._fig(d))
+            attach_figure(b, "chirp_ridge", self._fig(d, "chirp_ridge.png"))
+            attach_figure(f + ":/sweep", "gate_quality_vs_eta",
+                          self._fig(d, "quality.png"))
+            self.assertEqual(figure_names(a), ["rabi"])
+            self.assertEqual(sorted(figure_names(b)), ["chirp_ridge", "rabi"])
+            self.assertEqual(figure_names(f + ":/sweep"), ["gate_quality_vs_eta"])
+            self.assertEqual(figure_names(f), [])         # the root has none
+
+    def test_re_attaching_replaces_rather_than_duplicates(self):
+        """--replot after a plotting-code change refreshes the stored figure."""
+        from snail_solver.h5_io import attach_figure, extract_figures, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            run = save_doc(os.path.join(d, "run.h5"), {"t_g0_ns": 1.0})
+            attach_figure(run, "rabi", self._fig(d))
+            newer = os.path.join(d, "rabi_chevrons.png")
+            with open(newer, "wb") as fh:
+                fh.write(self.PNG + b"redrawn")
+            attach_figure(run, "rabi", newer)
+            got = extract_figures(run, os.path.join(d, "back"))
+            self.assertEqual(len(got), 1)
+            with open(got[0], "rb") as fh:
+                self.assertTrue(fh.read().endswith(b"redrawn"))
+
+    def test_a_figure_is_bytes_not_an_array_when_the_run_is_read_back(self):
+        """The encoding has a bytes rule, so a document carrying a figure round
+        trips as a document -- the loader must not hand back a uint8 array."""
+        from snail_solver.h5_io import load_doc, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            path = save_doc(os.path.join(d, "run.h5"),
+                            {"figures": {"rabi": self.PNG}, "t_g0_ns": 1.0})
+            back = load_doc(path)
+            self.assertIsInstance(back["figures"]["rabi"], bytes)
+            self.assertEqual(back["figures"]["rabi"], self.PNG)
+
+    def test_missing_figures_are_skipped_not_raised(self):
+        """A figure must never fail a finished run -- the callers already treat
+        rendering that way, and storing it is no more important."""
+        from snail_solver.h5_io import attach_figures, figure_names, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            run = save_doc(os.path.join(d, "run.h5"), {"t_g0_ns": 1.0})
+            n = attach_figures(run, {"rabi": self._fig(d),
+                                     "chirp_ridge": os.path.join(d, "nope.png"),
+                                     "post_chirp": None})
+            self.assertEqual(n, 1)
+            self.assertEqual(figure_names(run), ["rabi"])
+
+    def test_a_json_run_takes_no_figures(self):
+        """JSON cannot hold them, and embed_figures must no-op rather than crash
+        the sweep that asked."""
+        from snail_solver.tune_up_sweep import embed_figures
+        with tempfile.TemporaryDirectory() as d:
+            js = os.path.join(d, "s.json")
+            with open(js, "w") as fh:
+                json.dump({"rows": []}, fh)
+            self.assertEqual(embed_figures(js, {"rabi": self._fig(d)}), 0)
+            self.assertEqual(embed_figures(None, {"rabi": self._fig(d)}), 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

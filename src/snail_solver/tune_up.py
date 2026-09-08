@@ -64,7 +64,29 @@ Inverting this still produces a smooth curve with a maximum, so it's unit-tested
 CLI
 ---
     python -m snail_solver.tune_up --device evan_device.json --target-eta 1.8 \
-        --save-point tuneup
+        --out tuneup.h5 --save-point tuneup
+
+``--out`` writes the whole run -- the operating point AND every chevron's offset
+axis, time axis and population traces -- as one HDF5 file (:mod:`h5_io`), so a
+directory of runs stays browsable (``h5ls -r run.h5``) and the arrays keep their
+dtype and shape instead of becoming decimal text. ``--replot`` reads it back with
+no device and no solves; it sniffs the format, so JSON files written before this
+change still replot. Ask for JSON explicitly with ``--out name.json``.
+
+A run stored inside a larger file -- ``tune_up_sweep`` keeps every eta's tune-up
+in one sweep file -- is addressed as ``FILE:/runs/eta1p8`` wherever a path is
+taken, and only that group is read::
+
+    python -m snail_solver.tune_up --replot results/etasweep/eta_sweep.h5:/runs/eta1p8 \
+        --plot-ridge figs/eta1p8_ridge.png
+
+Every figure ``--plot``/``--plot-ridge``/``--plot-post-chirp`` renders is embedded
+in that same file as well as written to its own path, so one run is one artefact:
+the pictures cannot drift from the arrays they were drawn from, or be paired with
+another run's. ``--replot`` with no ``--out`` refreshes the embedded copies in the
+document it read -- including one group of a sweep file. Get them back out with::
+
+    python -m snail_solver.h5_io run.h5 --extract figs/
 """
 from __future__ import annotations
 
@@ -2590,10 +2612,38 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
 # ===========================================================================
 # CLI
 # ===========================================================================
+def _run_attrs(device_path: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
+    """Provenance for the root of an ``--out`` file.
+
+    Stored as HDF5 ROOT ATTRIBUTES, outside the result tree, so a plotting
+    function can never mistake it for data while ``h5ls -v run.h5`` still shows,
+    on one screen, which command and which device produced the file. This is the
+    half of "cleaner storage" that a bare results dict cannot provide: months
+    later the run is self-describing without a lab notebook next to it.
+    """
+    import platform
+    import shlex
+    import sys
+    import time
+
+    # argv[0] is the resolved .py path under a `-m` launch, which is not a command
+    # anyone can paste back; the module spelling is the one the docs and the SLURM
+    # scripts use, so rebuild it rather than record something unrunnable.
+    argv = " ".join(shlex.quote(a) for a in sys.argv[1:])
+    return {"tool": "snail_solver.tune_up",
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "command": f"python -m snail_solver.tune_up {argv}".strip(),
+            "device": str(device_path) if device_path else "",
+            "host": platform.node(),
+            **extra}
+
+
 def main() -> None:
     """CLI entry point."""
     import argparse
-    import json
+
+    from snail_solver.h5_io import (attach_figures, is_hdf5, load_doc, save_doc,
+                                    split_address)
 
     ap = argparse.ArgumentParser(
         prog="python -m snail_solver.tune_up", description=__doc__,
@@ -2606,12 +2656,14 @@ def main() -> None:
                          "number you choose: it sets the drive and hence the nominal "
                          "length t_g0 = 2A/eta*. Larger -> shorter gate, more leakage. "
                          "Required unless --replot is given")
-    ap.add_argument("--replot", metavar="JSON", default=None,
+    ap.add_argument("--replot", metavar="FILE", default=None,
                     help="skip the run entirely and regenerate --plot/--plot-ridge "
-                         "from a previously written --out JSON -- no new solves, so "
+                         "from a previously written --out file -- no new solves, so "
                          "this is the way to re-render a plot (e.g. after a "
                          "plot_chirp_ridge change) without repeating an expensive "
-                         "cluster run")
+                         "cluster run. HDF5 or (pre-HDF5) JSON, detected by "
+                         "content; FILE:/runs/eta1p8 reads one run out of a "
+                         "tune_up_sweep file")
     ap.add_argument("--drag-beat-GHz", type=float, default=None,
                     help="calibrate with DRAG on at this beat; enables the "
                          "chirp<->DRAG iteration")
@@ -2690,11 +2742,18 @@ def main() -> None:
     ap.add_argument("--atol", type=float, default=1e-10)
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
-    ap.add_argument("--out", default=None, help="write the record + stages to JSON")
+    ap.add_argument("--out", default=None,
+                    help="write the record + every stage (chevrons, traces, fits) to "
+                         "this file, under results/ unless absolute. HDF5 -- a bare "
+                         "name gains .h5 -- so the arrays stay binary, compressed and "
+                         "individually addressable; give it a .json suffix to get the "
+                         "old text format instead. Also written when the Rabi guards "
+                         "FAIL, holding the sweep that failed")
     ap.add_argument("--plot", nargs="?", const="figs/rabi_chevrons.png", default=None,
                     help="render every chevron, its envelope fit and the shift curve. "
                          "Written even when the run FAILS its guards -- those errors "
-                         "ask you to inspect the chevrons, so they have to be visible")
+                         "ask you to inspect the chevrons, so they have to be visible "
+                         "-- and embedded in the --out file alongside the data")
     ap.add_argument("--plot-ridge", nargs="?", const="figs/chirp_ridge.png", default=None,
                     help="overlay the chirp's pump trajectory on the fitted ridge "
                          "(the Fig. 4 / arXiv:2306.10162 picture -- riding the ridge "
@@ -2726,16 +2785,17 @@ def main() -> None:
     if args.save_point and args.device is None:
         ap.error("--save-point needs --device (to know which device JSON to write)")
 
-    from snail_solver.paths import resolve_device
+    from snail_solver.paths import in_results, resolve_device
 
     device_path = resolve_device(args.device) if args.device else None
 
     if args.replot:
-        # Everything plot_rabi_table/plot_chirp_ridge need is already in a JSON
-        # written by a previous --out: no config, no device, no new solves. This
-        # is the fast path back to a figure after e.g. a plotting-code change.
-        with open(args.replot) as fh:
-            saved = json.load(fh)
+        # Everything plot_rabi_table/plot_chirp_ridge need is already in the file
+        # a previous --out wrote: no config, no device, no new solves. This is the
+        # fast path back to a figure after e.g. a plotting-code change. load_doc
+        # dispatches on the file's magic number rather than its name, so HDF5 runs
+        # and every JSON written before the switch both replot unchanged.
+        saved = load_doc(args.replot)
         out = {"operating_point": saved["operating_point"], "stages": saved["stages"],
               "t_g0_ns": saved["t_g0_ns"],
               "drag": saved["stages"].get("drag_loop")}
@@ -2789,9 +2849,21 @@ def main() -> None:
         except RabiFitError as exc:
             # The measurement succeeded; only the interpretation failed. Save and draw
             # it before dying, so the "inspect the chevrons" instruction is actionable.
+            # The chevrons cost the whole sweep's wall-clock, so they go to disk even
+            # though there is no operating point to go with them -- inspecting them in
+            # a fresh session is exactly what the error asks for.
+            written = (save_doc(in_results(args.out), {"stages": {"rabi": exc.table}},
+                                attrs=_run_attrs(device_path,
+                                                 status="rabi_fit_failed",
+                                                 error=str(exc)))
+                       if args.out else None)
+            if written:
+                print(f"  wrote {written} (the sweep that failed)")
             if args.plot:
-                print(f"  wrote {plot_rabi_table(exc.table, args.plot)} "
-                      f"(the sweep that failed)")
+                fig = plot_rabi_table(exc.table, args.plot)
+                print(f"  wrote {fig} (the sweep that failed)")
+                if written and is_hdf5(written):
+                    attach_figures(written, {"rabi": fig})
             raise
 
     rec = out["operating_point"]
@@ -2812,38 +2884,51 @@ def main() -> None:
               f" -- leakage {abl['leakage_with_chirp']:.2e} vs "
               f"{abl['leakage_flat_carrier']:.2e}")
 
+    written = None
     if args.out:
-        from snail_solver.paths import in_results
-        path = in_results(args.out)
+        written = save_doc(in_results(args.out),
+                           {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
+                            "stages": out["stages"]},
+                           attrs=_run_attrs(device_path))
+        print(f"  written {written}")
 
-        def _plain(o):
-            if isinstance(o, np.ndarray):
-                return o.tolist()
-            if isinstance(o, (np.floating, np.integer)):
-                return o.item()
-            return str(o)
-        with open(path, "w") as fh:
-            json.dump({"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
-                       "stages": out["stages"]}, fh, indent=2, default=_plain)
-        print(f"  written {path}")
+    # Every figure rendered below is also embedded in the run file, so the run
+    # travels as ONE artefact -- the pictures cannot drift away from the arrays
+    # they were drawn from, or be paired with another run's.
+    figs: Dict[str, str] = {}
 
     if args.plot:
-        print(f"  wrote {plot_rabi_table(out['stages']['rabi'], args.plot)}")
+        figs["rabi"] = plot_rabi_table(out["stages"]["rabi"], args.plot)
+        print(f"  wrote {figs['rabi']}")
 
     if args.plot_ridge:
-        ridge_path = plot_chirp_ridge(out["stages"]["rabi"], out["stages"]["chirp"],
-                                      rec["wp_offset_GHz"], rec["t_g_ns"], args.plot_ridge)
-        print(f"  wrote {ridge_path}")
+        figs["chirp_ridge"] = plot_chirp_ridge(
+            out["stages"]["rabi"], out["stages"]["chirp"], rec["wp_offset_GHz"],
+            rec["t_g_ns"], args.plot_ridge)
+        print(f"  wrote {figs['chirp_ridge']}")
 
     if args.plot_post_chirp:
         post = out["stages"].get("post_chirp")
         if post:
-            post_path = plot_post_chirp_table(post, out=args.plot_post_chirp,
-                                              rabi_table=out["stages"]["rabi"])
-            print(f"  wrote {post_path}")
+            figs["post_chirp"] = plot_post_chirp_table(
+                post, out=args.plot_post_chirp, rabi_table=out["stages"]["rabi"])
+            print(f"  wrote {figs['post_chirp']}")
         else:
             print("  --plot-post-chirp given but no post_chirp stage ran "
                   "(pass --post-chirp-points > 0)")
+
+    # With no --out, a --replot re-embeds into the document it drew FROM: that is
+    # the point of replotting after a plotting-code change, and it rewrites only
+    # that document's figures group.
+    dest = written or args.replot
+    if figs and dest:
+        if is_hdf5(split_address(dest)[0]):
+            n = attach_figures(dest, figs)
+            print(f"  embedded {n} figure(s) in {dest} "
+                  f"(python -m snail_solver.h5_io {dest} --extract DIR)")
+        elif written:
+            print("  (--out is JSON, which cannot hold the figures; use an HDF5 "
+                  "--out to keep them with the run)")
 
     if args.save_point:
         from snail_solver.operating_points import save_point

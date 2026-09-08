@@ -56,10 +56,42 @@ Usage
         --outdir results/etasweep_1Gate4.2SNAIL \\
         --plot figs/etasweep_1Gate4.2SNAIL/gate_quality_vs_eta.png
 
+One file per sweep
+------------------
+Everything the fan-out produces goes into ONE HDF5 file (``h5_io``)::
+
+    eta_sweep.h5
+      /sweep              <- the summary document: rows, settings, timings
+      /runs/eta1p2        <- that eta's COMPLETE tune-up, in tune_up's --out schema
+      /runs/eta1p5             (operating_point, t_g0_ns, stages -- every chevron)
+      /runs/eta1p8        <- a FAILED eta keeps its measured chevrons here too
+      /sweep/figures      <- the rendered figures, stored with the data they draw
+      /runs/eta1p2/figures     (--plot-each; extract them with h5_io, see below)
+
+so a sweep is one artefact to copy off the cluster instead of a directory of
+per-eta JSONs, and each eta's calibration stays addressable on its own::
+
+    python -m snail_solver.tune_up --replot results/.../eta_sweep.h5:/runs/eta1p8 \\
+        --plot-ridge figs/eta1p8_ridge.png
+    python -m snail_solver.post_chirp --device 1Gate4.2SNAIL.json \\
+        --from-tuneup results/.../eta_sweep.h5:/runs/eta1p8 ...
+
+Reading one group reads only that group, so replotting the summary never pays
+for the chevrons. ``--out something.json`` still writes the summary as text, and
+then the per-eta runs land beside it as ``tuneup_<tag>.h5`` (JSON cannot hold
+several documents in one file).
+
+Figures live in the file too: ``--plot-each`` embeds each eta's chevrons, ridge
+and post-chirp figure in that eta's own group, and ``--plot`` embeds the summary
+figure in ``/sweep`` -- so pulling one eta out of a sweep brings its pictures with
+it, and none of them can be paired with the wrong run::
+
+    python -m snail_solver.h5_io eta_sweep.h5:/runs/eta1p8 --extract figs/eta1p8/
+
 Re-plot from a finished run, with no solves at all::
 
     python -m snail_solver.tune_up_sweep --replot \\
-        results/etasweep_1Gate4.2SNAIL/eta_sweep.json --plot figs/final.png
+        results/etasweep_1Gate4.2SNAIL/eta_sweep.h5 --plot figs/final.png
 """
 from __future__ import annotations
 
@@ -67,10 +99,16 @@ import argparse
 import json
 import logging
 import os
+import platform
+import shlex
+import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
+
+from snail_solver.h5_io import (attach_figures, has_group, is_hdf5, load_doc,
+                                save_doc, save_tree, split_address)
 
 TWO_PI = 2.0 * np.pi
 
@@ -107,6 +145,63 @@ def parse_etas(spec: str) -> List[float]:
     if any(e <= 0.0 for e in etas):
         raise ValueError(f"--target-etas {spec!r}: every eta must be > 0")
     return etas
+
+
+def sweep_holds_runs(sweep_path: Optional[str]) -> bool:
+    """Whether this sweep output can hold the per-eta runs inside itself.
+
+    Only HDF5 can. The JSON fallback is not a deprecated path so much as the
+    honest one: a text summary cannot carry nine tune-ups' worth of binary
+    traces, so those go beside it instead.
+    """
+    return bool(sweep_path
+                and os.path.splitext(split_address(sweep_path)[0])[1].lower() != ".json")
+
+
+def store_run(tag: str, doc: Dict[str, Any], *, sweep_path: Optional[str] = None,
+              outdir: Optional[str] = None,
+              attrs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Put one eta's complete tune-up document where this sweep keeps its runs.
+
+    Into ``<sweep>.h5:/runs/<tag>`` when the sweep output is HDF5 -- one file for
+    the whole fan-out -- and otherwise into ``<outdir>/tuneup_<tag>.h5`` beside a
+    JSON summary. Either way the stored document is in ``tune_up``'s own ``--out``
+    schema, so the address this returns can be handed straight to
+    ``tune_up --replot`` or ``post_chirp --from-tuneup``.
+
+    Written as each eta finishes rather than at the end, so a sweep killed at
+    hour six still has its first five hours on disk.
+
+    Returns
+    -------
+    str or None
+        The address written (``file`` or ``file:/group``), or None when there is
+        nowhere to put it (no `sweep_path` and no `outdir`).
+    """
+    if sweep_holds_runs(sweep_path):
+        return save_doc(split_address(sweep_path)[0], doc, attrs=attrs,
+                        group=f"runs/{tag}")
+    if outdir:
+        return save_doc(os.path.join(outdir, f"tuneup_{tag}.h5"), doc, attrs=attrs)
+    return None
+
+
+def embed_figures(run_address: Optional[str], figures: Dict[str, str]) -> int:
+    """Put this eta's figures inside the document its data went to.
+
+    The per-eta figures are also written under ``<outdir>/figs/<tag>/`` as they
+    always were; this is the copy that cannot be separated from the run. A sweep
+    file therefore carries one ``figures`` group per eta, and a run addressed out
+    of it (``FILE:/runs/eta1p8``) brings its own pictures along.
+
+    Silent no-op when there is nowhere to put them (no run stored, or a JSON
+    summary with no HDF5 file behind it) -- a figure never fails a sweep.
+    """
+    if not run_address or not figures:
+        return 0
+    if not is_hdf5(split_address(run_address)[0]):
+        return 0
+    return attach_figures(run_address, figures)
 
 
 def eta_tag(eta: float) -> str:
@@ -208,7 +303,8 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
                   post_chirp_points: int = 0,
                   flat_refit_length: bool = False, fit_virtual_z: bool = True,
                   jobs: int = 0, solver: Optional[Dict[str, Any]] = None,
-                  outdir: Optional[str] = None, plot_each: bool = False,
+                  outdir: Optional[str] = None, sweep_path: Optional[str] = None,
+                  plot_each: bool = False,
                   save_point_prefix: Optional[str] = None, overwrite: bool = False,
                   stop_on_error: bool = False,
                   logger: Optional[logging.Logger] = None,
@@ -235,6 +331,12 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
         `plot_chirp_ridge` cannot draw -- `plot_each` needs the fixed span.
     flat_refit_length : bool, default False
         Also score a flat carrier with its OWN fitted length (a third series).
+    sweep_path : str, optional
+        The sweep's own output file. When it is HDF5, each eta's complete
+        tune-up is stored INSIDE it under ``runs/<tag>`` as that eta finishes
+        (see :func:`store_run`); the row then carries the address. Without it
+        (or with a ``.json`` sweep output) the runs go to `outdir` as separate
+        files.
     save_point_prefix : str, optional
         Save each result into the device JSON as ``<prefix>_eta1p8``. Needs
         `device_path`.
@@ -298,19 +400,22 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
             row.update({"ok": False, "seconds": time.perf_counter() - t0,
                         "error": {"type": "RabiFitError", "stage": "rabi",
                                   "message": str(exc)}})
-            if outdir:
-                p = os.path.join(outdir, f"failed_{tag}.json")
-                with open(p, "w") as fh:
-                    json.dump({"stages": {"rabi": exc.table}}, fh, indent=2,
-                              default=_plain)
-                row["partial_json"] = p
-                if plot_each:
-                    fig = os.path.join(outdir, "figs", tag, "rabi_chevrons_FAILED.png")
-                    try:
-                        TU.plot_rabi_table(exc.table, fig)
-                        row["figs"] = {"rabi": fig}
-                    except Exception as pexc:            # a figure is never fatal
-                        log.info(f"  plot skipped: {type(pexc).__name__}: {pexc}")
+            p = store_run(tag, {"stages": {"rabi": exc.table}},
+                          sweep_path=sweep_path, outdir=outdir,
+                          attrs={"target_eta": float(eta_star),
+                                 "status": "rabi_fit_failed",
+                                 "error": str(exc)})
+            if p:
+                row["run"] = p
+                log.info(f"  the chevrons that failed are in {p}")
+            if plot_each and outdir:
+                fig = os.path.join(outdir, "figs", tag, "rabi_chevrons_FAILED.png")
+                try:
+                    TU.plot_rabi_table(exc.table, fig)
+                    row["figs"] = {"rabi": fig}
+                    embed_figures(p, {"rabi": fig})
+                except Exception as pexc:                # a figure is never fatal
+                    log.info(f"  plot skipped: {type(pexc).__name__}: {pexc}")
             log.warning(f"  eta={eta_star:g} FAILED (RabiFitError): {exc}")
             rows.append(row)
             if stop_on_error:
@@ -330,16 +435,17 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
         rec = out["operating_point"]
         stages = out["stages"]
 
-        # Write the per-eta result in tune_up's OWN --out schema, so
-        #   tune_up --replot <file> --plot-ridge ...
-        #   post_chirp --from-tuneup <file> ...
-        # both work on it verbatim.
-        if outdir:
-            p = os.path.join(outdir, f"tuneup_{tag}.json")
-            with open(p, "w") as fh:
-                json.dump({"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
-                           "stages": stages}, fh, indent=2, default=_plain)
-            row["tuneup_json"] = p
+        # Store the per-eta result in tune_up's OWN --out schema, so
+        #   tune_up --replot <address> --plot-ridge ...
+        #   post_chirp --from-tuneup <address> ...
+        # both work on it verbatim -- whether it lives in this sweep's file or
+        # in its own.
+        p = store_run(tag, {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
+                            "stages": stages},
+                      sweep_path=sweep_path, outdir=outdir,
+                      attrs={"target_eta": float(eta_star), "status": "ok"})
+        if p:
+            row["run"] = p
 
         if plot_each and outdir:
             figs = {}
@@ -347,7 +453,9 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
             for name, fn in (
                     ("rabi", lambda: TU.plot_rabi_table(
                         stages["rabi"], os.path.join(fdir, "rabi_chevrons.png"))),
-                    ("ridge", lambda: TU.plot_chirp_ridge(
+                    # named as tune_up names it, so figure_names() reads the same
+                    # on a run stored here and on a standalone tune_up --out
+                    ("chirp_ridge", lambda: TU.plot_chirp_ridge(
                         stages["rabi"], stages["chirp"], rec["wp_offset_GHz"],
                         rec["t_g_ns"], os.path.join(fdir, "chirp_ridge.png"))),
                     ("post_chirp", lambda: TU.plot_post_chirp_table(
@@ -363,6 +471,9 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
                     log.info(f"  {name} plot skipped: "
                              f"{type(pexc).__name__}: {pexc}")
             row["figs"] = figs
+            # ... and into that eta's OWN group, so one run pulled out of the
+            # sweep file (tune_up --replot FILE:/runs/eta1p8) brings its pictures.
+            embed_figures(p, figs)
 
         # --- score the real gate, chirped vs flat -----------------------------
         log.info(f"  scoring the gate at t_g={rec['t_g_ns']:.3f} ns")
@@ -652,10 +763,15 @@ def main() -> None:
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
     ap.add_argument("--outdir", default=None,
-                    help="per-eta JSONs and figures land here "
-                         "[results/etasweep_<device>]")
+                    help="figures land here, and the per-eta runs too when --out "
+                         "is JSON [results/etasweep_<device>]")
     ap.add_argument("--out", default=None,
-                    help="the sweep JSON [<outdir>/eta_sweep.json]")
+                    help="the sweep file [<outdir>/eta_sweep.h5]. HDF5 holds the "
+                         "whole fan-out: the summary under /sweep and each eta's "
+                         "complete tune-up under /runs/<tag>, each addressable as "
+                         "FILE:/runs/eta1p8 by tune_up --replot and post_chirp "
+                         "--from-tuneup. A .json target keeps the old layout: a "
+                         "text summary, with the runs beside it as tuneup_<tag>.h5")
     ap.add_argument("--plot", nargs="?", const="figs/gate_quality_vs_eta.png",
                     default=None, help="the summary figure")
     ap.add_argument("--plot-each", action="store_true",
@@ -666,16 +782,23 @@ def main() -> None:
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--stop-on-error", action="store_true",
                     help="abort on the first failing eta instead of recording it")
-    ap.add_argument("--replot", metavar="JSON", default=None,
-                    help="regenerate --plot from a previous --out -- no solves")
+    ap.add_argument("--replot", metavar="FILE", default=None,
+                    help="regenerate --plot from a previous --out -- no solves. "
+                         "HDF5 or (pre-HDF5) JSON, detected by content; only the "
+                         "summary group is read, never the stored runs")
     args = ap.parse_args()
 
     # --- the zero-solve path, before anything heavy is imported -----------
     if args.replot:
-        with open(args.replot) as fh:
-            doc = json.load(fh)
+        # Reading /sweep alone keeps a summary replot cheap: the runs in the same
+        # file are the bulk of it, and the figure does not use them.
+        target = (args.replot + ":/sweep" if has_group(args.replot, "sweep")
+                  else args.replot)
+        doc = load_doc(target)
         path = plot_eta_sweep(doc, out=args.plot or "figs/gate_quality_vs_eta.png")
         print(f"wrote {path}")
+        # re-drawn from this file, so refresh the copy it carries
+        embed_figures(target, {"gate_quality_vs_eta": path})
         return
 
     if not args.device:
@@ -703,7 +826,18 @@ def main() -> None:
     stem = os.path.splitext(os.path.basename(args.device))[0]
     outdir = args.outdir or in_results(f"etasweep_{stem}")
     os.makedirs(outdir, exist_ok=True)
-    out_json = args.out or os.path.join(outdir, "eta_sweep.json")
+    out_path = args.out or os.path.join(outdir, "eta_sweep.h5")
+    holds_runs = sweep_holds_runs(out_path)
+    if holds_runs:
+        # Truncate ONCE, up front. The per-eta runs are appended as they finish,
+        # so without this a rerun into the same name would inherit the previous
+        # sweep's runs for every eta this one fails to reach.
+        save_tree(out_path, {}, attrs={
+            "tool": "snail_solver.tune_up_sweep",
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "command": "python -m snail_solver.tune_up_sweep "
+                       + " ".join(shlex.quote(a) for a in sys.argv[1:]),
+            "device": str(device_path), "host": platform.node()})
 
     map_kw: Dict[str, Any] = {}
     if args.leak_max is not None:
@@ -730,13 +864,16 @@ def main() -> None:
         fit_virtual_z=not args.no_fit_virtual_z,
         jobs=args.jobs,
         solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},
-        outdir=outdir, plot_each=args.plot_each,
+        outdir=outdir, sweep_path=out_path, plot_each=args.plot_each,
         save_point_prefix=args.save_points, overwrite=args.overwrite,
         stop_on_error=args.stop_on_error, logger=logger, **map_kw)
 
-    with open(out_json, "w") as fh:
-        json.dump(doc, fh, indent=2, default=_plain)
-    print(f"\n  written {out_json}")
+    if holds_runs:
+        save_doc(out_path, doc, group="sweep")
+    else:
+        with open(out_path, "w") as fh:
+            json.dump(doc, fh, indent=2, default=_plain)
+    print(f"\n  written {out_path}")
 
     print("\n=== gate quality vs drive ===")
     print(f"  {'eta*':>6} {'t_g/ns':>8} {'F_chirp':>9} {'F_flat':>9} "
@@ -754,11 +891,17 @@ def main() -> None:
     print(f"  {s['n_ok']} ok, {s['n_failed']} failed, {s['seconds'] / 60:.1f} min")
 
     if args.plot:
-        # A sweep whose JSON is on disk has not failed, even if every eta did: the
+        # A sweep whose file is on disk has not failed, even if every eta did: the
         # failures ARE the result. Do not turn "nothing to draw" into a non-zero exit
         # that looks like the run itself died.
         try:
-            print(f"  wrote {plot_eta_sweep(doc, out=args.plot)}")
+            fig = plot_eta_sweep(doc, out=args.plot)
+            print(f"  wrote {fig}")
+            if embed_figures(f"{out_path}:/sweep" if holds_runs else out_path,
+                             {"gate_quality_vs_eta": fig}):
+                print(f"  embedded it in {out_path} "
+                      f"(python -m snail_solver.h5_io {out_path}:/sweep "
+                      f"--extract DIR)")
         except ValueError as exc:
             print(f"  no figure: {exc}")
 

@@ -7,7 +7,7 @@
   "lam_a": 0.1,
   "lam_b": 0.1,
   "coupler_freq_GHz": 4.5,
-  "coupler_levels": 5,
+  "coupler_levels": 7,
   "g3_GHz": 0.06,
   "g4_GHz": 0.0,  
   "anchor": 1,

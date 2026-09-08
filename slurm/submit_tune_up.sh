@@ -80,7 +80,7 @@ for DEV in "${DEVLIST[@]}"; do
     fi
 
     JID=$(env DEVICE="${DEV}" TARGET_ETA="${ETA}" SAVE_POINT="${POINT}" OVERWRITE=1 \
-               OUT="tuneup_${TAG}.json" PLOT_OUT="${PLOT_OUT}" \
+               OUT="tuneup_${TAG}.h5" PLOT_OUT="${PLOT_OUT}" \
                PLOT_RIDGE_OUT="${PLOT_RIDGE_OUT}" ${PASS} \
           sbatch --parsable --job-name="tu_${TAG}" --cpus-per-task="${CPUS}" \
                  slurm/snail_tune_up.slurm)
@@ -98,7 +98,8 @@ submitted: ${IDS}
 
 when they finish:
   uv run python -m snail_solver.operating_points --device <dev>   # list saved points
-  cat results/tuneup_<dev>_eta<value>.json                        # full per-stage data
+  python -m snail_solver.h5_io results/tuneup_<dev>_eta<value>.h5  # what is in it
+  python -m snail_solver.h5_io results/tuneup_<dev>_eta<value>.h5 --extract figs/
   open figs/tuneup_<dev>_eta<value>/rabi_chevrons.png              # every chevron + fit
   open figs/tuneup_<dev>_eta<value>/chirp_ridge.png                # chirp riding the ridge
 

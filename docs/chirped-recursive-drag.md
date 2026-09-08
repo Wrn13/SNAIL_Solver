@@ -974,3 +974,228 @@ python -m snail_solver.validate_recursive_drag        # P7
    Context). The whole `SinePowerRamp` design assumes the `pi·t'/t_r` reading.
 2. `--max-drag-iters` default may need raising once the K-dependence of the chirp↔length
    convergence is measured (Phase 6).
+
+---
+
+## Addendum, 2026-09-03 — how far the gate must sit from the subharmonic, measured
+
+Section 4 above showed the truncation spread collapsing as `w_s` was walked away
+from `2 w_p`, on four hand-picked points. `snail_solver.subharmonic_convergence`
+turns that into a calibrated map: `coupler_levels` against
+`Delta_sub = w_s - 2 w_p`, coloured by fidelity, with each column re-calibrated
+(offset + length, at fixed peak `|eta|`) so the answer is truncation error rather
+than a stale calibration. Two runs on `4Gate4.5SNAIL` (`w_a = 3.5`, `w_s = 4.5`,
+`g3 = 0.06`, `lam = 0.1`), 13 coupler levels as the reference, tolerance 2e-3.
+
+The axis moves the PARTNER QUBIT — `w_b = w_a + (w_s - Delta_sub)/2` — not the
+SNAIL. The iSWAP rate `6 g3 lam_a lam_b eta` carries no `w_p`, so at fixed
+`target_eta` every column runs at the same nominal length and drive, and only the
+spurious detuning moves.
+
+### `eta = 0.6` (inside the validity domain), 8 columns x 6 truncations, 31 min
+
+| `Delta_sub` | \|alpha\| | transfer | F(3) | F(5) | F(7) | F(9) | F(11) | F(13) | max spread |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.050 | 1.296 | 0.743 ! | 0.859 | 0.308 | 0.498 | 0.857 | 0.882 | 0.880 | 5.7e-01 |
+| 0.074 | 0.872 | 0.985 | 0.984 | 0.108 | 0.729 | 0.800 | 0.970 | 0.976 | 8.7e-01 |
+| 0.110 | 0.587 | 0.985 | 0.971 | 0.963 | 0.930 | 0.838 | 0.948 | 0.969 | 1.3e-01 |
+| 0.164 | 0.395 | 0.895 ! | 0.976 | 0.912 | 0.815 | 0.715 | 0.841 | 0.927 | 2.1e-01 |
+| 0.244 | 0.266 | 0.772 ! | 0.951 | 0.963 | 0.975 | 0.954 | 0.559 | 0.756 | 2.2e-01 |
+| 0.362 | 0.179 | 0.999 | 0.988 | 0.994 | 0.995 | 0.997 | 0.997 | 0.996 | 8.0e-03 |
+| **0.538** | **0.120** | **0.999** | **0.997** | **0.996** | **0.996** | **0.997** | **0.997** | **0.997** | **5.2e-04** |
+| 0.800 | 0.081 | 0.999 | 0.991 | 0.995 | 0.971 | 0.976 | 0.982 | 0.983 | 1.2e-02 |
+
+`!` = calibrated transfer under 0.9, i.e. that column's cells all score a badly
+calibrated pulse and its spread is not evidence about the truncation.
+
+**`Delta_sub = 0.538 GHz` is a converged operating point: every truncation from 3
+to 13 levels agrees to 5.2e-04 at `F = 0.997`.** Three coupler levels is enough
+there — the cheapest trustworthy simulation of this device found so far.
+
+### `eta = 1.2` (past the validity domain), 13 columns x 6 truncations, 17 min
+
+Ten of the thirteen columns could not be calibrated at all (transfer 0.14–0.88):
+inside `Delta_sub < 0.7 GHz` the coupler holds 1.8–2.9 photons at `t_g` and the
+"iSWAP" is not an iSWAP. Of the three healthy columns (0.800, 1.350, 1.900), only
+`Delta_sub = 1.35 GHz` converges — 5, 9, 11 and 13 levels agree to 5.6e-04 at
+`F = 0.9956`.
+
+### The rule both runs agree on
+
+Convergence tracks `|alpha|`, not `Delta_sub`:
+
+| run | converged column | \|alpha\| there | nearest non-converged | \|alpha\| there |
+|---|---|---|---|---|
+| `eta = 0.6` | 0.538 (and 0.362) | 0.120 (0.179) | 0.244 | 0.266 |
+| `eta = 1.2` | 1.350 | 0.192 | 1.150 | 0.225 |
+
+> **SUPERSEDED — see the 2026-09-03 two-sided addendum below.** Both runs above
+> sampled only `Delta_sub > 0` (`2 w_p < w_s`). Sampling the other side shows the
+> effect is NOT a function of `|alpha|`: at `2 w_p > w_s` the coupler stays cold
+> and 7 levels converge even at `|alpha| = 1.08`. The `|alpha|` threshold below
+> is real but is a property of the POSITIVE branch alone.
+
+Both put the threshold at **`|alpha| ~ 0.2`**, i.e.
+
+    Delta_sub  >~  15 g3 eta^2         (|alpha| = 3 g3 eta^2 / Delta_sub  <~  0.2)
+
+which is 0.32 GHz at `eta = 0.6` and 1.30 GHz at `eta = 1.2` for `g3 = 0.06` —
+both borne out. The predicted level count `|alpha|^2 + 4|alpha| + 1` is then under
+2, consistent with 3 levels sufficing at `Delta_sub = 0.538`.
+
+**The rule is necessary, not sufficient.** Convergence is NOT monotone in
+`Delta_sub`: at `eta = 0.6` the outermost column (0.800, `|alpha| = 0.081`)
+regresses to a 1.2e-02 spread at 7 and 9 levels with the coupler cold
+(`<n_s> = 0.001`), so something other than the displacement is at work there; at
+`eta = 1.2`, 1.600 and 2.200 are both worse than 1.350. Check the specific
+operating point — that is what the map is for.
+
+### Consequences for this device
+
+1. `4Gate4.5SNAIL` as shipped sits at `Delta_sub = +3.90 GHz`, which satisfies the
+   rule at any sane drive — but it is 67 MHz from the 2-pump `b -> s` conversion
+   at 3.833 GHz, a different collision entirely. Worth its own check.
+2. Phase 7 work wanting a cheap converged model should use `eta = 0.6` at
+   `Delta_sub = 0.538 GHz` (`w_b = 5.481`, `t_g = 209.5 ns`, 3 coupler levels).
+3. `eta = 1.2` is not usable on this device at any detuning sampled inside
+   2.2 GHz. That is the same conclusion section 6 reached from drive strength
+   alone, now with the placement axis held responsible separately.
+
+Reproduce (both runs are cached under `results/subharm_*`, so a re-run only fills
+gaps, and `--replot` re-reads the boundary at a different `--tol` for free):
+
+```bash
+uv run python -m snail_solver.subharmonic_convergence \
+    --device 4Gate4.5SNAIL.json --target-eta 0.6 \
+    --detunings 0.05:0.8:8:log --levels 3,5,7,9,11,13 --tg-lo 0.5 \
+    --wp-points 31 --jobs 30 --outdir results/subharm_4Gate4.5SNAIL_eta0p6 \
+    --plot figs/subharm_4Gate4.5SNAIL_eta0p6/convergence_map.png
+```
+
+---
+
+## Addendum 2, 2026-09-03 — isolating the subharmonic: it is sign-asymmetric
+
+The runs above walked the pump one way only (`2 w_p < w_s`, `Delta_sub > 0`) and
+concluded that convergence tracks `|alpha| = 3 g3 eta^2 / |Delta_sub|`. **That
+conclusion is wrong as stated.** Sampling both sides of the resonance shows the
+damage is confined to `2 w_p < w_s`; on the other branch the coupler stays cold
+and the model converges at 7 levels even at `|alpha| = 1.08`.
+
+### The design
+
+`w_a = 3.5`, `w_s = 4.5` puts the nearest other resonances at `Delta_sub = +1.0`
+(`2 w_p = w_a`) and `-2.5` (`w_p = w_a`), leaving a clean 3.5 GHz window. Inside
+it, MIRRORED PAIRS at `|Delta_sub| = 0.06, 0.10, 0.16, 0.25, 0.40, 0.63` plus
+negative-only columns at `-1.0, -1.6, -2.0`; `eta = 0.6`; 3-18 coupler levels
+with **18 as the reference**; every column re-calibrated (offset + length) at 18
+levels. 15 columns x 6 truncations = 90 cells, 47 min.
+
+A mirrored pair shares `|alpha|` EXACTLY, while every other pump-activated
+channel sits at a different detuning on the two sides because
+`w_p = (w_s -/+ |Delta_sub|)/2` differs. So the pair comparison is the isolation
+experiment, and it needs no modelling.
+
+### The mirror table (`F` at 18 levels)
+
+| `\|Delta_sub\|` | `\|alpha\|` | `F(+)` | `F(-)` | `\|diff\|` | `n_s(+)` | `n_s(-)` |
+|---|---|---|---|---|---|---|
+| 0.060 | 1.080 | 0.95226 | 0.99668 | 4.4e-02 | 0.0283 | 0.0014 |
+| 0.100 | 0.648 | 0.92992 | 0.99669 | 6.7e-02 | 0.1471 | 0.0017 |
+| 0.160 | 0.405 | 0.63908 | 0.99636 | 3.6e-01 | 0.9693 | 0.0011 |
+| 0.250 | 0.259 | 0.62934 | 0.99685 | 3.7e-01 | 1.1661 | 0.0008 |
+| 0.400 | 0.162 | 0.99651 | 0.99669 | 1.7e-04 | 0.0018 | 0.0011 |
+| 0.630 | 0.103 | 0.99657 | 0.99499 | 1.6e-03 | 0.0017 | 0.0035 |
+
+Median `|F(+) - F(-)| = 5.6e-02` against a 2e-3 tolerance. The two sides do NOT
+agree, so `|alpha|` is not the controlling parameter.
+
+### It really is the subharmonic, and it really is the sign
+
+Two checks, because "the sides differ" is not yet "the subharmonic differs".
+
+**1. Nothing else differs.** `spectator_audit.interaction_channels` at `+/-0.25`,
+window 0.9 GHz:
+
+| | `Delta_sub = +0.25` | `Delta_sub = -0.25` |
+|---|---|---|
+| 2p SNAIL subharmonic | det **-249.7** MHz, g 64.80, ratio 0.26 | det **+249.2** MHz, g 64.80, ratio 0.26 |
+| 1p `\|2>` leakage (via A/B) | det -119.8 / -120.2 MHz, g 3.05 | det -119.6 / -120.4 MHz, g 3.05 |
+
+The subharmonic's strength and `|Omega/Delta|` are IDENTICAL; only the sign of its
+detuning flips. Every other channel is unchanged -- the `|2>` leakage sits at the
+anharmonicity on both sides, as it must (`w_p - (w_b - w_a + alpha) = -alpha`,
+independent of `w_p`), and so does the `b <-> s` conversion
+(`w_s - w_a` identically, for `w_p > w_s - w_a`).
+
+**2. It is not the calibration.** The `+` side's length fit failed
+(`t_g = 185` vs `219 ns`), so the pulses differed too. Scoring BOTH signs with
+BOTH pulses removes that:
+
+| `Delta_sub` | pulse from | `t_g` | `F(5)` | `F(9)` | `F(13)` | `F(18)` | `n_s(18)` |
+|---|---|---|---|---|---|---|---|
+| +0.25 | +0.25 | 185 ns | 0.978 | 0.946 | 0.922 | **0.629** | 1.17 |
+| +0.25 | -0.25 | 219 ns | 0.982 | 0.918 | 0.932 | **0.451** | 2.23 |
+| -0.25 | +0.25 | 185 ns | 0.963 | 0.964 | 0.964 | **0.964** | 0.004 |
+| -0.25 | -0.25 | 219 ns | 0.994 | 0.997 | 0.997 | **0.997** | 0.001 |
+
+With either pulse the `+` side runs away and the `-` side is flat in `N`. The
+failed calibration on the `+` side is a SYMPTOM of the hot coupler, not its cause.
+
+Note the direction of the `+`-side error: `F` falls monotonically as levels are
+ADDED (0.978 -> 0.946 -> 0.922 -> 0.629) while `n_s` grows. More room lets the
+ladder climb further -- the `n^1.5` cubic self-term of section 6, now localised to
+one branch.
+
+### The result
+
+| branch | 3 levels | 5 | 7 | 9 | 13 |
+|---|---|---|---|---|---|
+| `2 w_p > w_s` (`Delta_sub < 0`) | none of 9 | `>= 2.00` | **`>= 0.06` (9/9)** | **`>= 0.06` (9/9)** | **`>= 0.06` (9/9)** |
+| `2 w_p < w_s` (`Delta_sub > 0`) | none of 6 | `>= 0.40` | `>= 0.40` (2/6) | `>= 0.40` (2/6) | `>= 0.40` (2/6) |
+
+**Place the gate so that `2 w_p > w_s` and 7 coupler levels are enough anywhere
+down to 60 MHz from the subharmonic** (`F = 0.9966`, `n_s ~ 1e-3`, spread
+`~1e-3`). On the other branch nothing under 18 levels converges inside
+`|Delta_sub| = 0.40 GHz`, and the fidelity there is 0.63-0.95 regardless.
+
+### Open: the `+`-branch damage is not monotone in `Delta_sub`
+
+`n_s` on the positive branch peaks at `Delta_sub = 0.16-0.25` (0.97, 1.17
+photons) and is SMALLER closer in (0.028 at 0.06, 0.147 at 0.10), where
+`|alpha|^2` is largest. That is resonance-like, not `1/Delta^2`-like, and it is
+not explained by the displacement picture. A cubic-nonlinearity cascade fits the
+shape -- climbing the ladder shifts successive transitions, so one sign of
+detuning sweeps INTO resonance as `n` grows and the other sweeps out, with the
+cascade condition met at a particular detuning rather than at `Delta -> 0` -- but
+that is a hypothesis, not a measurement. The test is a fine `Delta_sub` scan on
+the positive branch with `<n_s>(t)` recorded THROUGH the pulse rather than at
+`t_g`.
+
+### Two tooling findings from this run
+
+**The GPU is 6x slower here.** `--gpu-levels-min N` routes the big truncations
+through qutip-jax / diffrax. Measured on an NVIDIA GH200, `t_g = 209 ns`,
+`Delta_sub = 0.538`: a 13-level cell took **761 s on the GPU against 128 s on one
+CPU core** (18 levels: 176 s on CPU), at 95% device utilisation, with `F`
+agreeing to six digits (0.996610). dim ~ 162 with a time-dependent coefficient is
+far below the JAX crossover, and the CPU alternative is `jobs` independent cells
+at once, not one core. Use it to cross-check the CPU path, not to go faster.
+
+**Pin the BLAS threads.** At 18 levels (dim 162) numpy goes threaded where 13 did
+not: 15 pool workers took **127 threads each**, ~1900 threads on 72 cores, load
+average 107, each worker burning 310% CPU to do one core's work. The CLI now sets
+`OMP_NUM_THREADS=1` and friends before numpy loads (and only as the CLI). Load
+dropped 107 -> 17 and the run finished in 47 min.
+
+Reproduce:
+
+```bash
+uv run python -m snail_solver.subharmonic_convergence \
+    --device 4Gate4.5SNAIL.json --target-eta 0.6 \
+    --detunings=0.06,0.1,0.16,0.25,0.4,0.63,-0.06,-0.1,-0.16,-0.25,-0.4,-0.63,-1.0,-1.6,-2.0 \
+    --levels 3,5,7,9,13,18 --ref-levels 18 --calib-levels 18 \
+    --tg-lo 0.5 --tg-hi 1.4 --wp-points 31 --jobs 30 \
+    --outdir results/subharm_4Gate_mirror_eta0p6 \
+    --plot figs/subharm_4Gate_mirror_eta0p6/convergence_map.png
+```

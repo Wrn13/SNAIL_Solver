@@ -24,25 +24,18 @@ partial rotation.
 Usage
 -----
     python -m snail_solver.post_chirp --device 1Gate4.2SNAIL.json \\
-        --from-tuneup results/tuneup_probe_dev1_eta1p8_wide.json \\
+        --from-tuneup results/tuneup_probe_dev1_eta1p8_wide.h5 \\
         --eta-lo 0.5 --eta-hi 1.0 --amp-points 7 --wp-points 25 --jobs 16 \\
-        --out post_chirp_dev1_eta1p8.json \\
+        --out post_chirp_dev1_eta1p8.h5 \\
         --plot figs/probe_dev1_eta1p8_wide/post_chirp_chevrons.png
 """
 from __future__ import annotations
 
 import argparse
-import json
 from typing import Any, Dict, Optional
 
-
-def _plain(o: Any) -> Any:
-    import numpy as np
-    if isinstance(o, np.ndarray):
-        return o.tolist()
-    if isinstance(o, (np.floating, np.integer)):
-        return o.item()
-    return str(o)
+from snail_solver.h5_io import (attach_figures, is_hdf5, load_doc, save_doc,
+                                split_address)
 
 
 def main() -> None:
@@ -55,9 +48,10 @@ def main() -> None:
                          "required even with --from-tuneup, since a tune-up "
                          "result does not embed the full device config")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--from-tuneup", metavar="JSON", default=None,
-                     help="a tune_up --out JSON: reads operating_point and "
-                          "stages.rabi")
+    src.add_argument("--from-tuneup", metavar="FILE", default=None,
+                     help="a tune_up --out file (HDF5, or pre-HDF5 JSON): reads "
+                          "operating_point and stages.rabi. FILE:/runs/eta1p8 "
+                          "reads one run out of a tune_up_sweep file")
     src.add_argument("--point", metavar="NAME", default=None,
                      help="a saved operating point's name in --device's own "
                           "JSON (see operating_points.save_point)")
@@ -87,12 +81,15 @@ def main() -> None:
     ap.add_argument("--atol", type=float, default=1e-10)
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
-    ap.add_argument("--out", default=None, help="write the result to JSON")
+    ap.add_argument("--out", default=None,
+                    help="write the result here, under results/ unless absolute; "
+                         "HDF5 (a bare name gains .h5), or JSON on a .json suffix")
     ap.add_argument("--plot", nargs="?", const="figs/post_chirp_chevrons.png",
                     default=None)
-    ap.add_argument("--replot", metavar="JSON", default=None,
+    ap.add_argument("--replot", metavar="FILE", default=None,
                     help="skip the run entirely and regenerate --plot from a "
-                         "previously written --out -- no new solves")
+                         "previously written --out -- no new solves. HDF5 or JSON, "
+                         "detected by content")
     args = ap.parse_args()
 
     if args.reproject_chirp and args.from_tuneup is None:
@@ -107,12 +104,14 @@ def main() -> None:
     from snail_solver.tune_up import post_chirp_table, plot_post_chirp_table
 
     if args.replot:
-        with open(args.replot) as fh:
-            post = json.load(fh)
+        post = load_doc(args.replot)
         rabi_table = post.get("rabi_table")
         if args.plot:
             path = plot_post_chirp_table(post, out=args.plot, rabi_table=rabi_table)
             print(f"wrote {path}")
+            # re-drawn from this file, so refresh the copy it carries
+            if is_hdf5(split_address(args.replot)[0]):
+                attach_figures(args.replot, {"post_chirp": path})
         return
 
     from snail_solver.device_utils import load_device
@@ -126,8 +125,7 @@ def main() -> None:
 
     rabi_table: Optional[Dict[str, Any]] = None
     if args.from_tuneup:
-        with open(args.from_tuneup) as fh:
-            saved = json.load(fh)
+        saved = load_doc(args.from_tuneup)
         record = saved["operating_point"]
         rabi_table = saved["stages"]["rabi"]
     else:
@@ -172,18 +170,25 @@ def main() -> None:
     if post["compare_flat"]:
         print(f"  transfer(flat)     = {post['transfer_flat']}")
 
+    written = None
     if args.out:
-        path = in_results(args.out)
         out_doc = dict(post)
         if rabi_table is not None:
             out_doc["rabi_table"] = rabi_table
-        with open(path, "w") as fh:
-            json.dump(out_doc, fh, indent=2, default=_plain)
-        print(f"  written {path}")
+        written = save_doc(in_results(args.out), out_doc,
+                           attrs={"tool": "snail_solver.post_chirp",
+                                  "device": str(device_path),
+                                  "from_tuneup": str(args.from_tuneup or ""),
+                                  "point": str(args.point or "")})
+        print(f"  written {written}")
 
     if args.plot:
         path = plot_post_chirp_table(post, out=args.plot, rabi_table=rabi_table)
         print(f"  wrote {path}")
+        # the figure belongs with the sweep it draws, not only in figs/
+        if written and is_hdf5(split_address(written)[0]):
+            attach_figures(written, {"post_chirp": path})
+            print(f"  embedded it in {written}")
 
 
 if __name__ == "__main__":
