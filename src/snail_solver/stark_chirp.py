@@ -132,6 +132,134 @@ def shape_mean_factor(shape_fn) -> float:
     return float(shape_stark_legendre(shape_fn, degree=0)[0])
 
 
+#: Weightings for :func:`stark_moments`. ``"rabi"`` is the DERIVED one and the
+#: default; ``"uniform"`` (average over time) and ``"coupling"`` (weight by the iSWAP
+#: rate ``g ~ |eta|``) are the two plausible guesses that preceded it, kept because
+#: they bracket it and because :func:`tune_up.cross_check_probe_moments` reports all
+#: three. They span 2x on a Hann, so the choice is not cosmetic --
+#: see :func:`stark_moments`.
+MOMENT_WEIGHTINGS = ("rabi", "uniform", "coupling")
+
+
+def rabi_angle(shape_fn, u) -> np.ndarray:
+    r"""Accumulated Rabi angle ``theta(u)``, running ``0 -> pi`` across the pulse.
+
+    ``theta(u) = 2 \int_0^t g dt'`` for a pulse whose total area is ``pi`` (a complete
+    iSWAP), expressed on the normalized axis ``u`` in ``[-1, 1]``. Since
+    ``g(t) ~ |eta(t)| = eta_peak sqrt(f(u))``, the area normalization cancels
+    ``eta_peak`` and ``t_g`` and leaves a pure functional of the shape::
+
+        theta(u) = pi * int_{-1}^{u} sqrt(f) du' / int_{-1}^{1} sqrt(f) du'
+
+    This is the phase that makes :func:`stark_moments`'s ``"rabi"`` weighting work.
+
+    Parameters
+    ----------
+    shape_fn : callable
+        ``u -> |eta(u)|^2 / eta_peak^2``, vectorized.
+    u : array_like
+        Points in ``[-1, 1]``, ASCENDING, spanning the full pulse -- the cumulative
+        integral is taken on this grid, so a partial span gives a partial angle.
+
+    Returns
+    -------
+    ndarray
+        ``theta(u)`` in radians, ``theta(-1) = 0`` and ``theta(1) = pi``.
+    """
+    u = np.asarray(u, dtype=float)
+    s = np.sqrt(np.clip(np.asarray(shape_fn(u), dtype=float), 0.0, None))
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (s[1:] + s[:-1]) * np.diff(u))])
+    if not np.isfinite(cum[-1]) or cum[-1] <= 0.0:
+        raise ValueError("rabi weighting needs a positive pulse area")
+    return np.pi * cum / cum[-1]
+
+
+def stark_moments(shape_fn, weighting: str = "rabi", n_quad: int = 4001) -> tuple:
+    r"""``(M2, M4)``: how a SHAPED probe's chevron reports the Stark law.
+
+    A constant probe at ``|eta|`` measures the law pointwise,
+    ``delta = k2 |eta|^2 + k4 |eta|^4``. A shaped probe of PEAK ``eta*`` instead
+    reports an average over its own envelope, and because the law is an even
+    polynomial that average is DIAGONAL in ``{eta^2, eta^4}``::
+
+        <delta>(eta*) = k2 M2 eta*^2 + k4 M4 eta*^4
+        M2 = <f>,  M4 = <f^2>        f(u) = |eta(u)|^2 / eta*^2
+
+    so each coefficient is scaled by its own moment with no mixing between orders.
+    Recovering the pointwise law is then two divisions, ``k2 = K2/M2``,
+    ``k4 = K4/M4`` -- which is what makes a shaped ladder usable at drives where a
+    constant probe leaks too much to fit (see ``tune_up.rabi_shift_table``). An odd
+    power or a non-polynomial term would mix orders and need a real deconvolution.
+
+    Which average, though, is not a convention -- it is derivable, and the answer is
+    neither of the obvious guesses. Take the two-level iSWAP subspace with coupling
+    ``g(t)`` of total area ``pi`` and detuning ``D(t) = Delta + delta_stark(t)``. In
+    the frame that follows the ideal rotation, ``D`` enters as ``D sigma_z / 2``,
+    whose matrix element between the instantaneous state and its orthogonal partner
+    carries a factor ``sin theta(t)``, ``theta`` being the accumulated Rabi angle
+    (:func:`rabi_angle`). So to first order the error amplitude is
+    ``-1/2 int D(t) sin theta(t) dt`` and the chevron peaks where it vanishes::
+
+        Delta* = -<delta_stark>_w        w(t) = sin theta(t),  theta: 0 -> pi
+
+    The weight vanishes at both pulse ends -- there the state sits at a pole of the
+    Bloch sphere, where a ``z`` rotation does nothing -- and peaks at ``theta = pi/2``,
+    the half-area point, which for a symmetric envelope is mid-gate where the envelope
+    is near its peak. That is why ``M2`` comes out close to 1 rather than close to the
+    time-average, and why weighting by time badly underestimates it:
+
+    ============== ========== ========== =========================================
+    Hann           M2         M4         weight
+    ============== ========== ========== =========================================
+    rabi           0.7115     0.5836     ``sin theta(t)``     <- derived, default
+    coupling       0.6250     0.4922     ``|eta(t)|``
+    uniform        0.3750     0.2734     ``1``
+    ============== ========== ========== =========================================
+
+    Measured, not argued: a two-level integration of the model above reproduces
+    ``"rabi"`` to 5 decimal places at every drive and for each moment separately,
+    while a cross-check against a constant probe on a real 3-mode device
+    (``tune_up.cross_check_probe_moments``) put ``M2`` within ~4% of ``"rabi"``
+    against 19% for ``"coupling"`` and a factor 2.1 for ``"uniform"``.
+
+    Parameters
+    ----------
+    shape_fn : callable
+        ``u -> |eta(u)|^2 / eta_peak^2`` on ``[-1, 1]``, vectorized.
+    weighting : {"rabi", "uniform", "coupling"}
+        Default ``"rabi"``, the derived weight. The other two are kept for
+        comparison; they bracket it from below.
+    n_quad : int, default 4001
+        Trapezoid points for ``"rabi"``, which needs a cumulative integral and so
+        cannot use the Gauss-Legendre path the other two take. Converged to <1e-6
+        well below the default.
+
+    Returns
+    -------
+    tuple of float
+        ``(M2, M4)``, both in ``(0, 1]``.
+    """
+    if str(weighting) not in MOMENT_WEIGHTINGS:
+        raise ValueError(f"weighting={weighting!r}: expected one of "
+                         f"{list(MOMENT_WEIGHTINGS)}")
+    if str(weighting) == "uniform":
+        return (shape_mean_factor(shape_fn),
+                shape_mean_factor(lambda u: np.asarray(shape_fn(u), float) ** 2))
+    if str(weighting) == "coupling":
+        norm = shape_mean_factor(lambda u: np.sqrt(np.asarray(shape_fn(u), float)))
+        if not np.isfinite(norm) or norm <= 0.0:
+            raise ValueError("coupling weighting needs a positive <|eta|>")
+        return (shape_mean_factor(lambda u: np.asarray(shape_fn(u), float) ** 1.5) / norm,
+                shape_mean_factor(lambda u: np.asarray(shape_fn(u), float) ** 2.5) / norm)
+    u = np.linspace(-1.0, 1.0, max(int(n_quad), 101))
+    f = np.clip(np.asarray(shape_fn(u), dtype=float), 0.0, None)
+    w = np.sin(rabi_angle(shape_fn, u))
+    norm = np.trapz(w, u)
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("rabi weighting needs a positive sin(theta) normalization")
+    return (float(np.trapz(w * f, u) / norm), float(np.trapz(w * f * f, u) / norm))
+
+
 def hann_stark_legendre(degree: int = 4) -> np.ndarray:
     """Legendre coefficients of the Hann Stark-tracking shape, truncated at `degree`.
 

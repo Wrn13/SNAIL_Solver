@@ -23,7 +23,7 @@ partial rotation.
 
 Usage
 -----
-    python -m snail_solver.post_chirp --device 1Gate4.2SNAIL.json \\
+    python -m snail_solver.post_chirp \\
         --from-tuneup results/tuneup_probe_dev1_eta1p8_wide.h5 \\
         --eta-lo 0.5 --eta-hi 1.0 --amp-points 7 --wp-points 25 --jobs 16 \\
         --out post_chirp_dev1_eta1p8.h5 \\
@@ -43,10 +43,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog="python -m snail_solver.post_chirp", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--device", required=True,
-                    help="device JSON (bare name resolves under devices/) -- "
-                         "required even with --from-tuneup, since a tune-up "
-                         "result does not embed the full device config")
+    ap.add_argument("--device", default=None,
+                    help="device JSON (bare name resolves under devices/). Optional "
+                         "with --from-tuneup, which carries its own copy of the "
+                         "configuration the tune-up ran with -- pass one only to run "
+                         "against a DIFFERENT device than the tune-up used, and the "
+                         "context check below will tell you if it disagrees. Required "
+                         "with --point (the point lives in that file)")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--from-tuneup", metavar="FILE", default=None,
                      help="a tune_up --out file (HDF5, or pre-HDF5 JSON): reads "
@@ -95,6 +98,8 @@ def main() -> None:
     if args.reproject_chirp and args.from_tuneup is None:
         ap.error("--reproject-chirp needs --from-tuneup (a saved --point has "
                  "no Rabi table to reproject from)")
+    if args.point and not args.device:
+        ap.error("--point needs --device: the point is stored in that device JSON")
     if args.gpu:
         from snail_solver import zhou_coupler
         zhou_coupler.use_gpu(True)
@@ -117,20 +122,34 @@ def main() -> None:
     from snail_solver.device_utils import load_device
     from snail_solver.log_utils import setup_run_logger
 
-    device_path = resolve_device(args.device)
-    config = load_device(device_path)
-    if args.coupler_levels is not None:
-        config = {**config, "coupler_levels": int(args.coupler_levels)}
     logger = setup_run_logger(None, "post_chirp")
+    device_path = resolve_device(args.device) if args.device else None
+    config = load_device(device_path) if device_path else None
 
     rabi_table: Optional[Dict[str, Any]] = None
+    saved: Optional[Dict[str, Any]] = None
     if args.from_tuneup:
         saved = load_doc(args.from_tuneup)
         record = saved["operating_point"]
         rabi_table = saved["stages"]["rabi"]
+        if config is None:
+            # The run carries the configuration it was calibrated with. Using it is
+            # strictly better than re-reading the device file: that file gets edited
+            # (coupler_levels, frequencies) between the tune-up and this check, and
+            # then this "validation" would be measuring a different device.
+            config = saved.get("device")
+            if config is None:
+                ap.error(f"--device is required: {args.from_tuneup} was written "
+                         f"before runs carried a copy of their device config")
+            device_path = str(saved.get("device_path") or "") or None
+            print(f"device: from the tune-up's own copy"
+                  + (f" ({device_path})" if device_path else ""))
     else:
         from snail_solver.operating_points import get_point
         record = get_point(config, args.point)
+
+    if args.coupler_levels is not None:
+        config = {**config, "coupler_levels": int(args.coupler_levels)}
 
     from snail_solver.operating_points import check_context
     # t_g is pinned to the POINT's own calibrated length: post_chirp_table derives
@@ -144,7 +163,7 @@ def main() -> None:
             f"context:\n  " + "\n  ".join(mismatches))
 
     from snail_solver import find_stark_resonance as FSR
-    print(f"device={args.device}  target_eta={record['target_eta']}  "
+    print(f"device={args.device or device_path}  target_eta={record['target_eta']}  "
           f"jobs={FSR._resolve_jobs(args.jobs)}{' GPU' if args.gpu else ''}")
 
     solver = {"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps}
@@ -175,9 +194,10 @@ def main() -> None:
         out_doc = dict(post)
         if rabi_table is not None:
             out_doc["rabi_table"] = rabi_table
+        out_doc["device"] = config          # the configuration these solves ran with
         written = save_doc(in_results(args.out), out_doc,
                            attrs={"tool": "snail_solver.post_chirp",
-                                  "device": str(device_path),
+                                  "device_path": str(device_path or ""),
                                   "from_tuneup": str(args.from_tuneup or ""),
                                   "point": str(args.point or "")})
         print(f"  written {written}")

@@ -65,6 +65,8 @@ Everything the fan-out produces goes into ONE HDF5 file (``h5_io``)::
       /runs/eta1p2        <- that eta's COMPLETE tune-up, in tune_up's --out schema
       /runs/eta1p5             (operating_point, t_g0_ns, stages -- every chevron)
       /runs/eta1p8        <- a FAILED eta keeps its measured chevrons here too
+      /sweep/device       <- a COPY of the device config every eta ran with, so
+      /runs/eta1p2/device      the sweep still reads once the device file moves on
       /sweep/figures      <- the rendered figures, stored with the data they draw
       /runs/eta1p2/figures     (--plot-each; extract them with h5_io, see below)
 
@@ -73,8 +75,11 @@ per-eta JSONs, and each eta's calibration stays addressable on its own::
 
     python -m snail_solver.tune_up --replot results/.../eta_sweep.h5:/runs/eta1p8 \\
         --plot-ridge figs/eta1p8_ridge.png
-    python -m snail_solver.post_chirp --device 1Gate4.2SNAIL.json \\
+    python -m snail_solver.post_chirp \\
         --from-tuneup results/.../eta_sweep.h5:/runs/eta1p8 ...
+
+(no ``--device`` needed on that second one: the stored run carries its own copy
+of the configuration it was calibrated with.)
 
 Reading one group reads only that group, so replotting the summary never pays
 for the chevrons. ``--out something.json`` still writes the summary as text, and
@@ -348,7 +353,8 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
     Returns
     -------
     dict
-        The sweep document: ``device``, ``settings``, ``rows`` (one per eta, each
+        The sweep document: ``device`` (a copy of the merged configuration every
+        eta ran with), ``device_path``, ``settings``, ``rows`` (one per eta, each
         with ``ok`` and either the scores or an ``error``), and ``summary``.
     """
     from snail_solver import tune_up as TU
@@ -400,7 +406,8 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
             row.update({"ok": False, "seconds": time.perf_counter() - t0,
                         "error": {"type": "RabiFitError", "stage": "rabi",
                                   "message": str(exc)}})
-            p = store_run(tag, {"stages": {"rabi": exc.table}},
+            p = store_run(tag, {"stages": {"rabi": exc.table},
+                                "device": dict(config)},
                           sweep_path=sweep_path, outdir=outdir,
                           attrs={"target_eta": float(eta_star),
                                  "status": "rabi_fit_failed",
@@ -441,7 +448,7 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
         # both work on it verbatim -- whether it lives in this sweep's file or
         # in its own.
         p = store_run(tag, {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
-                            "stages": stages},
+                            "stages": stages, "device": dict(config)},
                       sweep_path=sweep_path, outdir=outdir,
                       attrs={"target_eta": float(eta_star), "status": "ok"})
         if p:
@@ -528,7 +535,10 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
     n_ok = sum(1 for r in rows if r.get("ok"))
     return {
         "source": "tune_up_sweep",
-        "device": device_path,
+        "device_path": device_path,
+        # The configuration every eta was calibrated with, copied in so the sweep
+        # reads back the same months later even if the device file has moved on.
+        "device": dict(config),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "area_ns": float(TU._area(config)),
         "target_etas": etas,
@@ -837,7 +847,7 @@ def main() -> None:
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "command": "python -m snail_solver.tune_up_sweep "
                        + " ".join(shlex.quote(a) for a in sys.argv[1:]),
-            "device": str(device_path), "host": platform.node()})
+            "device_path": str(device_path), "host": platform.node()})
 
     map_kw: Dict[str, Any] = {}
     if args.leak_max is not None:

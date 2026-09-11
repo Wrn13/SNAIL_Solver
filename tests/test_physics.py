@@ -26,6 +26,7 @@ Deliberately QuTiP-free and fast, so it can gate a cluster submission:
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -112,8 +113,17 @@ class TestSubharmonicBeat(unittest.TestCase):
             self.assertEqual(self.nc(cfg, self.wa, self.wb, self.wc,
                                      wspec, self.wp)[3], "spec")
 
-    def test_off_by_default(self):
+    def test_on_by_default(self):
+        """Deliberately inverted: the subharmonics are always physically present, so
+        DRAG always enumerates them. Previously opt-in, which meant any caller that
+        did not know the flag corrected a smaller set than the device really has."""
         beat = self.nc(_cfg(), self.wa, self.wb, self.wc, 2 * self.wp, self.wp)
+        self.assertEqual(beat[2], "subharm")
+        self.assertAlmostEqual(beat[1], 0.0, places=9)
+
+    def test_the_off_switch_still_works(self):
+        beat = self.nc(_cfg(drag_subharmonic=False), self.wa, self.wb, self.wc,
+                       2 * self.wp, self.wp)
         self.assertNotEqual(beat[2], "subharm")
 
 
@@ -4060,9 +4070,9 @@ class TestRunFileHDF5(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = save_doc(os.path.join(d, "run.h5"), self._doc(),
                             attrs={"command": "python -m snail_solver.tune_up",
-                                   "device": "devices/1Gate4.2SNAIL.json"})
+                                   "device_path": "devices/1Gate4.2SNAIL.json"})
             back = load_doc(path)
-            self.assertEqual(back["device"], "devices/1Gate4.2SNAIL.json")
+            self.assertEqual(back["device_path"], "devices/1Gate4.2SNAIL.json")
             self.assertNotIn("format", back)                 # describes the file
             self.assertNotIn("command", back["stages"])      # never mixed into data
 
@@ -4260,6 +4270,1470 @@ class TestEmbeddedFigures(unittest.TestCase):
                 json.dump({"rows": []}, fh)
             self.assertEqual(embed_figures(js, {"rabi": self._fig(d)}), 0)
             self.assertEqual(embed_figures(None, {"rabi": self._fig(d)}), 0)
+
+
+class TestEmbeddedDeviceConfig(unittest.TestCase):
+    """A run carries a COPY of the device configuration it ran with.
+
+    Device files are edited constantly -- coupler_levels, frequencies, a saved
+    operating point -- so a month-old run read back against today's device JSON is
+    being interpreted against a device it never ran on. The copy is written after
+    the CLI overrides, so it is the configuration the SOLVES saw, and it is what
+    post_chirp validates against: `--device` is now optional there precisely
+    because re-reading the file would be the less trustworthy of the two.
+    """
+
+    CFG = {"qubit_freqs_GHz": [4.7, 5.7], "qubit_levels": 3, "coupler_levels": 7,
+           "coupler_freq_GHz": 4.2, "g3_GHz": 0.06, "lam_a": 0.1, "lam_b": 0.1,
+           "anharm_qubit_GHz": -0.12, "min_detuning_GHz": 0.05,
+           "envelope": "raised_cosine", "chirp_coeffs_GHz": [],
+           "drag_compare": False, "grape_crab_seed": None,
+           "engine_cutoff_GHz": float("inf"), "t_g_ns": 77.2}
+
+    def _tuneup_doc(self, device=True):
+        doc = {"operating_point": {"target_eta": 1.2, "t_g_ns": 150.0,
+                                   "amp_scale": 1.3, "wp_offset_GHz": 2e-3,
+                                   "chirp_coeffs_GHz": [0.0, -0.004],
+                                   "wa_GHz": 4.7, "wb_GHz": 5.7,
+                                   "spec_abs_GHz": None, "drag_beat_GHz": None,
+                                   "drag_n_pump": 1, "score": 0.98,
+                                   "source": "tune_up"},
+               "t_g0_ns": 115.7,
+               "stages": {"rabi": {"eta": np.linspace(0.3, 1.2, 4)}}}
+        if device:
+            doc["device"] = dict(self.CFG)
+        return doc
+
+    def test_the_config_round_trips_exactly(self):
+        """Every kind of value a device JSON holds -- None, inf, bools, lists --
+        has to come back unchanged, or the copy is worse than no copy."""
+        from snail_solver.h5_io import load_doc, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            path = save_doc(os.path.join(d, "run.h5"), self._tuneup_doc())
+            got = load_doc(path)["device"]
+            self.assertEqual(set(got), set(self.CFG))
+            self.assertIsNone(got["grape_crab_seed"])
+            self.assertTrue(np.isinf(got["engine_cutoff_GHz"]))
+            self.assertIs(got["drag_compare"], False)
+            self.assertEqual(got["qubit_freqs_GHz"], [4.7, 5.7])
+            self.assertEqual(got["chirp_coeffs_GHz"], [])
+            self.assertEqual(got["envelope"], "raised_cosine")
+
+    def test_post_chirp_runs_off_the_stored_copy_with_no_device(self):
+        """The reason the copy exists: validating a tune-up must not depend on a
+        file that has been edited since (or is on another machine entirely)."""
+        from unittest import mock
+        from snail_solver import post_chirp
+        from snail_solver.h5_io import save_doc
+        seen = {}
+
+        def fake_table(config, record, **kw):
+            seen["config"] = config
+            seen["record"] = record
+            return {"eta": [1.2], "residual_MHz": [0.1], "transfer_chirped": [0.99],
+                    "compare_flat": False, "rows": []}
+
+        with tempfile.TemporaryDirectory() as d:
+            run = save_doc(os.path.join(d, "run.h5"), self._tuneup_doc())
+            argv = ["post_chirp", "--from-tuneup", run]
+            with mock.patch("snail_solver.tune_up.post_chirp_table", fake_table), \
+                 mock.patch("snail_solver.device_utils.load_device") as m_load, \
+                 mock.patch.object(sys, "argv", argv):
+                post_chirp.main()
+            m_load.assert_not_called()                  # never read a device file
+            self.assertEqual(seen["config"]["coupler_levels"], 7)
+            self.assertEqual(seen["config"]["qubit_freqs_GHz"], [4.7, 5.7])
+            self.assertEqual(seen["record"]["target_eta"], 1.2)
+
+    def test_a_cli_override_is_what_gets_stored_and_reused(self):
+        """--coupler-levels changes what the solver ran, so it must be in the copy
+        and must still win when the copy is reused."""
+        from unittest import mock
+        from snail_solver import post_chirp
+        from snail_solver.h5_io import save_doc
+        seen = {}
+
+        def fake_table(config, record, **kw):
+            seen["config"] = config
+            return {"eta": [1.2], "residual_MHz": [0.1], "transfer_chirped": [0.99],
+                    "compare_flat": False, "rows": []}
+
+        with tempfile.TemporaryDirectory() as d:
+            run = save_doc(os.path.join(d, "run.h5"), self._tuneup_doc())
+            argv = ["post_chirp", "--from-tuneup", run, "--coupler-levels", "5"]
+            with mock.patch("snail_solver.tune_up.post_chirp_table", fake_table), \
+                 mock.patch.object(sys, "argv", argv):
+                post_chirp.main()
+            self.assertEqual(seen["config"]["coupler_levels"], 5)
+
+    def test_a_run_written_before_the_copy_says_so(self):
+        """An old file has no device group; the tool must ask for --device rather
+        than crash somewhere deep in the solver."""
+        from unittest import mock
+        from snail_solver import post_chirp
+        from snail_solver.h5_io import save_doc
+        with tempfile.TemporaryDirectory() as d:
+            run = save_doc(os.path.join(d, "old.h5"), self._tuneup_doc(device=False))
+            argv = ["post_chirp", "--from-tuneup", run]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(SystemExit):
+                    post_chirp.main()
+            self.assertIn("--device is required", err.getvalue())
+
+    def test_a_stored_sweep_run_carries_it_too(self):
+        """One eta pulled out of a sweep file is a complete tune_up document, and
+        that now includes the device -- otherwise the address is only half usable."""
+        from snail_solver.h5_io import load_doc
+        from snail_solver.tune_up_sweep import store_run
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "eta_sweep.h5")
+            addr = store_run("eta1p2", self._tuneup_doc(), sweep_path=f, outdir=d)
+            self.assertEqual(load_doc(addr)["device"]["coupler_levels"], 7)
+
+
+class TestSubharmonicsOnByDefault(unittest.TestCase):
+    """Mode subharmonics are always physically present, so DRAG always sees them.
+
+    They used to be opt-in (`drag_subharmonic=False`), which meant every caller that
+    did not know to pass the flag silently corrected a strictly smaller set of
+    processes than the device actually has -- the trap recorded for
+    `validate_recursive_drag` in docs/chirped-recursive-drag.md.
+    """
+
+    def test_the_default_is_on(self):
+        from snail_solver.sweep_common import DEFAULT_CONFIG
+        self.assertIs(DEFAULT_CONFIG["drag_subharmonic"], True)
+
+    def test_the_subharmonic_is_enumerated_with_no_flag_passed(self):
+        """w_p = w_a/2 puts the A subharmonic at beat -2*delta; it must be a candidate
+        without anyone opting in."""
+        from snail_solver.sweep_common import _collision_candidates
+        cfg = _cfg(no_spectator=True)
+        wa, ws, delta = 3.5, 4.5, 0.05
+        w_p = wa / 2 + delta
+        cands = _collision_candidates(cfg, wa, wa - w_p, ws, 0.0, w_p)
+        subs = [c for c in cands if c[2] == "subharm" and c[3] == "a"]
+        self.assertEqual(len(subs), 1)
+        self.assertAlmostEqual(subs[0][1], wa - 2 * w_p, places=12)
+        self.assertAlmostEqual(subs[0][1], -2 * delta, places=12)
+
+    def test_an_empty_mode_list_really_selects_none(self):
+        """`subharmonic_modes: []` was falsy, so `or` restored ALL four modes -- which
+        made both single-channel isolation and opting out impossible."""
+        from snail_solver.sweep_common import _collision_candidates
+        cfg = _cfg(no_spectator=True, subharmonic_modes=[])
+        cands = _collision_candidates(cfg, 3.5, 1.75, 4.5, 0.0, 1.75)
+        self.assertEqual([c for c in cands if c[2] == "subharm"], [])
+
+    def test_a_missing_mode_list_still_falls_back(self):
+        """Only a MISSING key defaults; that distinction is the whole fix."""
+        from snail_solver.sweep_common import _collision_candidates
+        cfg = _cfg(no_spectator=True)
+        cfg.pop("subharmonic_modes", None)
+        cands = _collision_candidates(cfg, 3.5, 1.8, 4.5, 0.0, 1.7)
+        self.assertTrue([c for c in cands if c[2] == "subharm"])
+
+    def test_the_off_switch_reaches_the_candidates(self):
+        from snail_solver.sweep_common import _collision_candidates
+        cfg = _cfg(no_spectator=False, drag_subharmonic=False)
+        cands = _collision_candidates(cfg, 3.5, 1.8, 4.5, 4.6, 1.7)
+        self.assertEqual([c for c in cands if c[2] == "subharm"], [])
+
+
+class TestWpNativeAxis(unittest.TestCase):
+    """A w_p-native spelling of the subharmonic axis, for scanning the pump directly.
+
+    The existing axis is `Delta_sub = w_s - 2 w_p`, so a scan centred on a QUBIT's
+    subharmonic (w_p = w_a/2) had to be done by hand at every call site, with the
+    factor of two between the two axes as a standing trap.
+    """
+
+    CFG = {"qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5,
+           "min_detuning_GHz": 0.05, "coupler_levels": 7,
+           "chirp_coeffs_GHz": [0.0, -0.004]}
+
+    def test_both_branches_give_the_requested_pump(self):
+        from snail_solver.subharmonic_convergence import wb_for_wp
+        wa = self.CFG["qubit_freqs_GHz"][0]
+        for branch in ("below", "above"):
+            for w_p in (1.70, 1.75, 1.80):
+                wb = wb_for_wp(self.CFG, w_p, branch)
+                self.assertAlmostEqual(abs(wb - wa), w_p, places=12)
+
+    def test_the_two_branches_are_different_allocations(self):
+        """Same pump, different frequency plan: below puts w_b at w_a/2 (== w_p at the
+        subharmonic), above at 1.5 w_a."""
+        from snail_solver.subharmonic_convergence import wb_for_wp
+        wa = self.CFG["qubit_freqs_GHz"][0]
+        self.assertAlmostEqual(wb_for_wp(self.CFG, wa / 2, "below"), wa / 2, places=12)
+        self.assertAlmostEqual(wb_for_wp(self.CFG, wa / 2, "above"), 1.5 * wa, places=12)
+
+    def test_the_qubit_subharmonic_lands_where_the_other_axis_says(self):
+        """w_p = w_a/2  <=>  Delta_sub = w_s - w_a. If these two disagree the scan is
+        centred on the wrong point."""
+        from snail_solver.subharmonic_convergence import (detuning_for_wp,
+                                                          wp_for_detuning)
+        wa, ws = 3.5, 4.5
+        self.assertAlmostEqual(detuning_for_wp(self.CFG, wa / 2), ws - wa, places=12)
+        self.assertAlmostEqual(wp_for_detuning(self.CFG, ws - wa), wa / 2, places=12)
+
+    def test_a_step_in_the_pump_moves_the_other_axis_by_twice_as_much(self):
+        from snail_solver.subharmonic_convergence import detuning_for_wp
+        wa = 3.5
+        d0 = detuning_for_wp(self.CFG, wa / 2)
+        self.assertAlmostEqual(detuning_for_wp(self.CFG, wa / 2 + 0.05) - d0,
+                               -0.10, places=12)
+
+    def test_does_not_mutate_the_input_and_strips_a_device_chirp(self):
+        """A chirp calibrated at a different pump must not survive a w_b move."""
+        from snail_solver.subharmonic_convergence import config_at_wp
+        before = json.loads(json.dumps(self.CFG))
+        out = config_at_wp(self.CFG, 1.80, branch="below")
+        self.assertEqual(self.CFG, before)
+        self.assertIsNone(out["chirp_coeffs_GHz"])
+        self.assertAlmostEqual(out["qubit_freqs_GHz"][1], 3.5 - 1.80, places=12)
+        self.assertEqual(out["qubit_freqs_GHz"][0], 3.5)
+
+    def test_the_min_detuning_floor_still_applies(self):
+        """Under the floor the two qubits are inside a linewidth of each other, so the
+        'gate' is a direct collision, not a pumped one."""
+        from snail_solver.subharmonic_convergence import config_at_wp
+        with self.assertRaises(ValueError):
+            config_at_wp(self.CFG, 0.01, branch="below")
+
+    def test_a_nonpositive_pump_is_refused(self):
+        from snail_solver.subharmonic_convergence import wb_for_wp
+        with self.assertRaises(ValueError):
+            wb_for_wp(self.CFG, 0.0, "below")
+        with self.assertRaises(ValueError):
+            wb_for_wp(self.CFG, 1.75, "sideways")
+
+
+class TestScanGrid(unittest.TestCase):
+    """The offset grid, and why the origin is not on it."""
+
+    CFG = dict(TestWpNativeAxis.CFG)
+
+    def test_columns_sit_at_wa_over_two_plus_delta(self):
+        from snail_solver.subharmonic_gate_scan import columns_for
+        cols = columns_for(self.CFG, [-0.05, 0.05])
+        for got, want in zip((c["w_p_GHz"] for c in cols), (1.70, 1.80)):
+            self.assertAlmostEqual(got, want, places=12)
+        for got, want in zip((c["delta_sub_GHz"] for c in cols), (1.10, 0.90)):
+            self.assertAlmostEqual(got, want, places=12)
+
+    def test_the_subharmonic_beat_is_minus_two_delta(self):
+        """The channel the whole scan is about; if this drifts, the axis is mislabelled."""
+        from snail_solver.subharmonic_gate_scan import columns_for
+        for c in columns_for(self.CFG, [-0.1, -0.05, 0.05, 0.1]):
+            self.assertAlmostEqual(c["subharm_beat_MHz"],
+                                   -2e3 * c["delta_GHz"], places=9)
+
+    def test_the_origin_is_dropped_by_default(self):
+        """At delta = 0 the A-subharmonic channel is exactly resonant: g/|det| -> inf,
+        so there is no leading term for DRAG to cancel. It is not a gate."""
+        from snail_solver.subharmonic_gate_scan import columns_for
+        offs = [-0.05, 0.0, 0.05]
+        self.assertEqual(len(columns_for(self.CFG, offs)), 2)
+        self.assertEqual(len(columns_for(self.CFG, offs, drop_origin=False)), 3)
+
+    def test_too_few_amplitude_points_is_refused_up_front(self):
+        """fit_shift_curve needs >= 4 usable rows and DROPS rows for contrast/leakage,
+        which is exactly what happens at the high drive this scan is aimed at. Found by
+        running it: --amp-points 3 measured two full Rabi tables and then failed both
+        columns at the fit."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        argv = ["subharmonic_gate_scan", "--device", "4Gate4.5SNAIL.json",
+                "--target-eta", "0.5", "--amp-points", "3", "--dry-run"]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit):
+                GS.main()
+        self.assertIn("--amp-points 3 cannot fit a shift curve", err.getvalue())
+
+    def test_the_envelope_is_fixed_grid_wide_and_supports_the_recursion(self):
+        """envelope_m comes from the CAP, not the per-column channel count: it changes
+        area_factor and hence t_g, which must not drift column to column."""
+        from snail_solver.subharmonic_gate_scan import scan_config
+        cfg = scan_config({"envelope": "raised_cosine"}, max_drag_channels=4)
+        self.assertEqual(cfg["envelope"], "sine_power")
+        self.assertEqual(cfg["envelope_m"], 4)
+        self.assertEqual(scan_config({}, max_drag_channels=1)["envelope_m"], 2)
+
+    def test_a_cached_column_is_keyed_on_physics_not_grid_resolution(self):
+        """Refining the offset grid must REUSE the coarse grid's columns."""
+        from snail_solver.subharmonic_gate_scan import _column_expect
+        settings = {"target_eta": 2.5, "branch": "below", "coupler_levels": 9,
+                    "amp_points": 41, "eta_lo": 0.2, "eta_hi": 1.0,
+                    "max_drag_channels": 4, "min_ratio": 0.02, "max_ratio": 0.3,
+                    "envelope_m": 4, "wp_points": 25, "contrast_min": 0.35,
+                    "leak_max": None, "probe_shape": "constant",
+                    "moment_weighting": "uniform"}
+        exp = _column_expect({"w_p_GHz": 1.8, "target_eta": 2.5}, settings)
+        self.assertIn("target_eta", exp)
+        self.assertIn("envelope_m", exp)
+        self.assertNotIn("wp_points", exp)          # resolution, not physics
+
+
+class TestWpScanResume(unittest.TestCase):
+    """A column is cached on success and re-read, so a killed scan resumes.
+
+    The scan is long enough that this is the difference between an interruption
+    costing minutes and costing the whole run. A column is written only AFTER it
+    succeeds, so a partial or failed column never poisons the cache.
+    """
+
+    def _cfg(self):
+        return {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5,
+                "min_detuning_GHz": 0.05, "envelope": "sine_power", "envelope_m": 4}
+
+    def test_a_cached_column_is_reused_and_not_resolved(self):
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        calls = []
+
+        def fake_solve(config, col, settings, **kw):
+            calls.append(col["delta_GHz"])
+            return {**col, "ok": True, "error": None, "seconds": 1.0,
+                    "fidelity": {"F_avg": 0.99, "leakage": 1e-4, "transfer": 0.98},
+                    "flat": {"F_avg": 0.98, "leakage": 2e-4, "transfer": 0.97},
+                    "delta_F": 0.01, "n_coupler": 1e-3, "n_drag_channels": 4,
+                    "channel_audit": {"blocking": []}, "chirp": {"resid_MHz": 0.1},
+                    "operating_point": {"t_g_ns": 150.0},
+                    "coherence": GS.coherence_penalty(150.0),
+                    "infidelity_coherent": 0.01, "infidelity_total": 0.01}
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(GS, "solve_column", fake_solve):
+                first = GS.run_wp_scan(self._cfg(), [-0.05, 0.05], [2.5], outdir=d,
+                                       **self._kw())
+                self.assertEqual(len(calls), 2)
+                second = GS.run_wp_scan(self._cfg(), [-0.05, 0.05], [2.5], outdir=d,
+                                        **self._kw())
+        self.assertEqual(len(calls), 2, "a cached column was re-solved")
+        self.assertTrue(all(r["cached"] for r in second["rows"]))
+        self.assertFalse(any(r["cached"] for r in first["rows"]))
+        self.assertEqual(second["summary"]["n_ok"], 2)
+
+    def test_a_failed_column_is_not_cached(self):
+        """Otherwise a transient failure would be frozen into the scan for good."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        calls = []
+
+        def fake_fail(config, col, settings, **kw):
+            calls.append(col["delta_GHz"])
+            return {**col, "ok": False, "seconds": 1.0,
+                    "error": {"type": "RabiFitError", "stage": "rabi", "message": "x"}}
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(GS, "solve_column", fake_fail):
+                GS.run_wp_scan(self._cfg(), [0.05], [2.5], outdir=d, **self._kw())
+                GS.run_wp_scan(self._cfg(), [0.05], [2.5], outdir=d, **self._kw())
+        self.assertEqual(len(calls), 2)
+
+    def test_overwrite_ignores_the_cache(self):
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        calls = []
+
+        def fake_solve(config, col, settings, **kw):
+            calls.append(col["delta_GHz"])
+            return {**col, "ok": True, "error": None, "seconds": 1.0,
+                    "fidelity": {"F_avg": 0.9, "leakage": 0.0, "transfer": 0.9},
+                    "flat": {}, "delta_F": 0.0, "n_coupler": 0.0,
+                    "n_drag_channels": 1, "channel_audit": {"blocking": []},
+                    "chirp": {"resid_MHz": 0.1},
+                    "operating_point": {"t_g_ns": 150.0},
+                    "coherence": GS.coherence_penalty(150.0),
+                    "infidelity_coherent": 0.1, "infidelity_total": None}
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(GS, "solve_column", fake_solve):
+                GS.run_wp_scan(self._cfg(), [0.05], [2.5], outdir=d, **self._kw())
+                GS.run_wp_scan(self._cfg(), [0.05], [2.5], outdir=d, overwrite=True,
+                               **self._kw())
+        self.assertEqual(len(calls), 2)
+
+    def test_a_different_drive_does_not_reuse_the_cache(self):
+        """The cache key is physics: same offset at a different target_eta is a
+        different column, and silently reusing it would put stale numbers in the map."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        calls = []
+
+        def fake_solve(config, col, settings, **kw):
+            calls.append(col["target_eta"])
+            return {**col, "ok": True, "error": None, "seconds": 1.0,
+                    "fidelity": {"F_avg": 0.9, "leakage": 0.0, "transfer": 0.9},
+                    "flat": {}, "delta_F": 0.0, "n_coupler": 0.0,
+                    "n_drag_channels": 1, "channel_audit": {"blocking": []},
+                    "chirp": {"resid_MHz": 0.1},
+                    "operating_point": {"t_g_ns": 150.0},
+                    "coherence": GS.coherence_penalty(150.0),
+                    "infidelity_coherent": 0.1, "infidelity_total": None}
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(GS, "solve_column", fake_solve):
+                GS.run_wp_scan(self._cfg(), [0.05], [0.6], outdir=d, **self._kw())
+                GS.run_wp_scan(self._cfg(), [0.05], [2.5], outdir=d, **self._kw())
+        self.assertEqual(calls, [0.6, 2.5])
+
+    def test_the_pooled_path_agrees_with_the_sequential_one(self):
+        """A long scan needs a pool over COLUMNS, because tune_up step 4 takes no jobs
+        and runs single-threaded. The two paths must produce the same document, and the
+        pooled one must honour the cache too."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+
+        def fake_solve(config, col, settings, **kw):
+            return {**col, "ok": True, "error": None, "seconds": 1.0,
+                    "fidelity": {"F_avg": 0.9 + col["delta_GHz"], "leakage": 1e-4,
+                                 "transfer": 0.98},
+                    "flat": {"F_avg": 0.8, "leakage": 2e-4, "transfer": 0.9},
+                    "delta_F": 0.1, "n_coupler": 1e-3, "n_drag_channels": 3,
+                    "channel_audit": {"blocking": []}, "chirp": {"resid_MHz": 0.1},
+                    "operating_point": {"t_g_ns": 150.0},
+                    "coherence": GS.coherence_penalty(150.0),
+                    "infidelity_coherent": 1.0 - (0.9 + col["delta_GHz"]),
+                    "infidelity_total": None}
+
+        offs = [-0.05, 0.05]
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            with mock.patch.object(GS, "solve_column", fake_solve):
+                seq = GS.run_wp_scan(self._cfg(), offs, [2.5], outdir=d1, **self._kw())
+                par = GS.run_wp_scan(self._cfg(), offs, [2.5], outdir=d2,
+                                     column_workers=2, **self._kw())
+                # and the pooled path re-reads its own cache
+                again = GS.run_wp_scan(self._cfg(), offs, [2.5], outdir=d2,
+                                       column_workers=2, **self._kw())
+        self.assertEqual([r["delta_GHz"] for r in par["rows"]],
+                         [r["delta_GHz"] for r in seq["rows"]])
+        self.assertEqual([r["fidelity"]["F_avg"] for r in par["rows"]],
+                         [r["fidelity"]["F_avg"] for r in seq["rows"]])
+        self.assertEqual(par["summary"]["n_ok"], seq["summary"]["n_ok"])
+        self.assertTrue(all(r["cached"] for r in again["rows"]))
+
+    def _kw(self):
+        return {"amp_points": 41, "eta_lo": 0.2, "eta_hi": 1.0,
+                "coupler_levels": 5, "branch": "below", "max_drag_channels": 3}
+
+
+class TestDecoherenceEntersTheScore(unittest.TestCase):
+    """The scan solves a CLOSED system, so gate LENGTH is otherwise free.
+
+    t_g = 2A/eta, so weak drive buys a converged model and low leakage while its far
+    longer gate costs nothing in a unitary F_avg. That biases every comparison toward
+    low eta -- which is exactly backwards on hardware, where a 278 ns gate loses to a
+    56 ns one on decoherence. These tests pin the correction down.
+    """
+
+    def test_no_coherence_times_changes_nothing(self):
+        """The default must stay the old behaviour: purely coherent."""
+        from snail_solver.subharmonic_gate_scan import (coherence_penalty,
+                                                        total_infidelity)
+        p = coherence_penalty(231.5)
+        self.assertIsNone(p["eps_incoherent"])
+        self.assertIsNone(p["T_eff_us"])
+        self.assertAlmostEqual(total_infidelity(0.99, p["eps_incoherent"]), 0.01,
+                               places=12)
+
+    def test_a_shorter_gate_is_charged_less(self):
+        """Monotone in t_g under any prefactor -- which is what makes it a valid way
+        to RANK drive strengths even though the absolute value is an estimate."""
+        from snail_solver.subharmonic_gate_scan import coherence_penalty
+        eps = [coherence_penalty(t, t1_us=50.0, t2_us=50.0)["eps_incoherent"]
+               for t in (277.8, 231.5, 138.9, 77.2, 55.6)]
+        self.assertEqual(eps, sorted(eps, reverse=True))
+        for a, b in zip(eps, eps[1:]):
+            self.assertGreater(a, b)
+
+    def test_the_prefactor_is_a_knob_not_a_constant(self):
+        """The exact coefficient depends on the error model, so it must be settable
+        without editing code -- and t_g_over_T is reported raw for other conventions."""
+        from snail_solver.subharmonic_gate_scan import coherence_penalty
+        a = coherence_penalty(200.0, t1_us=50.0, prefactor=1.0)
+        b = coherence_penalty(200.0, t1_us=50.0, prefactor=2.0)
+        self.assertGreater(b["eps_incoherent"], a["eps_incoherent"])
+        self.assertAlmostEqual(a["t_g_over_T"], b["t_g_over_T"], places=12)
+        self.assertAlmostEqual(a["t_g_over_T"], 2 * 0.2 / 50.0, places=12)
+
+    def test_a_faster_gate_can_win_despite_worse_coherent_fidelity(self):
+        """THE point of the feature. Ranking on F_avg alone always picks the weakest
+        drive; with the incoherent term the shorter gate can and should win."""
+        from snail_solver.subharmonic_gate_scan import (coherence_penalty,
+                                                        total_infidelity)
+        slow = coherence_penalty(277.8, t1_us=50.0, t2_us=50.0)   # eta 0.5
+        fast = coherence_penalty(55.6, t1_us=50.0, t2_us=50.0)    # eta 2.5
+        F_slow, F_fast = 0.9995, 0.9950          # slow is BETTER coherently
+        self.assertLess(1 - F_slow, 1 - F_fast)
+        self.assertLess(total_infidelity(F_fast, fast["eps_incoherent"]),
+                        total_infidelity(F_slow, slow["eps_incoherent"]))
+
+    def test_the_document_ranks_on_the_total(self):
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+
+        def fake_solve(config, col, settings, **kw):
+            # the WEAK-drive column is better coherently, the strong one shorter
+            weak = col["target_eta"] < 1.0
+            F = 0.9995 if weak else 0.9950
+            t_g = 277.8 if weak else 55.6
+            coh = GS.coherence_penalty(t_g, t1_us=settings["t1_us"],
+                                       t2_us=settings["t2_us"])
+            return {**col, "ok": True, "error": None, "seconds": 1.0,
+                    "fidelity": {"F_avg": F, "leakage": 1e-4, "transfer": 0.99},
+                    "flat": {}, "delta_F": 0.0, "n_coupler": 1e-3,
+                    "n_drag_channels": 3, "channel_audit": {"blocking": []},
+                    "chirp": {"resid_MHz": 0.1},
+                    "operating_point": {"t_g_ns": t_g}, "coherence": coh,
+                    "infidelity_coherent": 1.0 - F,
+                    "infidelity_total": GS.total_infidelity(F,
+                                                            coh["eps_incoherent"])}
+
+        cfg = {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5,
+               "min_detuning_GHz": 0.05}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(GS, "solve_column", fake_solve):
+                doc = GS.run_wp_scan(cfg, [0.05], [0.5, 2.5], outdir=d,
+                                     t1_us=50.0, t2_us=50.0, amp_points=41,
+                                     coupler_levels=5)
+        self.assertEqual(doc["summary"]["best_target_eta"], 2.5)
+        by = doc["by_target_eta"]
+        self.assertLess(by["0.5"]["infidelity_coherent"],
+                        by["2.5"]["infidelity_coherent"])      # weak wins coherently
+        self.assertLess(by["2.5"]["infidelity_total"],
+                        by["0.5"]["infidelity_total"])         # strong wins overall
+
+
+class TestEtaIsAnAxis(unittest.TestCase):
+    """target_eta is a scan AXIS now, not a single operating point.
+
+    Each eta sets its own t_g = 2A/eta and its own Rabi amplitude ladder (a FRACTION
+    of it), so the columns of different eta are independent points that must cache
+    separately.
+    """
+
+    CFG = {"qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5,
+           "min_detuning_GHz": 0.05, "coupler_levels": 7}
+
+    def test_the_grid_is_delta_cross_eta(self):
+        from snail_solver.subharmonic_gate_scan import columns_for
+        cols = columns_for(self.CFG, [-0.05, 0.05])
+        etas = [0.6, 0.8, 1.0]
+        grid = [{**c, "target_eta": e} for c in cols for e in etas]
+        self.assertEqual(len(grid), 6)
+        self.assertEqual(sorted({g["target_eta"] for g in grid}), etas)
+
+    def test_tags_and_cache_keys_separate_the_etas(self):
+        """Same offset at a different drive is a DIFFERENT column; sharing a cache
+        file would silently reuse one eta's calibration for another."""
+        from snail_solver.subharmonic_gate_scan import _column_expect, column_tag
+        self.assertNotEqual(column_tag(0.05, 0.6), column_tag(0.05, 1.2))
+        self.assertEqual(column_tag(0.05, 1.2), "d0p05_eta1p2")
+        settings = {"branch": "below", "coupler_levels": 9, "amp_points": 41,
+                    "eta_lo": 0.2, "eta_hi": 1.0, "max_drag_channels": 3,
+                    "min_ratio": 0.02, "max_ratio": 0.3, "envelope_m": 3,
+                    "contrast_min": 0.35, "leak_max": None,
+                    "probe_shape": "constant", "moment_weighting": "uniform"}
+        a = _column_expect({"w_p_GHz": 1.8, "target_eta": 0.6}, settings)
+        b = _column_expect({"w_p_GHz": 1.8, "target_eta": 1.2}, settings)
+        self.assertNotEqual(a["target_eta"], b["target_eta"])
+
+    def test_leaky_rows_can_be_kept_out_of_the_chirp_fit(self):
+        """Found by running it: at target_eta 1.2 the top three Rabi rows leaked
+        20-25% and were ALL fed into the shift-curve fit, because tune_up's leak_max
+        defaults to 0.35. resid was 0.219 MHz against 0.016 at target_eta 0.6, and the
+        resulting chirp gave 5x the coherent error. The scan must be able to tighten
+        it, and the setting must invalidate a cached column."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+
+        seen = {}
+
+        def fake_run(cfg, target_eta, **kw):
+            # Capture the kwargs and stop: solve_column records the failure as a row,
+            # so the assertions below run without solving anything.
+            seen.update(kw)
+            raise RuntimeError("stop after capturing the settings")
+
+        cfg = {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5,
+               "min_detuning_GHz": 0.05}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("snail_solver.tune_up.run_tune_up", fake_run), \
+                 mock.patch("snail_solver.subharmonic_gate_scan.audit_column",
+                            lambda *a, **k: ((), {"blocking": [], "total_error": 0.0,
+                                                  "t_g0_ns": 100.0})):
+                GS.run_wp_scan(cfg, [0.1], [1.2], outdir=d, leak_max=0.05,
+                               contrast_min=0.6, amp_points=41, coupler_levels=5)
+        self.assertEqual(seen.get("leak_max"), 0.05)      # reached run_tune_up
+        self.assertEqual(seen.get("contrast_min"), 0.6)
+
+    def test_the_row_rejection_settings_invalidate_a_cached_column(self):
+        """Otherwise a re-run with a tighter leak_max silently reuses the calibration
+        that the loose one produced."""
+        from snail_solver.subharmonic_gate_scan import _column_expect
+        base = {"branch": "below", "coupler_levels": 9, "amp_points": 41,
+                "eta_lo": 0.2, "eta_hi": 1.0, "max_drag_channels": 3,
+                "min_ratio": 0.02, "max_ratio": 0.3, "envelope_m": 3,
+                "contrast_min": 0.35, "leak_max": None,
+                "probe_shape": "constant", "moment_weighting": "uniform"}
+        col = {"w_p_GHz": 1.8, "target_eta": 1.2}
+        loose = _column_expect(col, base)
+        tight = _column_expect(col, {**base, "leak_max": 0.05})
+        self.assertNotEqual(loose["leak_max"], tight["leak_max"])
+
+    def test_the_amplitude_ladder_is_per_eta(self):
+        """eta_lo/eta_hi are FRACTIONS, so the ladder scales with each target and
+        never probes above the pulse's own peak."""
+        for target in (0.6, 1.2, 2.5):
+            lad = np.linspace(0.2, 1.0, 41) * target
+            self.assertAlmostEqual(lad[-1], target, places=12)
+            self.assertLessEqual(lad[-1], target)
+
+
+class TestShapedProbeMomentDeconvolution(unittest.TestCase):
+    """A shaped probe reports the pulse AVERAGE; the moments recover the law.
+
+    The constant probe measures delta(|eta|) pointwise, which is what the chirp needs
+    -- but held flat at |eta| = 1.2 it leaks 0.245 (four fifths into the coupler) and
+    transiently 0.93, so the two-level chevron the centre fit assumes is gone. The
+    shaped pulse at the same peak leaks 4e-3. The price is that its rungs report
+
+        <delta>(eta*) = k2 M2 eta*^2 + k4 M4 eta*^4
+
+    and because the law is an EVEN POLYNOMIAL that average is diagonal in
+    {eta^2, eta^4}, so recovering it is two divisions rather than a real inverse.
+    """
+
+    @staticmethod
+    def _hann_f():
+        return lambda u: np.cos(np.pi * np.asarray(u, dtype=float) / 2.0) ** 4
+
+    def test_the_uniform_hann_moment_is_the_tabulated_constant(self):
+        """M2 for a Hann IS stark_chirp.HANN_MEAN_FACTOR. If these ever disagree, the
+        shape_fn convention has drifted and every deconvolved k2 is wrong."""
+        from snail_solver.stark_chirp import HANN_MEAN_FACTOR, stark_moments
+        M2, M4 = stark_moments(self._hann_f(), "uniform")
+        self.assertAlmostEqual(M2, HANN_MEAN_FACTOR, places=12)
+        self.assertAlmostEqual(M2, 3.0 / 8.0, places=12)
+        self.assertAlmostEqual(M4, 35.0 / 128.0, places=12)      # <cos^8>
+
+    def test_the_weightings_differ_enough_to_matter_and_stay_ordered(self):
+        """2x on k2 -- the reason the convention had to be derived, not argued.
+
+        The ordering rabi > coupling > uniform is not incidental: each weight
+        concentrates further toward mid-gate, where the envelope is largest. If a
+        shape change ever inverts it, the weight is no longer what these names say.
+        """
+        from snail_solver.stark_chirp import stark_moments
+        u2, u4 = stark_moments(self._hann_f(), "uniform")
+        c2, c4 = stark_moments(self._hann_f(), "coupling")
+        r2, r4 = stark_moments(self._hann_f(), "rabi")
+        self.assertAlmostEqual(c2, 0.625, places=10)             # <cos^6>/<cos^2>
+        self.assertAlmostEqual(c4, 63.0 / 128.0, places=10)
+        self.assertGreater(c2 / u2, 1.6)
+        self.assertGreater(c4 / u4, 1.7)
+        self.assertGreater(r2, c2)
+        self.assertGreater(r4, c4)
+        self.assertGreater(r2 / u2, 1.8)
+
+    def test_every_moment_is_a_fraction(self):
+        from snail_solver.stark_chirp import MOMENT_WEIGHTINGS, stark_moments
+        for w in MOMENT_WEIGHTINGS:
+            M2, M4 = stark_moments(self._hann_f(), w)
+            for m in (M2, M4):
+                self.assertGreater(m, 0.0)
+                self.assertLessEqual(m, 1.0)
+            # Jensen: M4 = E[f^2] >= (E[f])^2 under ANY positive weight. A weighting
+            # that violates this is not an average of the shape at all.
+            self.assertGreaterEqual(M4, M2 ** 2 - 1e-12)
+
+    def test_an_unknown_weighting_is_refused(self):
+        from snail_solver.stark_chirp import stark_moments
+        with self.assertRaises(ValueError):
+            stark_moments(self._hann_f(), "whatever")
+
+    def test_the_deconvolution_round_trips_exactly(self):
+        """Synthesize what a shaped ladder WOULD report from a known law, fit it the
+        way the pipeline fits, divide the moments out, and get the law back."""
+        from snail_solver.stark_chirp import stark_moments
+        f = self._hann_f()
+        for weighting in ("uniform", "coupling"):
+            M2, M4 = stark_moments(f, weighting)
+            k2_true, k4_true, d0 = 4.0446, 0.2307, -0.1492
+            etas = np.linspace(0.2, 1.0, 9) * 1.2
+            avg = d0 + k2_true * M2 * etas ** 2 + k4_true * M4 * etas ** 4
+            A = np.vstack([np.ones_like(etas), etas ** 2, etas ** 4]).T
+            got_d0, K2, K4 = np.linalg.lstsq(A, avg, rcond=None)[0]
+            self.assertAlmostEqual(got_d0, d0, places=9)
+            self.assertAlmostEqual(K2 / M2, k2_true, places=9)
+            self.assertAlmostEqual(K4 / M4, k4_true, places=9)
+            # and the measured coefficients really are the suppressed ones
+            self.assertLess(K2, k2_true)
+
+    def test_the_moments_follow_the_configured_envelope(self):
+        """A sine_power device must not be deconvolved with Hann moments -- that is
+        the same trap chirp_from_measured_shift guards against for the chirp."""
+        from snail_solver.tune_up import probe_moments
+        hann = probe_moments({"envelope": "raised_cosine"}, "uniform")
+        sp3 = probe_moments({"envelope": "sine_power", "envelope_m": 3}, "uniform")
+        self.assertAlmostEqual(hann[0], 0.375, places=10)
+        self.assertNotAlmostEqual(sp3[0], hann[0], places=3)
+        self.assertAlmostEqual(sp3[0], 0.4102, places=3)
+
+    def test_the_shaped_probe_plays_the_configured_envelope(self):
+        """build_chevron_coupler hardcoded a Hann, so on a sine_power device the
+        'actual gate pulse' probe was a DIFFERENT pulse. amp_scale=1 at nominal_t_g
+        must also put the peak exactly at the requested |eta|."""
+        from snail_solver.device_utils import load_device
+        from snail_solver.find_stark_resonance import build_chevron_coupler
+        from snail_solver.paths import resolve_device
+        from snail_solver.tune_up import nominal_t_g
+        base = load_device(resolve_device("4Gate4.5SNAIL.json"))
+        for env in ("raised_cosine", "sine_power"):
+            cfg = {**base, "envelope": env, "envelope_m": 3, "coupler_levels": 2,
+                   "qubit_levels": 2}
+            t_g = nominal_t_g(cfg, 0.6)
+            cpl, _w_p = build_chevron_coupler(cfg, 0.0, 0.0, t_g, shape="gate",
+                                              t_g_ns=t_g, amp_scale=1.0)
+            self.assertAlmostEqual(cpl.peak_eta(), 0.6, places=6)
+
+    def test_the_constant_probe_is_untouched_and_stores_no_moments(self):
+        """The default must stay exactly what it was."""
+        from unittest import mock
+        from snail_solver import tune_up as TU
+        seen = {}
+
+        def fake_scan(config, t_g, amp, offsets, window_ns, n_time, **kw):
+            seen.setdefault("shapes", []).append(kw.get("shape"))
+            raise RuntimeError("stop")
+
+        with mock.patch("snail_solver.find_stark_resonance.scan", fake_scan):
+            with self.assertRaises(Exception):
+                TU.rabi_shift_table(_cfg(qubit_freqs_GHz=[3.5, 3.8],
+                                         coupler_freq_GHz=4.5), 0.6, amp_points=4)
+        self.assertEqual(set(seen["shapes"]), {"constant"})
+
+
+class TestTheRabiWeightIsDerivedNotChosen(unittest.TestCase):
+    """The shaped chevron's centre averages the Stark shift against sin(theta).
+
+    Two weightings shipped before this one -- uniform in time, and weighted by the
+    iSWAP coupling |eta(t)| -- and BOTH are wrong, by 2.1x and 19% in k2. The right
+    weight follows from first-order perturbation theory on the two-level iSWAP
+    subspace: a detuning enters the rotating frame as D sigma_z / 2, whose matrix
+    element between the instantaneous state and its orthogonal partner carries
+    sin(theta(t)) with theta the accumulated Rabi angle, so
+
+        Delta* = -<delta_stark>_w ,   w(t) = sin theta(t),  theta: 0 -> pi
+
+    These tests are the derivation's guard rail. The load-bearing one integrates the
+    two-level model directly and recovers the moments to 4 decimal places -- if
+    someone "simplifies" the weight back to a time average, k2 halves and every
+    chirp built from a shaped ladder is wrong by 2x.
+    """
+
+    @staticmethod
+    def _hann_f():
+        return lambda u: np.cos(np.pi * np.asarray(u, dtype=float) / 2.0) ** 4
+
+    def test_the_rabi_angle_runs_zero_to_pi_and_never_backwards(self):
+        """theta is an accumulated area, so it is monotone and pinned at both ends."""
+        from snail_solver.stark_chirp import rabi_angle
+        u = np.linspace(-1.0, 1.0, 501)
+        th = rabi_angle(self._hann_f(), u)
+        self.assertAlmostEqual(float(th[0]), 0.0, places=12)
+        self.assertAlmostEqual(float(th[-1]), np.pi, places=12)
+        self.assertTrue(np.all(np.diff(th) >= -1e-15))
+
+    def test_a_shape_with_no_area_is_refused(self):
+        from snail_solver.stark_chirp import rabi_angle, stark_moments
+        with self.assertRaises(ValueError):
+            rabi_angle(lambda u: np.zeros_like(np.asarray(u, dtype=float)),
+                       np.linspace(-1.0, 1.0, 101))
+        with self.assertRaises(ValueError):
+            stark_moments(lambda u: np.zeros_like(np.asarray(u, dtype=float)), "rabi")
+
+    def test_the_hann_rabi_moments_are_the_documented_constants(self):
+        """The numbers stark_moments' table publishes. A drift here silently
+        rescales every chirp built from a shaped ladder."""
+        from snail_solver.stark_chirp import stark_moments
+        M2, M4 = stark_moments(self._hann_f(), "rabi")
+        self.assertAlmostEqual(M2, 0.7115, places=4)
+        self.assertAlmostEqual(M4, 0.5836, places=4)
+
+    def test_the_quadrature_is_converged_at_the_default(self):
+        from snail_solver.stark_chirp import stark_moments
+        coarse = stark_moments(self._hann_f(), "rabi", n_quad=1001)
+        fine = stark_moments(self._hann_f(), "rabi", n_quad=32001)
+        for a, b in zip(coarse, fine):
+            self.assertLess(abs(a - b), 1e-5)
+
+    def test_a_two_level_integration_reproduces_the_moments(self):
+        """THE test: propagate the model the derivation describes and read the
+        chevron centre off it. Done twice, once per moment, because a single drive
+        cannot separate k2 M2 from k4 M4 -- exactly the degeneracy that made the
+        cross-check against a real device unable to pin M4.
+        """
+        from scipy.integrate import solve_ivp
+
+        from snail_solver.stark_chirp import rabi_angle, stark_moments
+
+        f = self._hann_f()
+        M2, M4 = stark_moments(f, "rabi")
+        ug = np.linspace(-1.0, 1.0, 4001)
+        sg = np.sqrt(f(ug))
+        area = float(np.trapz(sg, ug)) * 0.5          # <s> over the gate, u -> t
+        g_pk = np.pi / (2.0 * area)                   # total area pi, with t_g = 1
+
+        def centre(k2, k4, eta, span):
+            """Chevron centre: the detuning that maximizes transfer."""
+            def rhs(t, y, D):
+                u = 2.0 * t - 1.0
+                s = float(np.interp(u, ug, sg))
+                d = D + k2 * eta ** 2 * s ** 2 + k4 * eta ** 4 * s ** 4
+                c0, c1 = y[0] + 1j * y[1], y[2] + 1j * y[3]
+                a = -1j * (-0.5 * d * c0 + g_pk * s * c1)
+                b = -1j * (g_pk * s * c0 + 0.5 * d * c1)
+                return [a.real, a.imag, b.real, b.imag]
+
+            guess = -(k2 * M2 * eta ** 2 + k4 * M4 * eta ** 4)
+            D = np.linspace(guess - span, guess + span, 41)
+            P = np.empty(D.size)
+            for i, dd in enumerate(D):
+                sol = solve_ivp(rhs, (0.0, 1.0), [1.0, 0.0, 0.0, 0.0], args=(dd,),
+                                rtol=1e-10, atol=1e-12)
+                P[i] = abs(sol.y[2, -1] + 1j * sol.y[3, -1]) ** 2
+            j = int(np.argmax(P))
+            self.assertTrue(0 < j < D.size - 1, "centre fell outside the bracket")
+            y0, y1, y2 = P[j - 1], P[j], P[j + 1]
+            return D[j] + 0.5 * (y0 - y2) / (y0 - 2 * y1 + y2) * (D[1] - D[0])
+
+        # quadratic only -> the centre is -k2 M2 eta^2
+        c = centre(3.0, 0.0, 0.4, 0.2)
+        self.assertAlmostEqual(-c / (3.0 * 0.4 ** 2), M2, places=4)
+        # quartic only -> the centre is -k4 M4 eta^4
+        c = centre(0.0, 2.0, 0.8, 0.2)
+        self.assertAlmostEqual(-c / (2.0 * 0.8 ** 4), M4, places=4)
+
+    def test_the_cross_check_scores_every_weighting_against_the_constant_probe(self):
+        """cross_check_probe_moments is how the weighting gets re-pinned whenever an
+        envelope changes, so it has to solve the shaped leg ONCE (the weightings
+        differ only in the division) and rank by k2, not k4 -- a short ladder leaves
+        k2 and k4 ~96% anticorrelated, so k4 carries the systematic and cannot rank.
+        """
+        from unittest import mock
+
+        from snail_solver import tune_up as tu
+
+        # the real device numbers: constant probe k2=3.1674, shaped K2=2.7448
+        fits = {"constant": {"k2": 3.1674, "k4": 1.1379, "r2": 0.9997},
+                "gate": {"k2": 0.0, "k4": 0.0, "r2": 1.0,
+                         "K2_measured": 2.7448, "K4_measured": 0.3665}}
+        calls = []
+
+        def fake_table(config, target_eta, **kw):
+            calls.append(kw.get("probe_shape", "constant"))
+            return {"fit": dict(fits[kw.get("probe_shape", "constant")])}
+
+        cfg = {"envelope": "sine_power", "envelope_m": 3}
+        with mock.patch.object(tu, "rabi_shift_table", fake_table):
+            out = tu.cross_check_probe_moments(cfg, 0.45)
+
+        self.assertEqual(calls, ["constant", "gate"])     # one shaped solve, not three
+        self.assertEqual(out["best"], "rabi")
+        self.assertEqual(set(out["shaped"]), {"rabi", "uniform", "coupling"})
+        self.assertLess(out["shaped"]["rabi"]["k2_rel_err"], 0.06)
+        self.assertGreater(out["shaped"]["uniform"]["k2_rel_err"], 1.0)
+        self.assertAlmostEqual(out["shaped"]["rabi"]["k2"], 3.306, places=2)
+
+    def test_a_time_average_would_be_off_by_two(self):
+        """The bug this replaced: weighting the shift by time underestimates k2 by
+        2.1x on the sine_power envelope the scan uses, which scales the chirp
+        directly. Kept as a named number so the mistake cannot come back quietly."""
+        from snail_solver.stark_chirp import stark_moments
+        f = self._hann_f()
+        rabi = stark_moments(f, "rabi")[0]
+        uni = stark_moments(f, "uniform")[0]
+        self.assertGreater(rabi / uni, 1.8)
+
+    def test_rabi_is_the_default_everywhere(self):
+        """Every entry point defaults to the derived weighting -- a caller that
+        forgets the argument must not silently get a 2x-wrong chirp."""
+        import inspect
+
+        from snail_solver import subharmonic_gate_scan as sgs
+        from snail_solver import tune_up as tu
+        from snail_solver.stark_chirp import MOMENT_WEIGHTINGS, stark_moments
+        self.assertEqual(MOMENT_WEIGHTINGS[0], "rabi")
+        self.assertEqual(stark_moments(self._hann_f()),
+                         stark_moments(self._hann_f(), "rabi"))
+        self.assertEqual(
+            inspect.signature(tu.probe_moments).parameters["weighting"].default,
+            "rabi")
+        for fn in (tu.rabi_shift_table, tu.run_tune_up, sgs.run_wp_scan):
+            got = inspect.signature(fn).parameters["moment_weighting"].default
+            self.assertEqual(got, "rabi", f"{fn.__name__} defaults to {got!r}")
+
+
+class TestColumnFiguresTravelWithTheColumn(unittest.TestCase):
+    """A column's chevrons are its whole cost, so the picture goes in the same file.
+
+    The Rabi table is `amp_points x wp_points` exact trajectories -- the expensive
+    part of a scan -- and a column that FAILED its fit is exactly the one someone has
+    to read the chevrons off. Before this, `/columns/<tag>` held the arrays and no
+    figure, so reading a failed column meant re-deriving the plot by hand.
+    """
+
+    @staticmethod
+    def _run_doc(*, with_chirp=True):
+        doc = {"stages": {"rabi": {"eta": [0.2, 0.4], "delta_MHz": [0.1, 0.4],
+                                   "fit": {"probe_shape": "gate",
+                                           "moment_weighting": "rabi"}}},
+               "delta_GHz": -0.1, "w_p_GHz": 1.65, "target_eta": 0.6}
+        if with_chirp:
+            doc["stages"]["chirp"] = {"coeffs_GHz": [0.0, 1.0]}
+            doc["operating_point"] = {"t_g_ns": 200.0, "wp_offset_GHz": 1e-4}
+        return doc
+
+    def test_a_failed_column_still_gets_its_chevrons(self):
+        """The ridge needs an operating point; the chevrons must NOT. A column that
+        died in the chirp is the one whose chevrons matter most."""
+        from unittest import mock
+
+        from snail_solver import subharmonic_gate_scan as sgs
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("snail_solver.tune_up.plot_rabi_table",
+                            lambda t, out, **kw: out), \
+                 mock.patch("snail_solver.tune_up.plot_chirp_ridge",
+                            lambda *a, **kw: a[4]):
+                figs = sgs.render_column_figures(
+                    self._run_doc(with_chirp=False), "tag", d)
+        self.assertEqual(set(figs), {"rabi"})
+
+    def test_a_complete_column_gets_both(self):
+        from unittest import mock
+
+        from snail_solver import subharmonic_gate_scan as sgs
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("snail_solver.tune_up.plot_rabi_table",
+                            lambda t, out, **kw: out),                  mock.patch("snail_solver.tune_up.plot_chirp_ridge",
+                            lambda *a, **kw: a[4]):
+                figs = sgs.render_column_figures(self._run_doc(), "tag", d)
+        self.assertEqual(set(figs), {"rabi", "chirp_ridge"})
+
+    def test_a_plotting_failure_never_costs_the_column(self):
+        """matplotlib must not be able to fail a finished scan -- the same rule
+        h5_io.attach_figures already applies to STORING a figure."""
+        from unittest import mock
+
+        from snail_solver import subharmonic_gate_scan as sgs
+
+        def boom(*a, **kw):
+            raise RuntimeError("no display")
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("snail_solver.tune_up.plot_rabi_table", boom),                  mock.patch("snail_solver.tune_up.plot_chirp_ridge", boom):
+                figs = sgs.render_column_figures(self._run_doc(), "tag", d)
+        self.assertEqual(figs, {})
+
+    def test_a_column_with_no_rabi_stage_is_skipped_not_crashed(self):
+        from snail_solver import subharmonic_gate_scan as sgs
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(sgs.render_column_figures({}, "tag", d), {})
+            self.assertEqual(sgs.render_column_figures({"stages": {}}, "tag", d), {})
+
+    def test_figures_are_not_in_the_cache_key(self):
+        """Storing a picture must never invalidate a solved column."""
+        from snail_solver import subharmonic_gate_scan as sgs
+        col = {"w_p_GHz": 1.65, "target_eta": 0.6}
+        base = {"branch": "below", "coupler_levels": 5, "amp_points": 9,
+                "eta_lo": 0.2, "eta_hi": 1.0, "max_drag_channels": 3,
+                "min_ratio": 0.02, "max_ratio": 0.3, "contrast_min": 0.35,
+                "leak_max": None, "probe_shape": "gate",
+                "moment_weighting": "rabi", "envelope_m": 3}
+        a = sgs._column_expect(col, {**base, "column_figures": True})
+        b = sgs._column_expect(col, {**base, "column_figures": False})
+        self.assertEqual(a, b)
+
+    def test_the_shared_ridge_grid_IS_in_the_cache_key(self):
+        """--ridge-grid replaces each row's adaptive span with one shared axis, which
+        is a different measurement of the column, not a finer one -- so unlike the
+        rest of the grid resolution it must invalidate a cached column."""
+        from snail_solver import subharmonic_gate_scan as sgs
+        col = {"w_p_GHz": 1.65, "target_eta": 0.6}
+        base = {"branch": "below", "coupler_levels": 5, "amp_points": 9,
+                "eta_lo": 0.2, "eta_hi": 1.0, "max_drag_channels": 3,
+                "min_ratio": 0.02, "max_ratio": 0.3, "contrast_min": 0.35,
+                "leak_max": None, "probe_shape": "gate",
+                "moment_weighting": "rabi", "envelope_m": 3}
+        self.assertNotEqual(sgs._column_expect(col, {**base, "ridge_grid": True}),
+                            sgs._column_expect(col, {**base, "ridge_grid": False}))
+
+    def test_the_ridge_grid_fixes_the_span_and_grows_the_point_count(self):
+        """A fixed span undersamples the weakest row unless wp_points grows with it,
+        so the count ridge_span_MHz asks for has to be honoured, never clipped."""
+        from unittest import mock
+
+        from snail_solver import subharmonic_gate_scan as sgs
+        settings = {"ridge_grid": True, "wp_span_MHz": None, "eta_lo": 0.2,
+                    "eta_hi": 1.0, "span_linewidths": 4.0, "wp_points": 9}
+        with mock.patch("snail_solver.tune_up.ridge_span_MHz",
+                        lambda *a, **kw: (37.5, 41)):
+            out = sgs._settings_for({"target_eta": 0.6}, settings, {"dev": 1})
+        self.assertAlmostEqual(out["wp_span_MHz"], 37.5)
+        self.assertEqual(out["wp_points"], 41)           # grown, not the passed 9
+
+    def test_an_explicit_span_wins_over_the_ridge_grid(self):
+        from snail_solver import subharmonic_gate_scan as sgs
+        settings = {"ridge_grid": True, "wp_span_MHz": 12.0, "eta_lo": 0.2,
+                    "eta_hi": 1.0, "span_linewidths": 4.0, "wp_points": 9}
+        out = sgs._settings_for({"target_eta": 0.6}, settings, {"dev": 1})
+        self.assertAlmostEqual(out["wp_span_MHz"], 12.0)
+        self.assertEqual(out["wp_points"], 9)
+
+    def test_the_ridge_grid_needs_a_config_and_says_so(self):
+        from snail_solver import subharmonic_gate_scan as sgs
+        with self.assertRaises(ValueError):
+            sgs._settings_for({"target_eta": 0.6},
+                              {"ridge_grid": True, "wp_span_MHz": None,
+                               "eta_lo": 0.2, "eta_hi": 1.0,
+                               "span_linewidths": 4.0, "wp_points": 9}, None)
+
+
+class TestOpenSystemScoring(unittest.TestCase):
+    """The open-system metric must be the SAME metric, extended to many Kraus ops.
+
+    The scan reports coherent fidelity plus a first-order incoherent estimate; the
+    open-system path replaces the estimate with a real solve on the few points worth
+    confirming. It is only comparable to the rest of the pipeline if it uses the same
+    leakage-aware Pedersen definition -- so with a single (unitary) Kraus operator it
+    has to reproduce ZhouCoupler._iswap_fidelity_from_U exactly.
+
+    These tests are deliberately solver-free: they feed the map built from a known
+    unitary, so they pin the FORMULA without needing QuTiP. The end-to-end reduction
+    (mesolve with no collapse operators == sesolve) is checked by hand, not here,
+    because it costs 16 solves.
+    """
+
+    @staticmethod
+    def _map_from_unitary(U):
+        """E[k, m] = U |k><m| U^dag, the single-Kraus map, projected (it already is)."""
+        E = np.zeros((4, 4, 4, 4), dtype=complex)
+        for k in range(4):
+            for m in range(4):
+                rho = np.zeros((4, 4), dtype=complex)
+                rho[k, m] = 1.0
+                E[k, m] = U @ rho @ U.conj().T
+        return E
+
+    def test_a_unitary_map_reproduces_the_closed_system_formula(self):
+        from snail_solver.open_system import _fidelity_from_map, _ideal_iswap
+        from snail_solver.zhou_coupler import ZhouCoupler
+        rng = np.random.default_rng(7)
+        U_ideal = _ideal_iswap()
+        for _ in range(5):
+            # a Haar-ish unitary, then a small perturbation of the ideal gate
+            X = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+            Q, R = np.linalg.qr(X)
+            U = Q @ np.diag(np.diag(R) / np.abs(np.diag(R)))
+            for cand in (U, U_ideal, U_ideal @ np.diag([1, 1, 1, np.exp(0.3j)])):
+                got, leak = _fidelity_from_map(self._map_from_unitary(cand), U_ideal)
+                want, want_leak = ZhouCoupler._iswap_fidelity_from_U(cand, False)
+                self.assertAlmostEqual(got, want, places=10)
+                self.assertAlmostEqual(leak, want_leak, places=10)
+
+    def test_the_ideal_gate_scores_one(self):
+        from snail_solver.open_system import _fidelity_from_map, _ideal_iswap
+        U = _ideal_iswap()
+        F, leak = _fidelity_from_map(self._map_from_unitary(U), U)
+        self.assertAlmostEqual(F, 1.0, places=12)
+        self.assertAlmostEqual(leak, 0.0, places=12)
+
+    def test_leakage_is_lost_subspace_population(self):
+        """Half the amplitude driven out of the computational subspace is leakage 0.75
+        (population goes as the square), and it must not read as fidelity."""
+        from snail_solver.open_system import _fidelity_from_map, _ideal_iswap
+        U = _ideal_iswap()
+        E = self._map_from_unitary(U) * 0.25          # 25% of population survives
+        F, leak = _fidelity_from_map(E, U)
+        self.assertAlmostEqual(leak, 0.75, places=12)
+        self.assertLess(F, 0.3)
+
+    def test_a_virtual_z_phase_is_fitted_out(self):
+        """Single-qubit Z is free in software, so a pure Z error must not be charged."""
+        from snail_solver.open_system import (_fidelity_from_map, _fit_virtual_z,
+                                              _ideal_iswap)
+        U_ideal = _ideal_iswap()
+        U = U_ideal @ np.diag([1.0, np.exp(0.7j), np.exp(-1.1j),
+                               np.exp(1j * (0.7 - 1.1))])
+        E = self._map_from_unitary(U)
+        self.assertLess(_fidelity_from_map(E, U_ideal)[0], 0.99)
+        F_fit, _target = _fit_virtual_z(E, U_ideal)
+        self.assertGreater(F_fit, 0.999)
+
+    def test_pure_dephasing_is_what_is_left_after_relaxation(self):
+        """1/T2 = 1/(2 T1) + 1/T_phi, and a T2 longer than 2 T1 is unphysical -- it
+        must clamp to zero rather than become gain."""
+        from snail_solver.open_system import dephasing_rate_MHz
+        self.assertAlmostEqual(dephasing_rate_MHz(50.0, 100.0), 0.0, places=15)
+        self.assertGreater(dephasing_rate_MHz(50.0, 30.0), 0.0)
+        self.assertEqual(dephasing_rate_MHz(50.0, 1e9), 0.0)
+        self.assertEqual(dephasing_rate_MHz(None, None), 0.0)
+        # T1 only: no pure dephasing term at all
+        self.assertEqual(dephasing_rate_MHz(50.0, None), 0.0)
+
+
+class TestScanDocumentRoundTrips(unittest.TestCase):
+    """The scan document survives HDF5 -- including the parts that are easy to lose.
+
+    Rows are HETEROGENEOUS (a failed column has an `error` and no `fidelity`), the
+    channel audit is nested two deep, and the settings carry None and the full eta
+    ladder. If any of that flattens, --replot reads a different scan than ran.
+    """
+
+    def _doc(self):
+        return {
+            "source": "subharmonic_gate_scan",
+            "device": {"qubit_freqs_GHz": [3.5, 1.7], "envelope": "sine_power",
+                       "envelope_m": 4, "chirp_coeffs_GHz": None,
+                       "engine_cutoff_GHz": float("inf")},
+            "settings": {"target_eta": 2.5, "branch": "below", "wp_span_MHz": None,
+                         "eta_scan": list(np.linspace(0.2, 1.0, 41) * 2.5)},
+            "rows": [
+                {"delta_GHz": -0.05, "ok": True, "error": None,
+                 "fidelity": {"F_avg": 0.99, "leakage": 1e-4, "transfer": 0.98},
+                 "flat": {"F_avg": 0.98, "leakage": 2e-4, "transfer": 0.97},
+                 "channel_audit": {"rows": [{"category": "leakage", "g_MHz": 9.1,
+                                             "detuning_MHz": -20.0,
+                                             "selected": False,
+                                             "reason": "left uncorrected"}],
+                                   "blocking": [], "n_selected": 4}},
+                {"delta_GHz": 0.05, "ok": False,
+                 "error": {"type": "RabiFitError", "stage": "rabi", "message": "flat"}},
+            ],
+            "summary": {"n_columns": 2, "n_ok": 1, "best_delta_GHz": -0.05},
+        }
+
+    def test_every_awkward_part_comes_back(self):
+        from snail_solver.h5_io import load_doc, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            addr = save_doc(os.path.join(d, "scan.h5"), self._doc(), group="scan")
+            back = load_doc(addr)
+        self.assertEqual(len(back["rows"]), 2)
+        self.assertIs(back["rows"][0]["ok"], True)
+        self.assertIsNone(back["rows"][0]["error"])
+        self.assertEqual(back["rows"][1]["error"]["type"], "RabiFitError")
+        self.assertNotIn("fidelity", back["rows"][1])       # heterogeneous, not padded
+        self.assertEqual(back["rows"][0]["channel_audit"]["rows"][0]["reason"],
+                         "left uncorrected")
+        self.assertEqual(back["rows"][0]["channel_audit"]["blocking"], [])
+        self.assertIsNone(back["settings"]["wp_span_MHz"])
+        self.assertTrue(np.isinf(back["device"]["engine_cutoff_GHz"]))
+        self.assertIsNone(back["device"]["chirp_coeffs_GHz"])
+
+    def test_the_eta_ladder_is_stored_intact(self):
+        """It is the calibration input the chirp came from, so a run has to record
+        exactly which drive strengths were measured."""
+        from snail_solver.h5_io import load_doc, save_doc
+        with tempfile.TemporaryDirectory() as d:
+            addr = save_doc(os.path.join(d, "scan.h5"), self._doc(), group="scan")
+            etas = load_doc(addr)["settings"]["eta_scan"]
+        self.assertEqual(len(etas), 41)
+        self.assertAlmostEqual(etas[0], 0.5, places=12)
+        self.assertAlmostEqual(etas[-1], 2.5, places=12)
+
+
+class TestChannelPolicy(unittest.TestCase):
+    """Recursive DRAG must target the leakage and subharmonic channels at least.
+
+    Category alone is not enough: the classifier's `leakage` means specifically the
+    |2> ladder, so a subharmonic that takes qubit A from |0> to |1> is filed under
+    `other`. Requiring only the categories would silently miss the very channel a
+    scan across 2 w_p = w_a is about.
+    """
+
+    def _audit(self, **kw):
+        from snail_solver.device_utils import load_device
+        from snail_solver.paths import resolve_device
+        from snail_solver.spectator_audit import select_drag_channels
+        from snail_solver.subharmonic_convergence import config_at_wp
+        from snail_solver.tune_up import nominal_t_g
+        cfg = load_device(resolve_device("4Gate4.5SNAIL.json"))
+        cfg = {**cfg, "coupler_levels": 5, "envelope": "sine_power", "envelope_m": 4}
+        wa = cfg["qubit_freqs_GHz"][0]
+        c = config_at_wp(cfg, wa / 2 + kw.pop("delta", 0.05), branch="below")
+        return select_drag_channels(c, nominal_t_g(c, 0.6), **kw)
+
+    def test_the_qubit_subharmonic_is_selected_although_it_is_category_other(self):
+        chans, audit = self._audit(delta=0.05, max_channels=4)
+        sub = [r for r in audit["rows"] if r["is_subharmonic"] and r["g_MHz"] > 0]
+        self.assertTrue(sub, "the A subharmonic was not even enumerated")
+        self.assertEqual(sub[0]["category"], "other")     # not "leakage"
+        self.assertTrue(sub[0]["selected"])
+        self.assertAlmostEqual(sub[0]["detuning_MHz"], -100.0, places=6)
+
+    def test_leakage_and_coupler_are_mandatory_when_they_matter(self):
+        _chans, audit = self._audit(delta=0.05, max_channels=8)
+        sel = [r for r in audit["rows"] if r["selected"]]
+        for cat in ("leakage", "coupler"):
+            strong = [r for r in audit["rows"]
+                      if r["category"] == cat and not r["negligible"]]
+            if strong:
+                self.assertTrue(any(r["selected"] for r in strong),
+                                f"no {cat} channel selected")
+        self.assertTrue(sel)
+
+    def test_the_cap_is_honoured_and_says_what_it_dropped(self):
+        chans, audit = self._audit(delta=0.05, max_channels=2)
+        self.assertLessEqual(len(chans), 2)
+        self.assertEqual(audit["envelope_m_min"], len(chans))
+        capped = [r for r in audit["rows"]
+                  if str(r["reason"]).startswith("capped")]
+        self.assertTrue(capped, "the cap dropped channels but reported no reason")
+
+    def test_a_negligible_channel_stops_being_mandatory(self):
+        """Spending a recursion order -- and a unit of envelope_m, and hence gate
+        length -- on a parasite worth P_exc ~ 1e-4 buys nothing."""
+        _chans, audit = self._audit(delta=0.05, max_channels=8, min_ratio=0.05)
+        for r in audit["rows"]:
+            if r["category"] != "target" and r.get("ratio", 0.0) < 0.05:
+                self.assertFalse(r["mandatory"])
+
+    def test_no_duplicate_substitution_is_composed(self):
+        """Same beat AND same pump count is the identical substitution; composing it
+        twice doubles the correction instead of suppressing a second process."""
+        _chans, audit = self._audit(delta=0.05, max_channels=8)
+        idents = [(round(c.beat_GHz, 9), c.n_pump) for c in _chans]
+        self.assertEqual(len(idents), len(set(idents)))
+
+    def test_a_channel_drag_cannot_converge_on_is_left_uncorrected(self):
+        """Found by running it: composing a channel with g/|det| ~ 0.46 made the
+        chirp<->DRAG fixed point DIVERGE (min|Delta(t)| ran to 1e10 MHz) instead of
+        settling. Above max_ratio the DRAG quadrature is a third or more of the pulse
+        it corrects, so the channel is reported and left alone -- the same 0.3 the
+        device_utils.drag_correction_ratio guard warns at."""
+        chans, audit = self._audit(delta=0.05, max_channels=8)
+        strong = [r for r in audit["rows"]
+                  if r["category"] != "target" and r.get("ratio", 0.0) >= 0.3]
+        self.assertTrue(strong, "expected a strong channel at this operating point")
+        for r in strong:
+            self.assertFalse(r["selected"])
+            self.assertIn("uncorrected", r["reason"])
+        self.assertTrue(audit["uncorrected"])
+        for c in chans:                       # nothing above the cap got composed
+            row = next(r for r in audit["rows"]
+                       if r["selected"] and abs(r["beat_GHz"] - c.beat_GHz) < 1e-9)
+            self.assertLess(row["ratio"], 0.3)
+
+    def test_the_anharmonicity_shifted_subharmonic_is_seen(self):
+        """The |1>->|2> subharmonic sits at the anharmonicity, not at -2*delta, so it
+        goes resonant at its OWN offset (delta ~ +60 MHz for a -120 MHz anharmonicity).
+        collision_landmarks cannot see it -- its process table is harmonic -- so the
+        channel audit is the only thing that reports it."""
+        _chans, audit = self._audit(delta=0.05, max_channels=8)
+        near = [r for r in audit["rows"]
+                if r["category"] == "leakage" and int(r["n_pump"]) == 2
+                and abs(r["detuning_MHz"]) < 40.0]
+        self.assertTrue(near, "the anharmonicity-shifted subharmonic was not enumerated")
+        # It is the strong one, and the reason the divergence guard exists.
+        self.assertGreaterEqual(near[0]["ratio"], 0.3)
+        self.assertFalse(near[0]["selected"])
+
+    def test_a_resonant_channel_is_the_worst_case_not_a_missing_number(self):
+        """An exactly-resonant channel has ratio = inf. Reducing a column with
+        max(... if isfinite) DROPPED it, so the feasibility table reported a resonant
+        column as clean -- which is the reading that sends someone to an operating
+        point the scan then refuses. The worst-case reduction must keep inf."""
+        _chans, audit = self._audit(delta=0.0, max_channels=3)
+        para = [r for r in audit["rows"] if r["category"] != "target"]
+        self.assertTrue(any(not np.isfinite(r["ratio"]) for r in para),
+                        "expected a resonant channel at delta = 0")
+        worst_all = max(r["ratio"] for r in para)
+        worst_finite = max((r["ratio"] for r in para if np.isfinite(r["ratio"])),
+                           default=0.0)
+        self.assertFalse(np.isfinite(worst_all))
+        self.assertTrue(np.isfinite(worst_finite))   # the misleading old reduction
+        self.assertLess(worst_finite, 1.0)           # ... and it looked FINE
+
+    def test_an_exactly_resonant_channel_blocks(self):
+        """At delta = 0 the A subharmonic is resonant, g/|det| >= 1: no leading term to
+        cancel. That is frequency allocation, not pulse shaping."""
+        _chans, audit = self._audit(delta=0.0, max_channels=4)
+        self.assertTrue(audit["blocking"])
+        self.assertTrue(all("not perturbative" in b["verdict"]
+                            for b in audit["blocking"]))
+
+    def test_a_clear_column_does_not_block(self):
+        _chans, audit = self._audit(delta=0.05, max_channels=4)
+        self.assertEqual(audit["blocking"], [])
+
+
+class TestEtaScanShapesTheChirpNotTheScore(unittest.TestCase):
+    """The eta scan is a calibration INPUT; it must not reach the fidelity axis.
+
+    eta 0.5 -> 2.5 is the Rabi amplitude scan that measures the Stark shift law the
+    chirp is projected from (tune_up steps 1-2). Each column reports ONE fidelity,
+    scored at the single operating point. If drive strength ever became an output
+    axis, the scan would be answering a different question.
+    """
+
+    SETTINGS = {"target_eta": 2.5, "branch": "below", "coupler_levels": 5,
+                "eta_lo": 0.2, "eta_hi": 1.0, "amp_points": 41,
+                "max_drag_channels": 3, "min_ratio": 0.02, "max_ratio": 0.3,
+                "envelope_m": 3, "drag_retries": 0,
+                "wp_points": 25, "wp_span_MHz": None, "span_linewidths": 4.0,
+                "n_time": 61, "window_tg": 2.0, "tg_points": 7,
+                "tg_lo": 0.7, "tg_hi": 1.3, "chirp_degree": 8, "max_drag_iters": 2,
+                "contrast_min": 0.35, "quartic_warn": 0.25, "leak_max": None,
+                "map_kw": {}, "probe_shape": "constant",
+                "moment_weighting": "uniform"}
+
+    def _record(self):
+        return {"target_eta": 2.5, "t_g_ns": 150.0, "amp_scale": 1.0,
+                "wp_offset_GHz": 2e-3, "chirp_coeffs_GHz": [0.0, -0.004],
+                "wa_GHz": 3.5, "wb_GHz": 1.7, "spec_abs_GHz": None,
+                "drag_beat_GHz": None, "drag_n_pump": 1, "score": 0.99,
+                "source": "tune_up"}
+
+    def test_the_requested_ladder_is_exactly_reproduced(self):
+        """target_eta 2.5 with eta_lo 0.2 / eta_hi 1.0 over 41 points IS
+        0.50, 0.55, ..., 2.50 -- and never exceeds the pulse's own peak."""
+        etas = np.linspace(0.2, 1.0, 41) * 2.5
+        self.assertAlmostEqual(etas[0], 0.50, places=12)
+        self.assertAlmostEqual(etas[-1], 2.50, places=12)
+        self.assertAlmostEqual(etas[1] - etas[0], 0.05, places=12)
+        self.assertLessEqual(etas[-1], 2.5)
+
+    def test_the_scan_feeds_run_tune_up_and_the_score_is_scalar(self):
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        rec = self._record()
+        seen = {}
+
+        def fake_run_tune_up(cfg, target_eta, **kw):
+            seen["target_eta"] = target_eta
+            seen["amp_points"] = kw["amp_points"]
+            seen["eta_lo"], seen["eta_hi"] = kw["eta_lo"], kw["eta_hi"]
+            seen["channels"] = kw["drag_channels"]
+            return {"operating_point": rec, "t_g0_ns": 140.0,
+                    "stages": {"rabi": {"eta": np.linspace(0.5, 2.5, 41),
+                                        "fit": {"k2": 1.0, "k4": 0.1, "r2": 0.999,
+                                                "resid_MHz": 0.2}},
+                               "chirp": {"quartic_fraction": 0.1}}}
+
+        scores = []
+
+        def fake_score_gate(cfg, record, chirp, **kw):
+            scores.append(list(chirp))
+            return {"F_avg": 0.99, "leakage": 1e-4, "transfer": 0.98}
+
+        cfg = {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5,
+               "envelope": "sine_power", "envelope_m": 4}
+        col = GS.columns_for(cfg, [0.05])[0]
+        with mock.patch("snail_solver.tune_up.run_tune_up", fake_run_tune_up), \
+             mock.patch("snail_solver.tune_up_sweep.score_gate", fake_score_gate), \
+             mock.patch("snail_solver.subharmonic_convergence.coupler_occupation",
+                        lambda *a, **k: 1e-3), \
+             mock.patch("snail_solver.subharmonic_gate_scan.audit_column",
+                        lambda *a, **k: ((), {"blocking": [], "total_error": 1e-3,
+                                              "t_g0_ns": 140.0})):
+            row = GS.solve_column(cfg, col, self.SETTINGS)
+
+        # The eta ladder went IN as a calibration setting ...
+        self.assertEqual(seen["amp_points"], 41)
+        self.assertEqual((seen["eta_lo"], seen["eta_hi"]), (0.2, 1.0))
+        self.assertEqual(seen["target_eta"], 2.5)
+        # ... and reached the stored run, but NOT the reported fidelity.
+        self.assertEqual(len(row["run_doc"]["stages"]["rabi"]["eta"]), 41)
+        self.assertEqual(set(row["fidelity"]), {"F_avg", "leakage", "transfer"})
+        for v in row["fidelity"].values():
+            self.assertIsInstance(v, float)
+        # Scored exactly twice: the calibrated chirp, and a chirp-off reference.
+        self.assertEqual(len(scores), 2)
+        self.assertEqual(scores[0], [0.0, -0.004])
+        self.assertEqual(scores[1], [])             # [] not None: never inherit
+
+    def test_a_diverging_recursion_sheds_a_channel_instead_of_losing_the_column(self):
+        """Found by running it: at 4 composed channels the chirp<->DRAG fixed point ran
+        away (min|Delta(t)| -> 1e18 MHz) and the column was lost outright. Whether a
+        depth is well posed depends on the operating point, so shed the weakest channel
+        and retry."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        from snail_solver.envelope import DragChannel
+        rec = self._record()
+        chans = tuple(DragChannel(b, n_pump=2, n_photon=2, quotient_rule=True)
+                      for b in (-0.9, -0.1, 0.8, -0.12))
+        seen = []
+
+        def flaky(cfg, target_eta, **kw):
+            n = len(kw["drag_channels"])
+            seen.append(n)
+            if n >= 4:
+                raise RuntimeError("the chirp<->DRAG fixed point did not settle in 12 "
+                                   "passes (last step 2.87e+18 GHz)")
+            return {"operating_point": rec, "t_g0_ns": 140.0,
+                    "stages": {"rabi": {"eta": np.linspace(0.5, 2.5, 41), "fit": {}},
+                               "chirp": {}}}
+
+        cfg = {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5}
+        col = GS.columns_for(cfg, [0.05])[0]
+        settings = {**self.SETTINGS, "drag_retries": 2}
+        with mock.patch("snail_solver.tune_up.run_tune_up", flaky), \
+             mock.patch("snail_solver.tune_up_sweep.score_gate",
+                        lambda *a, **k: {"F_avg": 0.99, "leakage": 1e-4,
+                                         "transfer": 0.98}), \
+             mock.patch("snail_solver.subharmonic_convergence.coupler_occupation",
+                        lambda *a, **k: 1e-3), \
+             mock.patch("snail_solver.subharmonic_gate_scan.audit_column",
+                        lambda *a, **k: (chans, {"blocking": [], "total_error": 1e-3,
+                                                 "t_g0_ns": 140.0})):
+            row = GS.solve_column(cfg, col, settings)
+        self.assertEqual(seen, [4, 3])            # retried once, at one fewer channel
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["n_drag_channels"], 3)
+        self.assertEqual(row["drag_shed"], 1)
+
+    def test_a_recursion_that_never_converges_is_recorded_as_such(self):
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        from snail_solver.envelope import DragChannel
+        chans = tuple(DragChannel(b, n_pump=2, n_photon=2) for b in (-0.9, -0.1))
+
+        def always(cfg, target_eta, **kw):
+            raise RuntimeError("the chirp<->DRAG fixed point did not settle in 12 passes")
+
+        cfg = {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5}
+        col = GS.columns_for(cfg, [0.05])[0]
+        with mock.patch("snail_solver.tune_up.run_tune_up", always), \
+             mock.patch("snail_solver.subharmonic_gate_scan.audit_column",
+                        lambda *a, **k: (chans, {"blocking": [], "total_error": 1e-3,
+                                                 "t_g0_ns": 140.0})):
+            row = GS.solve_column(cfg, col, {**self.SETTINGS, "drag_retries": 2})
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error"]["type"], "DragFixedPointDiverged")
+        self.assertEqual(row["error"]["stage"], "chirp")
+
+    def test_a_blocking_column_is_recorded_not_raised(self):
+        """A column no pulse can fix is a RESULT about that frequency."""
+        from unittest import mock
+        from snail_solver import subharmonic_gate_scan as GS
+        cfg = {**_cfg(), "qubit_freqs_GHz": [3.5, 3.8], "coupler_freq_GHz": 4.5}
+        col = GS.columns_for(cfg, [0.05])[0]
+        block = [{"name": "qubit a subharmonic", "g_MHz": 6.5,
+                  "detuning_MHz": 0.0, "verdict": "fails: not perturbative"}]
+        with mock.patch("snail_solver.subharmonic_gate_scan.audit_column",
+                        lambda *a, **k: ((), {"blocking": block, "total_error": 1.0,
+                                              "t_g0_ns": 140.0})):
+            row = GS.solve_column(cfg, col, self.SETTINGS)
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error"]["type"], "NonPerturbativeChannel")
+        self.assertNotIn("fidelity", row)
+
 
 
 if __name__ == "__main__":

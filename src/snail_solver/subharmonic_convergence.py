@@ -305,6 +305,96 @@ def config_at_detuning(config: Dict[str, Any], delta_sub_GHz: float, *,
     return out
 
 
+def wp_for_detuning(config: Dict[str, Any], delta_sub_GHz: float) -> float:
+    """``w_p = (w_s - Delta_sub)/2`` -- the pump this axis position implies."""
+    _wa, _wb, ws = _freqs(config)
+    return 0.5 * (ws - float(delta_sub_GHz))
+
+
+def detuning_for_wp(config: Dict[str, Any], w_p_GHz: float) -> float:
+    """``Delta_sub = w_s - 2 w_p`` -- the inverse of :func:`wp_for_detuning`.
+
+    Note the factor of two: a step ``d`` in the pump moves this axis by ``-2 d``. It is
+    the reason a ``w_p``-native scan is worth having rather than doing the arithmetic at
+    every call site (and why :func:`nearest_landmark` reports both distances).
+    """
+    _wa, _wb, ws = _freqs(config)
+    return ws - 2.0 * float(w_p_GHz)
+
+
+def wb_for_wp(config: Dict[str, Any], w_p_GHz: float,
+              branch: str = "below") -> float:
+    """Partner frequency that makes the gate pump exactly ``w_p_GHz``.
+
+    ``w_b = w_a +/- w_p``, so ``w_p = |w_b - w_a|`` on either branch.
+    ``branch="below"`` (the default here, unlike :func:`wb_for_detuning`) puts the
+    partner UNDER the anchor, which is the ``w_p = w_a - w_b`` convention; ``"above"``
+    puts it over, at ``w_a + w_p``.
+
+    The two branches are physically different allocations at the same pump. In
+    particular, scanning ``w_p`` across ``w_a/2``:
+
+    * ``below`` sends ``w_b -> w_a/2 = w_p``, so the partner lands ON the pump
+      frequency -- qubit A's subharmonic and a direct drive on B collide at once.
+    * ``above`` sends ``w_b -> 1.5 w_a``, which is degenerate with nothing, so A's
+      subharmonic is isolated.
+
+    Raises
+    ------
+    ValueError
+        If ``w_p`` is not positive, or the implied ``w_b`` is not.
+    """
+    wa, _wb, _ws = _freqs(config)
+    w_p = float(w_p_GHz)
+    if w_p <= 0.0:
+        raise ValueError(f"w_p={w_p:g} GHz is not a pump: expected w_p > 0")
+    sign = {"above": +1.0, "below": -1.0}.get(str(branch))
+    if sign is None:
+        raise ValueError(f"branch={branch!r}: expected 'above' or 'below'")
+    wb = wa + sign * w_p
+    if wb <= 0.0:
+        raise ValueError(
+            f"w_p={w_p:g} GHz on the 'below' branch puts w_b={wb:g} GHz at or under "
+            f"zero (w_a={wa:g}); use branch='above'")
+    return float(wb)
+
+
+def config_at_wp(config: Dict[str, Any], w_p_GHz: float, *,
+                 levels: Optional[int] = None, branch: str = "below",
+                 chirp_coeffs_GHz: Sequence[float] = (),
+                 min_detuning_GHz: Optional[float] = None) -> Dict[str, Any]:
+    """A COPY of `config` whose gate pump is ``w_p_GHz``.
+
+    The ``w_p``-native spelling of :func:`config_at_detuning`, which it delegates to
+    after the change of variable ``Delta_sub = w_s - 2 w_p`` -- so the
+    ``min_detuning_GHz`` floor and the device-chirp stripping are the SAME code, not a
+    second copy that could drift from it.
+
+    The floor is checked here first, in terms of ``w_p``, only so the error names the
+    variable the caller passed; the delegate's identical check then cannot fire.
+
+    Raises
+    ------
+    ValueError
+        If ``w_p`` is under ``min_detuning_GHz`` (the device's own by default): the
+        two qubits are then within a linewidth of each other and the "gate" is a
+        direct collision, not a pumped one.
+    """
+    w_p = float(w_p_GHz)
+    floor = (float(config.get("min_detuning_GHz", 0.05))
+             if min_detuning_GHz is None else float(min_detuning_GHz))
+    if w_p < floor:
+        raise ValueError(
+            f"w_p={w_p:g} GHz is under the {floor:g} GHz floor: the qubits are then "
+            f"within a linewidth of each other and the 'gate' is a direct collision, "
+            f"not a pumped one.")
+    wb_for_wp(config, w_p, branch)                  # branch/positivity, w_p-phrased
+    return config_at_detuning(config, detuning_for_wp(config, w_p),
+                              levels=levels, branch=branch,
+                              chirp_coeffs_GHz=chirp_coeffs_GHz,
+                              min_detuning_GHz=min_detuning_GHz)
+
+
 def delta_tag(delta_sub_GHz: float) -> str:
     """``0.35 -> 'd0p35'``, ``-0.2 -> 'dm0p2'`` -- a filename fragment, no dots."""
     return "d" + f"{float(delta_sub_GHz):g}".replace(".", "p").replace("-", "m")

@@ -1199,3 +1199,387 @@ uv run python -m snail_solver.subharmonic_convergence \
     --outdir results/subharm_4Gate_mirror_eta0p6 \
     --plot figs/subharm_4Gate_mirror_eta0p6/convergence_map.png
 ```
+
+---
+
+## Addendum 3, 2026-09-09 — scanning the pump across a QUBIT's subharmonic, and the depth at which the recursion stops converging
+
+`subharmonic_convergence` walks the gate along `Delta_sub = w_s - 2 w_p`, i.e. toward the
+SNAIL's subharmonic. `subharmonic_gate_scan` (new) walks the same knob — `w_b`, with `w_a`
+and `w_s` fixed — but parameterized in the pump directly and centred on **qubit A's** own
+subharmonic:
+
+    w_p = w_a/2 + delta;   w_b = w_a -/+ w_p        (branch "below" / "above")
+    2 w_p - w_a = 2 delta                            <- qubit A's subharmonic beat
+    Delta_sub = (w_s - w_a) - 2 delta
+
+and it runs a FULL `run_tune_up` per column, so the chirp is rebuilt from a fresh Rabi
+amplitude scan at every pump frequency rather than carried in. One fidelity per column,
+scored at the single operating point; the amplitude scan is a calibration input and never
+an output axis.
+
+### Three things the scan forced into the open
+
+**1. On the `below` branch, A's subharmonic and B's direct drive are the SAME point.**
+`w_p = w_a - w_b` together with `w_p = w_a/2` forces `w_b = w_a/2 = w_p`, so at `delta = 0`
+the pump sits on qubit B as well. `collision_landmarks` dedupes on `Delta_sub` keeping the
+lowest pump order, so the k=2 A-subharmonic is *hidden behind* the k=1 "qubit b excitation"
+label at `Delta_sub = w_s - w_a`. The two effects are not separable on this branch;
+`--branch above` (`w_b = 1.5 w_a`) isolates the subharmonic.
+
+**2. There is a second resonance inside ±100 MHz that `collision_landmarks` cannot see.**
+The `|1> -> |2>` subharmonic sits at the anharmonicity, so its beat runs as
+`alpha + 2 delta` and it goes resonant at `delta ~ -alpha/2` (+60 MHz for
+`alpha = -120 MHz`), not at `delta = 0`. `_PROCESSES` is a harmonic table, so the landmark
+list misses it entirely; only the per-channel audit
+(`spectator_audit.interaction_channels`, which is anharmonicity-shifted) reports it. On
+`4Gate4.5SNAIL` at `eta = 0.6` it is the strongest parasite on the axis
+(`g = 9.16 MHz`, and `g/|det| = 0.46` at `delta = +50 MHz`).
+
+**3. Composing FOUR corrections diverges. Three is the deepest that converges.**
+Measured on `4Gate4.5SNAIL`, `eta = 0.6`, 3 coupler levels, `w_p = w_a/2 + 50 MHz`, with
+`sine_power` `m = n_channels` in each case:
+
+| channels | n_photon=2 among them | `chirp_from_measured_shift` |
+| --- | --- | --- |
+| 1 (`-0.900`, k2) | 1 | converges, 4 inner passes, `min\|Delta(t)\|` 900 MHz |
+| 2 (`+ -0.100`, k2) | 2 | converges, 6 inner passes, `min\|Delta(t)\|` 102 MHz |
+| 3 (`+ +0.800`, k1) | 2 | converges, 7 inner passes, `min\|Delta(t)\|` 102 MHz |
+| **4** (`+ -0.120`, k1) | 2 | **diverges**: last step `2.9e18` GHz, `min\|Delta(t)\|` `1.3e18` MHz |
+
+It is a runaway, not slow convergence: `eta_tot` grows, the Stark shift built from it grows,
+the chirp grows, `Delta(t) = beat - k delta(t)` shrinks, and the `1/Delta` correction grows
+again. The chirp itself is only ~1 MHz against 100 MHz beats here, so the loop is NOT the
+chirp sweeping a channel onto its collision — it is the composition depth.
+
+Two guards came out of this, both in `spectator_audit.select_drag_channels`:
+
+- **`max_ratio = 0.3`** — a channel with `g/|det| >= 0.3` is reported and left
+  UNCORRECTED. It is the same threshold `device_utils.drag_correction_ratio` already warns
+  at, and `drag_verdict` already calls `>= 0.3` "marginal: weak suppression". Excluding the
+  `0.46` channel above was necessary but *not sufficient* — the depth-4 case still diverged
+  without it.
+- **`max_drag_channels = 3`** as the default, which is exactly the composition this file
+  already recorded as well-posed (`SinePowerRamp(m=3)` under a 3-channel recursion). The
+  scan additionally sheds the weakest channel and retries on a divergence
+  (`--drag-retries`), so a column degrades to a shallower recursion instead of being lost.
+
+Worth noting even at converged depths: the log reports **"DRAG adds +106% to +120% of the
+shift"**. The correction is larger than the Stark shift it corrects, i.e. the perturbative
+expansion is not small even where the fixed point settles. That is a caveat on every
+number this scan produces, and the reason the audit is printed before solving rather than
+after.
+
+### Running it
+
+```bash
+# always first -- solves nothing, prints every column's channel audit
+uv run python -m snail_solver.subharmonic_gate_scan --device 4Gate4.5SNAIL.json \
+    --offsets=-0.1:0.1:21 --target-eta 2.5 --dry-run
+
+# eta 0.50..2.50 in 0.05 steps IS the Rabi amplitude scan that builds the chirp
+scripts/run_wp_scan.sh --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
+    --target-eta 2.5 --eta-lo 0.2 --eta-hi 1.0 --amp-points 41 \
+    --coupler-levels 9 --column-workers 8 --jobs 8 \
+    --out wpscan_full.h5 --plot figs/wpscan_full.png
+```
+
+**Where the wall clock actually goes.** Measured on a two-column smoke
+(`4Gate4.5SNAIL`, 3 coupler levels, 5 amplitude points, 9 chevron points): step 1's
+Rabi table ran ~50 s per amplitude row fanned out over `--jobs`, but **step 4 alone
+took over six minutes single-threaded** -- `length_rabi` accepts no `jobs`, and with a
+3-channel recursion every one of its solves re-evaluates the composed pulse (~200 us
+per `_eta` call, ~1500 calls per solve). A `--jobs`-only run therefore idles almost the
+whole machine through step 4 of every column. `--column-workers` exists for exactly
+that: pool the columns and give each a modest `--jobs`.
+
+No SLURM: it runs detached on one box and is resumable by relaunching the identical
+command (per-column caches under `--outdir`). `delta = 0` is dropped by default — the
+A-subharmonic channel is exactly resonant there, which is frequency allocation, not pulse
+shaping.
+
+---
+
+## Addendum 4, 2026-09-09 — the drive ceiling: why the requested eta = 2.5 cannot be scanned, and what closes the loop
+
+The scan above was specified at `target_eta = 2.5`, on the correct reasoning that
+`t_g = 2A/eta` makes weak drive slow: 55.6 ns at `eta = 2.5` against 277.8 ns at
+`eta = 0.5`, a factor of five in exposure to decoherence. Two things came out of trying
+it, and they point in opposite directions.
+
+### 1. Recursive DRAG has a hard drive ceiling, and it is not a matter of model taste
+
+The subharmonic coupling is a two-pump process, `g ~ 3 g3 eta^2` (times the relevant
+participation), while its detuning is set by the offset `delta`. So `g/|det|` grows as
+`eta^2` and the perturbative premise fails at a *specific* drive. Measured on
+`4Gate4.5SNAIL` (`--dry-run` prints this table):
+
+    worst parasitic g/|det| per column
+      eta*  t_g(ns)      -100     -50      50     100   MHz offset
+       0.6    231.5      0.03    0.06    0.46    0.11     ok / marg
+       0.8    173.6      0.06    0.12    0.81    0.20     ok / marg
+       1.0    138.9      0.09    0.18    1.27    0.32     FAIL at +50
+       1.2    115.7      0.13    0.26    1.83    0.46     FAIL at +50
+       1.8     77.2      1.37    4.12    2.75    1.03     FAIL almost everywhere
+       2.5     55.6      2.65    7.95    5.30    1.99     FAIL; only ~500 MHz is clean
+
+At `eta = 2.5` the audit reports FOUR non-perturbative channels, including the qubit-A
+subharmonic the scan exists to study (`g = 112.5 MHz` at `det = 100 MHz`, ratio 1.125)
+and the SNAIL subharmonic (`g = 1125 MHz` at `det = -900 MHz`, ratio 1.25). `g/|det| >= 1`
+means there is no leading term for DRAG to cancel — the "off-resonant" process is
+effectively resonant. The scan refuses those columns rather than reporting a pulse that
+is not a correction; `--force` overrides it, and the audit records exactly which channels
+were abandoned.
+
+Note the SNAIL subharmonic's ratio is `3 g3 eta^2 / |Delta_sub|` and `Delta_sub` barely
+moves over a ±100 MHz scan, so **that one cannot be escaped by choosing `delta`**. It caps
+the drive at `eta < sqrt(|Delta_sub| / 3 g3)` ~ 2.36 on this device, whatever the offset.
+The `+50 MHz` column is worst because the `|1>->|2>` subharmonic sits at `alpha + 2 delta`
+and is only 20 MHz detuned there (Addendum 3, finding 2).
+
+**So `eta ~ 0.8-1.0` is the ceiling for a ±100 MHz scan here**, and it is set by the
+control scheme, not by the truncation.
+
+### 2. But the closed-system score cannot see the cost of a slow gate
+
+Everything in this package solves `sesolve`. `F_avg` is therefore purely coherent, and
+gate LENGTH is free — so the scan, left alone, always prefers the weakest drive: low
+`eta` buys a converged model and low leakage and pays nothing for a gate five times
+longer. That is backwards on hardware, and it makes the eta axis unanswerable.
+
+Two additions close it:
+
+- `subharmonic_gate_scan.coherence_penalty` — a first-order incoherent term from the
+  already-recorded `t_g` plus `--t1-us`/`--t2-us`, reported alongside a combined
+  `infidelity_total`, which is what the best point is now ranked on. Deliberately
+  transparent (`eps = 1 - exp(-prefactor * t_g / T_eff)`, `--decoh-prefactor` a knob,
+  raw `t_g_over_T` also stored): the exact coefficient is model-dependent, but the
+  ordering is monotone in `t_g` under every convention, and ordering is what the eta
+  axis needs. At `T1 = T2 = 50 us` it charges 1.8e-2 at `eta = 0.6` against 6.2e-3 at
+  `eta = 1.8` — a real budget for the extra coherent error stronger drive incurs.
+- `snail_solver.open_system` — the actual number, for the few points the ordering picks
+  out. `mesolve` with collapse operators built from the embedded ladder ops, scored with
+  the SAME leakage-aware Pedersen metric extended from one Kraus operator to many:
+
+      F = ( sum_i |Tr M_i|^2 + sum_i Tr[M_i M_i^dag] ) / ( d (d+1) ),  M_i = U_ideal^dag K_i
+
+  With a single unitary Kraus this collapses to `ZhouCoupler._iswap_fidelity_from_U`,
+  which is the test that pins the normalisation (`TestOpenSystemScoring`, solver-free:
+  it feeds the map built from random unitaries and compares against the existing
+  formula to 10 decimals). Neither sum needs the Kraus operators —
+  `<j|E(|k><m|)|l> = sum_i (K_i)_jk conj((K_i)_lm)` — so 16 propagations of the
+  subspace basis operators give both. That is 16 `mesolve` runs on a `dim^2` density
+  matrix per point, hence `--open-system TOP` (default 3) rather than everywhere.
+
+### What to actually run
+
+Scan the drive band where DRAG is valid and let the decoherence term pick the optimum,
+then confirm the winner properly:
+
+```bash
+uv run python -m snail_solver.subharmonic_gate_scan --device 4Gate4.5SNAIL.json \
+    --offsets=-0.1:0.1:21 --target-etas 0.6,0.8,1.0,1.2 --dry-run   # read the table
+
+scripts/run_wp_scan.sh --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
+    --target-etas 0.6,0.8,1.0,1.2 --amp-points 41 --coupler-levels 7 \
+    --t1-us 50 --t2-us 50 --open-system 3 \
+    --column-workers 8 --jobs 8 --out wpscan_band.h5 --plot figs/wpscan_band.png
+```
+
+`--target-etas` is the drive/speed axis; `--amp-points`/`--eta-lo`/`--eta-hi` remain the
+Rabi amplitude ladder that BUILDS each column's chirp (a fraction of that column's
+`target_eta`, so it never probes above the pulse's own peak). Columns cache per
+`(delta, eta)`, so the band can be extended one eta at a time without re-solving.
+
+## Addendum 5, 2026-09-11 — the shaped probe, and the weight a chevron centre actually uses
+
+Addendum 4 left the drive question half-answered: `eta = 1.2` lost not because the
+operating point is bad but because the **measurement** is. The Rabi ladder that builds
+the chirp uses CONSTANT-amplitude chevrons, and at `|eta| = 1.2` those leak 0.245
+steady-state and 0.93 transiently — the two-level chevron the centre fit assumes is
+gone, so `resid` rises 14x and the chirp built from it costs 5x the coherent error.
+The shaped pulse at the *same peak* leaks `4.1e-3`. The fix is therefore to measure the
+law with the gate's own envelope, which is what `--probe-shape gate` now does.
+
+### The deconvolution is two divisions, not an inverse problem
+
+A shaped rung of peak `eta*` does not report the law pointwise; it reports an average
+over its own envelope. Because the law is an **even polynomial**, that average is
+diagonal in `{eta^2, eta^4}`:
+
+    <delta>(eta*) = k2 M2 eta*^2 + k4 M4 eta*^4
+    M2 = <f>,  M4 = <f^2>,        f(u) = |eta(u)|^2 / eta*^2
+
+so recovering the pointwise law that `chirp_from_measured_shift` needs is `k2 = K2/M2`,
+`k4 = K4/M4`. Nothing downstream changed. `delta0` is drive-independent and is not
+rescaled. Each rung runs at its own `t_g = nominal_t_g(config, eta)` with
+`amp_scale = 1.0`, which puts the peak exactly at the requested `|eta|`, so the probe
+never exceeds the pulse it is calibrating and `extrapolation_ratio -> 1` — the
+extrapolation risk Addendum 4 flagged as the price of excluding leaky rows disappears.
+
+### What "average" means is derivable, and both original guesses were wrong
+
+The two conventions shipped first were *uniform* (average over time) and *coupling*
+(weight by the iSWAP rate `g ~ |eta(t)|`, on the argument that the chevron centre is
+set by where transfer accumulates). Neither is right.
+
+Take the two-level iSWAP subspace with coupling `g(t)` of total area `pi` and detuning
+`D(t) = Delta + delta_stark(t)`. In the frame following the ideal rotation, `D` enters
+as `D sigma_z / 2`, and its matrix element between the instantaneous state and its
+orthogonal partner carries a factor `sin theta(t)` with `theta` the accumulated Rabi
+angle. So to first order the error amplitude is `-1/2 int D(t) sin theta(t) dt`, and
+the chevron peaks where that vanishes:
+
+    Delta* = -<delta_stark>_w ,     w(t) = sin theta(t),   theta: 0 -> pi
+
+The weight **vanishes at both pulse ends** — there the state sits at a pole of the Bloch
+sphere, where a `z` rotation does nothing — and **peaks at `theta = pi/2`**, the
+half-area point, which for a symmetric envelope is mid-gate where the envelope is
+largest. That is why `M2` comes out near 1 rather than near the time average, and why
+weighting by time underestimates it by 2x.
+
+| Hann | M2 | M4 | weight |
+| --- | --- | --- | --- |
+| `rabi` | 0.7115 | 0.5836 | `sin theta(t)` — derived, **default** |
+| `coupling` | 0.6250 | 0.4922 | `|eta(t)|` |
+| `uniform` | 0.3750 | 0.2734 | `1` |
+
+### Confirmed twice, and the constant probe is the ground truth
+
+A direct two-level integration of the model above recovers the moments to 5 decimal
+places at every drive, and **each moment separately** (run `k2 = 0` to isolate `M4`):
+
+    |eta|   simulated centre    M2 implied     (model 0.8303)
+    0.135        -0.04821          0.8303
+    0.240        -0.15431          0.8303
+    0.345        -0.32512          0.8303
+    0.450        -0.56758          0.8303
+
+Then against a real 3-mode device — `tune_up --cross-check-moments` runs the constant
+leg (clean at `target_eta = 0.45`, leak 0.003–0.015) as the reference and one shaped leg,
+deconvolving it every way. `sine_power m=3`, `delta = -100 MHz`, 7 rows:
+
+| weighting | M2 | M4 | k2 | vs constant probe |
+| --- | --- | --- | --- | --- |
+| `rabi` | 0.8303 | 0.7512 | +3.3060 | **+4.4%** |
+| `coupling` | 0.7305 | 0.6321 | +3.7576 | +18.6% |
+| `uniform` | 0.4102 | 0.3366 | +6.6921 | +111.3% |
+| constant | — | — | +3.1674 | reference |
+
+### Read the `k2` column, not `k4`
+
+The same run's free two-parameter fit "wants" `M2 = 0.8666 +/- 0.0045` and
+`M4 = 0.3214 +/- 0.0748`, and that `M4` violates `M4 >= M2^2` — which holds for **any**
+positive weight by Jensen, so it cannot be a real weighting. It is the fit degeneracy:
+the quartic term is only 6.4% of the shift at the top row, the design matrix has
+condition number 7, and `k2`/`k4` come out 96% anticorrelated, so a few-percent
+systematic in `k2` is absorbed as a large apparent error in `k4`. **A short ladder
+cannot pin `M4`**; the derivation supplies it, and the two-level integration confirms it
+in isolation. The residual ~4% on `k2` against the real device is 3-mode physics
+(coupler occupation, the `|2>` ladders) rather than the weight, since the weight is
+exact in the two-level model the derivation covers.
+
+### Using it
+
+```bash
+# re-pin the weighting whenever the envelope changes -- one cheap column, weak drive
+uv run python -m snail_solver.tune_up --device 4Gate4.5SNAIL.json \
+    --target-eta 0.45 --cross-check-moments --amp-points 7 --jobs 24
+
+# then calibrate with the gate's own envelope
+uv run python -m snail_solver.tune_up --device 4Gate4.5SNAIL.json \
+    --target-eta 1.2 --probe-shape gate --drag-auto
+```
+
+`--moment-weighting` defaults to `rabi`; `uniform` and `coupling` are kept because they
+bracket it from below and because the cross-check reports all three. The setting is part
+of a scan column's cache key, so switching it invalidates stale columns rather than
+mixing conventions within one grid.
+
+**Not yet done:** the band scan of Addendum 4 was run with the constant probe, so its
+`eta = 1.2` column is still the one the leaky fit produced. Re-running the band with
+`--probe-shape gate` is what would show whether the interior optimum at `eta ~ 1.0` is
+real or an artefact of the measurement — that is the open question, and it is the reason
+the shaped probe was built.
+
+Cost it honestly before running it: the weighting and the probe shape are both part of a
+column's cache key, so switching them **invalidates every cached column** and nothing is
+reused — budget a full re-run, not an increment. The per-rung cost is a wash in practice:
+a shaped rung's window is the rung's own `t_g = nominal_t_g(config, eta)`, `3.3 x t_g0` at
+`eta_lo = 0.3` against the constant probe's `window_tg * t_g0 = 2 x t_g0`, so the low-eta
+rows are dearer — but MEASURED over the whole band the shaped run came out 9% FASTER
+(5991 s vs 6608 s, same grid and workers), because the cleaner fit costs fewer DRAG
+shed-and-retry passes. Do not assume either direction; the two effects are comparable.
+
+## Addendum 6, 2026-09-11 — the drive ceiling was a hardcoded pass limit, and one channel
+
+Addendum 5 ended with the shaped probe failing to rescue `eta = 1.2`, and concluded the
+binding constraint is the chirp<->DRAG FIXED POINT rather than the measurement. That was
+right, and this addendum finds out *why* the fixed point failed. Neither reason is
+physics.
+
+### The loop is algebraic, so the whole (delta, eta) plane is free to map
+
+`chirp_from_measured_shift`'s DRAG loop needs only `(k2, k4, eta*, t_g, channels)` --
+no propagation at all. So convergence can be mapped over any grid in seconds, which is
+the diagnostic the audit alone could never give (the audit passed `delta = -100,
+eta = 1.2` at ratio 0.13 and it still diverged).
+
+### 1. `max_iters` was hardcoded at 12 and no caller could raise it
+
+`chirp_from_measured_shift(max_iters=12)`, and **no call site overrode it**.
+`--max-drag-iters` (default 4) is a DIFFERENT loop -- the outer chirp/offset/length
+relaxation -- so the inner fixed point was always capped at 12 passes. The tolerance is
+`1e-12 GHz`, and the map shows honest convergence taking **14 to 86 passes** at strong
+drive. With 200 passes, cells that had read as divergent settle in 9-15:
+
+    eta:            0.6     0.8     1.0     1.2     1.5     1.8     2.2     2.5     3.0
+    delta=-0.200   3/11    2/34    3/8     2/5     3/70    3/32    3/27    1/14    1/11
+    delta=-0.250   3/12    3/41    2/34    2/5     3/79    3/24    3/20    2/56    1/10
+    delta=-0.300   3/15    3/55    2/42    2/5     3/9     3/15    3/14    2/10       D
+    delta=-0.350   3/18    3/78    2/6     2/16    3/9     3/11    3/11    1/9     1/7
+    (cell = channels retained / passes needed;  D = diverged even at one channel)
+
+`--chirp-max-passes` now exposes it (default unchanged at 12) in both `tune_up` and the
+scan, and it is part of a scan column's CACHE KEY -- a larger budget can turn a cached
+failure into a fit, so the old failure must not be reused.
+
+**Read the channel count, not just convergence.** A `1/9` cell converged by SHEDDING two
+of the three channels the audit selected, leaving those parasites uncorrected -- that is
+a trade, not a win. The region where all three survive at high drive is
+`delta = -200 .. -350 MHz`, `eta = 1.5 .. 2.2`: a **63-93 ns** gate against the
+near-subharmonic band's best of 118 ns.
+
+Two caveats on the map: it uses a synthetic law (`k2 = 3.2`, `k4 = 1.1`) because there is
+no measured `k2` at unexplored points -- though a sensitivity check at `k2 = 2.4 / 3.2 /
+4.0` moves almost nothing -- and it is a PREDICTION. The `delta = -50 MHz` anomaly is the
+standing reminder that an algebraic screen can pass a point the solver then ruins.
+
+### 2. `eta = 1.2` failed for a specific channel, and it is the anharmonicity
+
+Convergence was non-monotone in drive -- 1.2 failed where 1.5 and 2.2 converged -- which
+is not what a "too much drive" story predicts. The channel SET is what changes:
+
+    delta=-0.35, eta=1.2:  +400 (k=1),  +580 (k=2),  -120 (k=1)   <- diverges
+    delta=-0.35, eta=1.5:  +400 (k=1),  +580 (k=2),  -820 (k=2)   <- converges in 9
+
+The `-120 MHz` channel is the qubit `|1>->|2>` leakage channel sitting at
+`anharm_qubit_GHz = -0.12`, so its beat is FIXED -- independent of both `delta` and
+`eta`, which is why it recurs at every offset. It carries the smallest `|beat| * t_g` in
+the set (13.9 at `eta = 1.2`, against 46-67 for the others), and the DRAG quadrature goes
+as `1/(Delta * t_g)`, so it contributes by far the largest correction and destabilises the
+loop. At `eta >= 1.5` the strength ranking evicts it and the loop settles.
+
+It passes the audit at `ratio = 0.051`, verdict **"DRAG effective"**. So this is a third
+case of the audit being necessary but not sufficient -- and the first with a mechanism in
+hand: `drag_verdict` scores whether the PERTURBATION is small (`g/|det|`), not whether
+the FIXED POINT is stable, and stability is governed by the quadrature's `1/(Delta t_g)`.
+Adiabaticity `|det| * t_g` is computed by `drag_verdict` but is not what gates selection.
+
+### 3. A policy inconsistency, currently implicit
+
+The audit reports `n_mandatory = 8` against `max_channels = 3`, and the `-120 MHz`
+leakage channel is dropped at `eta >= 1.5`. So the CAP silently overrides the documented
+mandatory set (`require=("leakage", "coupler")`). Not correcting a leakage channel may
+well be the right call at high drive -- the evidence above says it is -- but it should be
+a decision with a recorded reason, not a side effect of ranking and a cap.

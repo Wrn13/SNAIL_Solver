@@ -107,8 +107,9 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
       * ``shape="constant"`` (default) -- a CONSTANT pump of peak |eta| = eta_op
         held over [0, window_ns]. Amplitude-robust; it has d eta/dt = 0, so it
         cannot see the DRAG-quadrature Stark shift.
-      * ``shape="raised_cosine"`` -- the ACTUAL gate pulse: a Hann full iSWAP over
-        [0, t_g_ns] normalized on (a, b) and scaled by amp_scale, with the DRAG
+      * ``shape="gate"`` (alias ``"raised_cosine"``) -- the ACTUAL gate pulse: a
+        full iSWAP over [0, t_g_ns] in the envelope ``config["envelope"]`` selects,
+        normalized on (a, b) and scaled by amp_scale, with the DRAG
         quadrature applied when ``drag_beat_GHz`` is given (tuned to that beat).
         This DOES carry the DRAG-quadrature shift, so the located resonance is the
         DRAG-ON resonance.
@@ -158,8 +159,9 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
     (ZhouCoupler, float)
         The coupler and its pump frequency w_p (GHz).
     """
+    from snail_solver.envelope import envelope_from_config
     from snail_solver.zhou_coupler import (ZhouCoupler, PumpTone, ConstantPulse,
-                                           RaisedCosine, make_chirp)
+                                           make_chirp)
 
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     ws = float(config["coupler_freq_GHz"])
@@ -185,11 +187,17 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                       nonlinearities=nonlin, levels=levels,
                       anharmonicities_GHz=anharm)
 
-    if shape == "raised_cosine":
-        # The actual gate pulse: Hann full iSWAP over t_g, DRAG tuned to the beat.
+    if shape in ("gate", "raised_cosine"):
+        # The actual gate pulse: a full iSWAP over t_g, DRAG tuned to the beat.
         # Built exactly as run_sweep_zhou.build_point does (normalize then scale).
+        #
+        # The envelope comes from the CONFIG, not from a hardcoded RaisedCosine. This
+        # probe's whole claim is that it is the pulse being calibrated, and on a
+        # sine_power device (which recursive DRAG requires past one channel) a Hann
+        # probe is a different pulse -- the same trap chirp_from_measured_shift
+        # already guards against. Bit-identical for a raised_cosine device.
         t_g = float(t_g_ns if t_g_ns is not None else window_ns)
-        env = RaisedCosine(amp=1.0, t_g=t_g)
+        env = envelope_from_config(config, t_g, amp=1.0)
         tone = PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
                         drag=(drag_beat_GHz is not None),
                         delta_drag_GHz=drag_beat_GHz,

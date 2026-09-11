@@ -123,9 +123,12 @@ peak drive |η| instead, which makes the pulse shape in normalized gate time
 independent of `t_g` and so decouples the frequency calibration from the length
 calibration — leaving the length as the only free parameter, as in the lab.
 
-A run's outputs — the operating point, every chevron's traces, and the figures
-drawn from them — go into ONE HDF5 file (`--out run.h5`), so a run is a single
-artefact that cannot be separated from its own pictures:
+A run's outputs — the operating point, every chevron's traces, the figures drawn
+from them, and a copy of the device configuration the solves actually ran with —
+go into ONE HDF5 file (`--out run.h5`), so a run is a single self-describing
+artefact: it cannot be separated from its own pictures, and it does not have to be
+re-interpreted against a device JSON that has been edited since (which is why
+`post_chirp --from-tuneup` no longer needs `--device`):
 
 ```
 python -m snail_solver.h5_io results/run.h5                  # what is in there
@@ -141,6 +144,31 @@ own as `eta_sweep.h5:/runs/eta1p8` wherever a path is taken (`tune_up --replot`,
 resulting gate, because the chirp and the carrier offset are themselves functions
 of the drive, so a range of drives cannot be scored against one calibration.
 
+**The Rabi ladder can use the gate's own envelope** (`--probe-shape gate`). The
+default ladder holds the amplitude CONSTANT, which measures the Stark law
+`δ = k2|η|² + k4|η|⁴` pointwise — but a constant probe at `|η| = 1.2` leaks 0.245
+(0.93 transiently), so the two-level chevron its centre fit assumes is gone, while the
+shaped pulse at the same peak leaks 4e-3. A shaped rung instead reports an average over
+its own envelope, and because the law is an even polynomial that average is *diagonal*
+in `{η², η⁴}` — so recovering the pointwise law is two divisions, `k2 = K2/M2`,
+`k4 = K4/M4`, and nothing downstream changes.
+
+Which average is **derived, not chosen**: a chevron's centre weights the shift by
+`sin θ(t)`, the accumulated Rabi angle, which vanishes at both pulse ends (a `z`
+rotation does nothing at a pole of the Bloch sphere) and peaks mid-gate. That is
+`--moment-weighting rabi`, the default; `coupling` and `uniform` are the earlier guesses
+and both underestimate `k2`, by 19% and 2.1×. Re-pin it against ground truth whenever an
+envelope changes — `tune_up --cross-check-moments` runs a clean constant leg at weak
+drive and reports which convention reproduces it:
+
+```
+uv run python -m snail_solver.tune_up --device 4Gate4.5SNAIL.json \
+    --target-eta 0.45 --cross-check-moments --amp-points 7 --jobs 24
+```
+
+The derivation, the two-level confirmation, and why the same ladder cannot pin `M4` are
+in [docs/chirped-recursive-drag.md](docs/chirped-recursive-drag.md) (Addendum 5).
+
 **Analysis and figures**
 
 | Module | Purpose |
@@ -153,6 +181,8 @@ of the drive, so a range of drives cannot be scored against one calibration.
 | [spectroscopy](src/snail_solver/spectroscopy.py) | Power-vs-frequency spectroscopy map |
 | [stark_vs_detuning](src/snail_solver/stark_vs_detuning.py) | How the Stark-shifted resonance moves as a spectator is walked |
 | [subharmonic_convergence](src/snail_solver/subharmonic_convergence.py) | Coupler levels vs distance from the SNAIL subharmonic: *how far must the gate be detuned before a truncated model is trustworthy* |
+| [subharmonic_gate_scan](src/snail_solver/subharmonic_gate_scan.py) | Gate quality vs pump offset from a qubit's OWN subharmonic (`w_p = w_a/2 + delta`) and vs drive strength: *what does the calibration do as `2 w_p` lands on a qubit, and how hard can the pump be driven* |
+| [open_system](src/snail_solver/open_system.py) | Leakage-aware iSWAP fidelity with T1/T2 (`mesolve` + collapse operators): *what the gate achieves*, for confirming a winner the closed-system scan picked out |
 | [calibration_plots](src/snail_solver/calibration_plots.py) | The chevron figure that shows the Stark shift explicitly |
 | [validate_engines](src/snail_solver/validate_engines.py) | Measure the JAX engine against the QuTiP reference |
 
@@ -199,13 +229,67 @@ are tuned to the device they name and run as written.
 | `snail_spectroscopy.slurm` | Sharded spectroscopy map |
 | `snail_eta_scan.slurm` | DRAG gain vs. pump strength |
 
+### Without SLURM (one box)
+
+`subharmonic_gate_scan` has no SLURM script: it runs detached on a single machine,
+which is where the GH200 work happens. `scripts/run_wp_scan.sh` forwards its
+arguments to the module under `setsid nohup`, pins BLAS to one thread per process
+(the tune-up already fans its chevron out over a process pool, so unpinned BLAS
+thrashes), and prints a PID and a log path:
+
+```bash
+# always first: solves nothing, prints the drive-feasibility table and the
+# per-column DRAG channel audit
+uv run python -m snail_solver.subharmonic_gate_scan \
+    --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
+    --target-etas 0.6,0.8,1.0,1.2 --dry-run
+
+scripts/run_wp_scan.sh --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
+    --target-etas 0.6,0.8,1.0,1.2 --amp-points 41 --coupler-levels 7 \
+    --t1-us 50 --t2-us 50 --open-system 3 \
+    --column-workers 8 --jobs 8 \
+    --out wpscan_band.h5 --plot figs/wpscan_band.png
+```
+
+`--target-etas` is the drive/speed axis (`t_g = 2A/eta`). `--amp-points` /
+`--eta-lo` / `--eta-hi` are a different thing: the Rabi amplitude ladder that
+*builds* each column's chirp, taken as a fraction of that column's own
+`target_eta` so it never probes above the pulse's own peak.
+
+**The drive axis has a ceiling, and it is not the truncation.** The subharmonic
+coupling is a two-pump process, so `g ∝ η²` while its detuning is set by `δ` —
+past `η ≈ 1` a ±100 MHz scan goes *non-perturbative* (`g/|det| ≥ 1`) and
+recursive DRAG has no leading term to cancel. The dry run prints the feasibility
+table; columns carrying such a channel are refused unless `--force`.
+
+**The solve is closed-system, so gate length is otherwise free.** Without
+`--t1-us` / `--t2-us` the ranking always prefers the weakest drive and ignores
+that its gate is five times longer. Those flags add a first-order incoherent term
+(transparent, and adjustable with `--decoh-prefactor`) and rank on the combined
+infidelity; `--open-system TOP` then re-scores the best few points with a real
+`mesolve`.
+
+**Spend the cores across columns, not only inside them.** `tune_up` step 4
+(`length_rabi`) takes no `jobs` — it is an optimizer over gate length and runs
+single-threaded, for minutes per column once the pulse carries a multi-channel
+recursion, and `run_tune_up` repeats it `2 × n_channels` times. A `--jobs 72` run
+leaves ~70 cores idle throughout, so pair a moderate `--jobs` with
+`--column-workers`.
+
+Resumable: each column is cached per `(δ, η)` the moment it succeeds, so
+relaunching the identical command re-reads what is done and solves only what is
+missing — and the eta band can be extended one value at a time. `--offsets=`
+needs the `=`, since a bare leading `-` reads as a flag. Don't use `--gpu`: this
+Hilbert space is ~10² states, well below the CPU/GPU crossover, and `--gpu`
+forces `--jobs 1`.
+
 ## Tests
 
 ```bash
 uv run pytest -q
 ```
 
-239 tests, deliberately QuTiP-free and ~1 min, so they can gate a cluster
+366 tests, deliberately QuTiP-free and ~1 min, so they can gate a cluster
 submission. Each one encodes an invariant that a real bug once violated (beat
 sign conventions, collision labelling, the subharmonic factor of 2, blank
 spectator plumbing) — a failure means a specific known-bad behaviour is back.

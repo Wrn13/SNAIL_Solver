@@ -80,6 +80,14 @@ taken, and only that group is read::
     python -m snail_solver.tune_up --replot results/etasweep/eta_sweep.h5:/runs/eta1p8 \
         --plot-ridge figs/eta1p8_ridge.png
 
+The device configuration the solves actually ran with -- the merged device JSON,
+after any ``--coupler-levels`` override -- is copied into the file as ``device``,
+so the run stays readable and reproducible when the device file has since been
+edited (they get edited constantly) or is simply not next to the results. The
+root attribute ``device_path`` still records where it came from; the copy is what
+``post_chirp --from-tuneup`` reads, which is why that tool no longer needs
+``--device``.
+
 Every figure ``--plot``/``--plot-ridge``/``--plot-post-chirp`` renders is embedded
 in that same file as well as written to its own path, so one run is one artefact:
 the pictures cannot drift from the arrays they were drawn from, or be paired with
@@ -818,6 +826,8 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                      leak_max: float = 0.35, stability_max: float = 0.3,
                      stability_cutoffs: Sequence[float] = (1.0, 0.9, 0.8, 0.7),
                      window_tg: float = 2.0, n_time: int = 161, jobs: int = 0,
+                     probe_shape: str = "constant",
+                     moment_weighting: str = "rabi",
                      solver: Optional[Dict[str, Any]] = None,
                      logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Step 1: measure the resonant pump offset as a function of drive strength.
@@ -832,6 +842,35 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     which would need deconvolving. It's also blind to DRAG (d eta/dt = 0), so
     `drag_beat_GHz` here only reaches the shaped cross-check in
     `calibrate_drag_offset`.
+
+    ``probe_shape="gate"`` does exactly that deconvolution, and exists because the
+    constant probe STOPS WORKING at strong drive: held flat at ``|eta| = 1.2`` on
+    ``4Gate4.5SNAIL`` it leaks 0.245 (four fifths of it into the coupler, via the
+    ``3 g3 eta^2`` subharmonic displacement) and the transient leakage reaches 0.93,
+    so the two-level chevron :func:`fit_chevron_center` assumes is simply gone. The
+    shaped pulse at the SAME peak drive leaks 4e-3, because its time-averaged drive
+    is far below its peak.
+
+    The price is that a shaped rung reports a moment-weighted average rather than a
+    point on the law. Since the law is an even polynomial the average is diagonal in
+    ``{eta^2, eta^4}`` (:func:`stark_chirp.stark_moments`), so recovering it is two
+    divisions::
+
+        <delta>(eta*) = k2 M2 eta*^2 + k4 M4 eta*^4   ->   k2 = K2/M2, k4 = K4/M4
+
+    ``delta0`` is drive-independent and is NOT rescaled. Everything downstream --
+    :func:`chirp_from_measured_shift` above all -- still receives a POINTWISE law and
+    is unchanged. The measured shift is smaller by ``M2`` (2.4x on a Hann), so at
+    fixed peak drive this is the worse measurement; it wins by permitting peak drives
+    the constant probe cannot reach at all, and by removing the extrapolation
+    (the probe sits at the gate's own peak, so ``extrapolation_ratio -> 1``).
+
+    ``moment_weighting`` is NOT cosmetic: the three weightings span 2x, which scales
+    the chirp directly. The default ``"rabi"`` is the DERIVED one -- the chevron
+    centre averages the shift against ``sin theta(t)``, the accumulated Rabi angle
+    (see :func:`stark_chirp.stark_moments`) -- and it is confirmed both by a two-level
+    integration and by :func:`cross_check_probe_moments` on a real device. The other
+    two are kept only for comparison and both UNDERESTIMATE the shift.
 
     Every point is an exact ``sesolve`` trajectory covering all times, so the whole
     table costs ``amp_points * wp_points`` solves with no reduced-model
@@ -907,19 +946,29 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     windows = np.full(eta.size, np.nan)
     spans = np.full(eta.size, np.nan)
     chevrons = []
+    shaped = str(probe_shape) != "constant"
     for i, e in enumerate(eta):
         # Window scales with drive: fixed in ns, the weakest row would never complete
         # a swap and the strongest would sit in leakage. window_tg swaps per row.
-        window_ns = float(window_tg) * nominal_t_g(config, float(e))
+        #
+        # A SHAPED rung is a full iSWAP in its own right: its length is the gate
+        # length at that peak drive, and amp_scale = 1.0 then makes the peak exactly
+        # |eta| = e (nominal_t_g and peak_eta_of are inverses). So the window is the
+        # pulse, not a multiple of it.
+        t_g_rung = nominal_t_g(config, float(e))
+        window_ns = t_g_rung if shaped else float(window_tg) * t_g_rung
         span = (float(wp_span_MHz) if wp_span_MHz is not None
                 else 2.0 * float(span_linewidths) * linewidth_MHz(e))
 
         for attempt in range(3):
             offsets_GHz = (np.linspace(-span / 2.0, span / 2.0, int(wp_points)) * 1e-3
                            + float(wp_offset_GHz))
-            chev = FSR.scan(config, t_g0, 1.0, offsets_GHz, window_ns, int(n_time),
+            chev = FSR.scan(config,
+                            t_g_rung if shaped else t_g0, 1.0,
+                            offsets_GHz, window_ns, int(n_time),
                             solver=solver, n_jobs=jobs, spec_abs_GHz=spec_abs_GHz,
-                            shape="constant", chirp_coeffs_GHz=None,
+                            shape=("gate" if shaped else "constant"),
+                            chirp_coeffs_GHz=None,
                             drag_n_pump=drag_n_pump, eta_op=float(e),
                             keep_full_channels=True)
             m = np.asarray(chev["resonance_metric"], dtype=float)
@@ -1022,6 +1071,20 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
             f"there. Widen --wp-span-MHz if the ridge is leaving the window, or "
             f"lower --eta-hi to stay inside the drive range that still swaps.",
             partial) from exc
+    if shaped:
+        # A shaped rung reported <delta>, so the fitted coefficients are the law's
+        # scaled by the envelope moments. Undo that here, ONCE, so every consumer
+        # downstream keeps receiving a pointwise k2/k4 and needs no changes. delta0
+        # is drive-independent and must not be rescaled.
+        M2, M4 = probe_moments(config, moment_weighting)
+        fit = dict(fit, k2=float(fit["k2"]) / M2, k4=float(fit["k4"]) / M4,
+                   K2_measured=float(fit["k2"]), K4_measured=float(fit["k4"]),
+                   M2=float(M2), M4=float(M4),
+                   moment_weighting=str(moment_weighting))
+        # stark_span is a DRIVE-DEPENDENT span, so it rescales too -- the guard below
+        # compares it against the residual, which is in measured (averaged) units.
+        fit["stark_span_MHz"] = float(fit["stark_span_MHz"])
+    fit["probe_shape"] = str(probe_shape)
     partial["fit"] = fit
     stability = shift_curve_stability(eta, ridge, weights=quality, target_eta=target_eta,
                                       cutoffs=stability_cutoffs)
@@ -1047,6 +1110,11 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
             f"widen --eta-lo/--eta-hi and refine --wp-points until the drive "
             f"dependence clears the noise.", partial)
     if logger:
+        if shaped:
+            logger.info(f"  rabi: SHAPED probe ({config.get('envelope')}), moments "
+                        f"M2={fit['M2']:.4f} M4={fit['M4']:.4f} "
+                        f"({fit['moment_weighting']}): measured K2={fit['K2_measured']:+.4f} "
+                        f"-> pointwise k2={fit['k2']:+.4f}")
         logger.info(f"  rabi: delta0={fit['delta0']:+.4f} MHz (static), "
                     f"k2={fit['k2']:+.4f} MHz/|eta|^2, k4={fit['k4']:+.4f} "
                     f"MHz/|eta|^4, r2={fit['r2']:.4f} over {fit['n_used']} rows; "
@@ -1127,6 +1195,98 @@ def shape_config(config: Dict[str, Any]) -> tuple:
            "rise_frac": float(config.get("envelope_rise_frac", 0.5))}
           if kind == "sine_power" else {})
     return kind, kw
+
+
+def cross_check_probe_moments(config: Dict[str, Any], target_eta: float, *,
+                              weightings: Sequence[str] = ("rabi", "uniform",
+                                                           "coupling"),
+                              logger: Optional[logging.Logger] = None,
+                              **kw: Any) -> Dict[str, Any]:
+    """Pin the moment weighting by measuring the law BOTH ways at the same drive.
+
+    :func:`stark_chirp.stark_moments` weights the shift by ``sin theta(t)`` on a
+    derivation (the ``"rabi"`` default), and the two weightings that preceded it --
+    uniform in time, or weighted by the iSWAP coupling -- span 2x in ``k2``, which
+    scales the chirp directly. A derivation about how a chevron centre responds to a
+    time-varying detuning is exactly the kind that is easy to get wrong, so this
+    checks it against a measurement: at a drive weak enough that the CONSTANT probe
+    is still clean, its pointwise ``k2/k4`` are ground truth, and the right
+    convention is the one whose deconvolved shaped fit reproduces them.
+
+    As run (``4Gate4.5``-like device, ``delta = -100 MHz``, ``target_eta = 0.45``,
+    7 rows) it put ``"rabi"`` within ~4% on ``k2``, against 19% for ``"coupling"``
+    and a factor 2.1 for ``"uniform"``. Note that ``M4`` is NOT pinned by a ladder
+    this short: the quartic term is only ~6% of the shift at the top row, so ``k2``
+    and ``k4`` come out ~96% anticorrelated and a few-percent systematic in ``k2``
+    is absorbed as a large apparent error in ``k4``. Read the ``k2`` column.
+
+    Run it at low drive (``target_eta <~ 0.5``, where leakage is under a percent).
+    At strong drive neither leg is trustworthy and the comparison means nothing.
+
+    Parameters
+    ----------
+    config : dict
+        Merged device configuration.
+    target_eta : float
+        Peak drive for both legs. Keep it weak.
+    weightings : sequence of str
+        Conventions to score.
+    **kw
+        Forwarded to :func:`rabi_shift_table` (``amp_points``, ``jobs``, ...).
+
+    Returns
+    -------
+    dict
+        ``constant`` (the reference fit), ``shaped`` (per weighting: ``k2``, ``k4``
+        and the fractional error against the reference) and ``best`` -- the weighting
+        with the smallest ``k2`` error.
+    """
+    log = logger or logging.getLogger("tune_up")
+    ref = rabi_shift_table(config, target_eta, probe_shape="constant",
+                           logger=log, **kw)["fit"]
+    log.info(f"cross-check: constant probe gives k2={ref['k2']:+.4f} "
+             f"k4={ref['k4']:+.4f} (r2={ref['r2']:.4f})")
+    # ONE shaped measurement; the weightings differ only in how it is deconvolved,
+    # so re-solving per weighting would be waste.
+    shaped_raw = rabi_shift_table(config, target_eta, probe_shape="gate",
+                                  moment_weighting=weightings[0], logger=log,
+                                  **kw)["fit"]
+    K2, K4 = shaped_raw["K2_measured"], shaped_raw["K4_measured"]
+    out: Dict[str, Any] = {}
+    for w in weightings:
+        M2, M4 = probe_moments(config, w)
+        k2, k4 = K2 / M2, K4 / M4
+        err2 = abs(k2 - ref["k2"]) / max(abs(ref["k2"]), 1e-12)
+        out[str(w)] = {"M2": float(M2), "M4": float(M4), "k2": float(k2),
+                       "k4": float(k4), "k2_rel_err": float(err2),
+                       "k4_rel_err": float(abs(k4 - ref["k4"])
+                                           / max(abs(ref["k4"]), 1e-12))}
+        log.info(f"cross-check: {w:9s} M2={M2:.4f} -> k2={k2:+.4f} "
+                 f"({100 * err2:+.1f}% vs constant)")
+    best = min(out, key=lambda w: out[w]["k2_rel_err"])
+    log.info(f"cross-check: best weighting = {best!r} "
+             f"({100 * out[best]['k2_rel_err']:.1f}% k2 error)")
+    return {"constant": ref, "shaped": out, "best": best,
+            "K2_measured": float(K2), "K4_measured": float(K4),
+            "target_eta": float(target_eta)}
+
+
+def probe_moments(config: Dict[str, Any], weighting: str = "rabi") -> tuple:
+    """``(M2, M4)`` for THIS device's envelope -- see :func:`stark_chirp.stark_moments`.
+
+    Read off the configured shape, so a shaped probe and the chirp built from its fit
+    cannot disagree about which pulse was played.
+    """
+    from snail_solver.stark_chirp import stark_moments
+    shape, shape_kw = shape_config(config)
+    env = _shape_envelope(shape, shape_kw)
+
+    def shape_fn(u):
+        s = np.abs(np.asarray(env.value_at(np.asarray(u, dtype=float) + 1.0, np),
+                              dtype=complex))
+        return s ** 2                       # |eta(u)|^2 / eta_peak^2
+
+    return stark_moments(shape_fn, weighting)
 
 
 def _resolve_drag_channels(beat_GHz: Optional[float], n_pump: int = 1,
@@ -2305,7 +2465,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
                 drag_channels=None,
                 spec_abs_GHz: Optional[float] = None, chirp_degree: int = 8,
-                quartic_warn: float = 0.25,
+                quartic_warn: float = 0.25, chirp_max_passes: int = 12,
                 eta_lo: float = 0.3, eta_hi: float = 1.0,
                 amp_points: int = 9, wp_span_MHz: Optional[float] = None,
                 wp_points: int = 25, tg_points: int = 13,
@@ -2315,6 +2475,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 contrast_min: float = 0.35,
                 chirp_tol_GHz: float = 1e-4, offset_tol_MHz: float = 0.2,
                 do_time_rabi: bool = True, jobs: int = 0,
+                probe_shape: str = "constant", moment_weighting: str = "rabi",
                 post_chirp_points: int = 0,
                 solver: Optional[Dict[str, Any]] = None,
                 logger: Optional[logging.Logger] = None,
@@ -2360,10 +2521,12 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                   spec_abs_GHz=spec_abs_GHz, drag_n_pump=drag_n_pump,
                   window_tg=window_tg, n_time=n_time, jobs=jobs, solver=solver,
                   span_linewidths=span_linewidths, contrast_min=contrast_min,
+                  probe_shape=probe_shape, moment_weighting=moment_weighting,
                   logger=log, **map_kw)
 
     # -- 1: the Rabi sweep, measured once ------------------------------------
-    log.info("step 1: Rabi (constant-probe chevron per drive strength), DRAG OFF")
+    log.info(f"step 1: Rabi ({'SHAPED gate-pulse' if probe_shape != 'constant' else 'constant-probe'}"
+             f" chevron per drive strength), DRAG OFF")
     table = rabi_shift_table(config, target_eta, **common)
 
     def project(t_g: float) -> Dict[str, Any]:
@@ -2371,7 +2534,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         return chirp_from_measured_shift(
             table, target_eta, degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
             drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
-            shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn)
+            shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn,
+            max_iters=int(chirp_max_passes))
 
     def shaped_residual(t_g: float, chirp, wp_offset: float) -> float:
         """Residual offset of the ASSEMBLED gate: shaped pulse, chirp and DRAG on.
@@ -2633,7 +2797,7 @@ def _run_attrs(device_path: Optional[str] = None, **extra: Any) -> Dict[str, Any
     return {"tool": "snail_solver.tune_up",
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "command": f"python -m snail_solver.tune_up {argv}".strip(),
-            "device": str(device_path) if device_path else "",
+            "device_path": str(device_path) if device_path else "",
             "host": platform.node(),
             **extra}
 
@@ -2644,6 +2808,7 @@ def main() -> None:
 
     from snail_solver.h5_io import (attach_figures, is_hdf5, load_doc, save_doc,
                                     split_address)
+    from snail_solver.stark_chirp import MOMENT_WEIGHTINGS
 
     ap = argparse.ArgumentParser(
         prog="python -m snail_solver.tune_up", description=__doc__,
@@ -2683,6 +2848,27 @@ def main() -> None:
     ap.add_argument("--drag-n-pump", type=int, default=1,
                     help="pump quanta of the suppressed process (1 one-pump, "
                          "2 subharmonic, 0 static/pump-independent)")
+    ap.add_argument("--drag-auto", action="store_true",
+                    help="DERIVE the recursive-DRAG channels from the device instead "
+                         "of listing them: spectator_audit.select_drag_channels "
+                         "enumerates every near-resonant process, always corrects the "
+                         "leakage (|2> ladder) and coupler (SNAIL heating) categories "
+                         "plus the mode subharmonics (2 w_p = w_i), and fills any "
+                         "remaining slot with the strongest correctable parasite. The "
+                         "full audit -- including what it did NOT select and why -- is "
+                         "printed before solving. Mutually exclusive with "
+                         "--drag-channel / --drag-beat-GHz. Use this when the collision "
+                         "structure depends on the operating point (a frequency scan), "
+                         "where hand-listing channels per point is not viable.")
+    ap.add_argument("--max-drag-channels", type=int, default=4,
+                    help="cap on --drag-auto's recursion depth [4]. Not free: the base "
+                         "envelope must vanish to this order at both gate edges, so it "
+                         "sets the sine_power m (and hence the pulse area and t_g).")
+    ap.add_argument("--force", action="store_true",
+                    help="with --drag-auto, solve even when a parasite is NOT "
+                         "PERTURBATIVE (g/|det| >= 1). Such a channel has no leading "
+                         "term to cancel -- it is a frequency-allocation problem that "
+                         "no pulse shape fixes -- so the default is to refuse.")
     ap.add_argument("--spec-abs-GHz", type=float, default=None)
     ap.add_argument("--chirp-degree", type=int, default=8,
                     help="Legendre truncation for the chirp (even terms only matter). "
@@ -2734,6 +2920,37 @@ def main() -> None:
                          "leading-order rate, so a device whose dressed rate differs "
                          "puts the real full swap outside the default +/-30%% [1.3]")
     ap.add_argument("--max-drag-iters", type=int, default=4)
+    ap.add_argument("--probe-shape", choices=("constant", "gate"), default="constant",
+                    help="step 1's probe. 'constant' holds a flat pump at each |eta| "
+                         "and measures the law POINTWISE -- the default, and correct "
+                         "while it works. 'gate' plays the configured gate envelope at "
+                         "each PEAK |eta| instead: it leaks ~50x less (a flat pump at "
+                         "|eta|=1.2 leaks 0.245, four fifths into the coupler, and "
+                         "transiently 0.93, which destroys the two-level chevron the "
+                         "centre fit assumes), and it probes at the gate's own peak so "
+                         "the fit no longer extrapolates. Its rungs report a "
+                         "moment-weighted average, which is deconvolved back to a "
+                         "pointwise k2/k4 -- see stark_chirp.stark_moments")
+    ap.add_argument("--chirp-max-passes", type=int, default=12,
+                    help="passes allowed for the chirp<->DRAG FIXED POINT [12]. Not "
+                         "the same loop as --max-drag-iters (which is the outer "
+                         "chirp/offset/length relaxation). The fixed point is "
+                         "algebraic and its tolerance is 1e-12 GHz, so a converging "
+                         "point can legitimately need 20-80 passes at strong drive "
+                         "-- 12 reports those as divergent")
+    ap.add_argument("--moment-weighting", choices=MOMENT_WEIGHTINGS,
+                    default="rabi",
+                    help="what a shaped rung's chevron centre averages. 'rabi' [default] "
+                         "is derived: the weight is sin(theta(t)), the accumulated Rabi "
+                         "angle, which vanishes at both pulse ends and peaks mid-gate. "
+                         "'coupling' (|eta(t)|) and 'uniform' (time) are the earlier "
+                         "guesses, kept for comparison; both underestimate k2, by 19%% "
+                         "and 2.1x respectively as measured by --cross-check-moments")
+    ap.add_argument("--cross-check-moments", action="store_true",
+                    help="measure the law with BOTH probes at --target-eta and report "
+                         "which moment weighting reproduces the constant probe's "
+                         "pointwise k2. Run it at weak drive (target_eta <~ 0.5), "
+                         "where the constant probe is ground truth. Solves and exits")
     ap.add_argument("--skip-time-rabi", action="store_true")
     ap.add_argument("--coupler-levels", type=int, default=None)
     ap.add_argument("--jobs", type=int, default=0)
@@ -2775,6 +2992,9 @@ def main() -> None:
     if args.drag_channel and args.drag_beat_GHz is not None:
         ap.error("--drag-channel and --drag-beat-GHz are two spellings of the same "
                  "setting (--drag-beat-GHz is the one-channel shorthand); pass only one")
+    if args.drag_auto and (args.drag_channel or args.drag_beat_GHz is not None):
+        ap.error("--drag-auto derives the channels itself; pass it OR "
+                 "--drag-channel/--drag-beat-GHz, not both")
     _cli_channels = parse_drag_channels(args.drag_channel)
     if args.gpu:
         from snail_solver import zhou_coupler
@@ -2796,6 +3016,7 @@ def main() -> None:
         # dispatches on the file's magic number rather than its name, so HDF5 runs
         # and every JSON written before the switch both replot unchanged.
         saved = load_doc(args.replot)
+        device_config = saved.get("device")               # the copy, if it has one
         out = {"operating_point": saved["operating_point"], "stages": saved["stages"],
               "t_g0_ns": saved["t_g0_ns"],
               "drag": saved["stages"].get("drag_loop")}
@@ -2807,6 +3028,10 @@ def main() -> None:
         config = load_device(device_path)
         if args.coupler_levels is not None:
             config = {**config, "coupler_levels": int(args.coupler_levels)}
+        # Copied into the run file below -- AFTER the --coupler-levels override, so
+        # what is stored is the configuration the solves actually ran with, not the
+        # device file as it happened to read that day.
+        device_config = config
 
         # plot_chirp_ridge does not interpolate, so it needs every chevron row on ONE
         # offset axis -- which only happens with a fixed span. Size it here rather
@@ -2827,6 +3052,43 @@ def main() -> None:
         print(f"device={args.device}  target_eta={args.target_eta}  "
               f"jobs={FSR._resolve_jobs(args.jobs)}{' GPU' if args.gpu else ''}")
 
+        if args.cross_check_moments:
+            out = cross_check_probe_moments(
+                config, args.target_eta, eta_lo=args.eta_lo, eta_hi=args.eta_hi,
+                amp_points=args.amp_points, wp_points=args.wp_points,
+                wp_span_MHz=args.wp_span_MHz, span_linewidths=args.span_linewidths,
+                n_time=args.n_time, window_tg=args.window_tg,
+                contrast_min=args.contrast_min, jobs=args.jobs,
+                spec_abs_GHz=args.spec_abs_GHz, logger=logger)
+            print(f"\nbest moment weighting: {out['best']!r}")
+            for w, v in out["shaped"].items():
+                print(f"  {w:9s} M2={v['M2']:.4f} M4={v['M4']:.4f}  "
+                      f"k2={v['k2']:+.4f} ({100 * v['k2_rel_err']:+.1f}%)  "
+                      f"k4={v['k4']:+.4f} ({100 * v['k4_rel_err']:+.1f}%)")
+            print(f"  constant  k2={out['constant']['k2']:+.4f} "
+                  f"k4={out['constant']['k4']:+.4f}  <- reference")
+            return
+
+        if args.drag_auto:
+            # Audited at the NOMINAL length, which is what the pulse starts from; the
+            # verdicts move with t_g (the bandwidth is 1/t_g) but the ranking does not.
+            from snail_solver.spectator_audit import (print_channel_audit,
+                                                      select_drag_channels)
+            _cli_channels, _audit = select_drag_channels(
+                config, nominal_t_g(config, args.target_eta),
+                max_channels=args.max_drag_channels,
+                spec_abs_GHz=args.spec_abs_GHz)
+            print_channel_audit(_audit)
+            if _audit["blocking"] and not args.force:
+                ap.error(
+                    f"{len(_audit['blocking'])} channel(s) are NOT PERTURBATIVE at this "
+                    f"operating point (g/|det| >= 1), so DRAG has no leading term to "
+                    f"cancel: "
+                    + "; ".join(f"{b['name']} (g={b['g_MHz']:.2f} MHz, "
+                                f"det={b['detuning_MHz']:.2f} MHz)"
+                                for b in _audit["blocking"][:3])
+                    + ". Move the operating point, or pass --force to solve anyway.")
+
         try:
             out = run_tune_up(
                 config, args.target_eta, drag_beat_GHz=args.drag_beat_GHz,
@@ -2839,6 +3101,9 @@ def main() -> None:
                 drag_shift_points=args.drag_shift_points,
                 eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
                 contrast_min=args.contrast_min,
+                probe_shape=args.probe_shape,
+                moment_weighting=args.moment_weighting,
+                chirp_max_passes=args.chirp_max_passes,
                 wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
                 tg_points=args.tg_points, tg_lo=args.tg_lo, tg_hi=args.tg_hi,
                 max_drag_iters=args.max_drag_iters,
@@ -2852,7 +3117,9 @@ def main() -> None:
             # The chevrons cost the whole sweep's wall-clock, so they go to disk even
             # though there is no operating point to go with them -- inspecting them in
             # a fresh session is exactly what the error asks for.
-            written = (save_doc(in_results(args.out), {"stages": {"rabi": exc.table}},
+            written = (save_doc(in_results(args.out),
+                                {"stages": {"rabi": exc.table},
+                                 "device": device_config},
                                 attrs=_run_attrs(device_path,
                                                  status="rabi_fit_failed",
                                                  error=str(exc)))
@@ -2886,10 +3153,11 @@ def main() -> None:
 
     written = None
     if args.out:
-        written = save_doc(in_results(args.out),
-                           {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
-                            "stages": out["stages"]},
-                           attrs=_run_attrs(device_path))
+        doc = {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
+               "stages": out["stages"]}
+        if device_config is not None:
+            doc["device"] = device_config
+        written = save_doc(in_results(args.out), doc, attrs=_run_attrs(device_path))
         print(f"  written {written}")
 
     # Every figure rendered below is also embedded in the run file, so the run

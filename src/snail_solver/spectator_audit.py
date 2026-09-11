@@ -515,6 +515,227 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
     return out
 
 
+def _audit_beat_key(beat_GHz: float, dedupe_MHz: float = 0.5) -> int:
+    """Bucket a beat so the same process arriving from two enumerations coincides."""
+    return int(round(float(beat_GHz) * 1e3 / max(float(dedupe_MHz), 1e-6)))
+
+
+def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
+                         max_channels: int = 4,
+                         require: Sequence[str] = ("leakage", "coupler"),
+                         window_GHz: float = 1.0, amp_scale: float = 1.0,
+                         wp_offset_GHz: float = 0.0,
+                         spec_abs_GHz: Optional[float] = None,
+                         min_g_MHz: float = 1e-3, min_ratio: float = 0.02,
+                         max_ratio: float = 0.3,
+                         chirp_coeffs_GHz: Optional[Sequence[float]] = None,
+                         quotient_rule: bool = True) -> Tuple[tuple, Dict[str, Any]]:
+    """Audit every near-resonant channel; pick the ones recursive DRAG should correct.
+
+    Two enumerations are unioned, because neither alone is the right set:
+
+    * :func:`interaction_channels` finds every process the Hamiltonian actually
+      contains, with a coupling ``g_MHz``, a detuning and a :func:`drag_verdict`. Its
+      ``leakage`` category means specifically the ``|2>`` ladder and its ``coupler``
+      category the SNAIL heating -- the two that must always be corrected.
+    * ``sweep_common.collision_drag_channels`` supplies the MODE SUBHARMONICS
+      (``w_i = 2 w_p``, two pump quanta). These are not optional either, and they do
+      NOT all fall in a ``require`` category: a subharmonic that excites qubit A from
+      ``|0>`` to ``|1>`` leaves both qubits under ``|2>``, so the classifier calls it
+      ``other``. Requiring only the categories would silently miss it, which is
+      precisely the channel a scan across ``2 w_p = w_a`` is about.
+
+    Everything mandatory is kept; the remaining slots go to the strongest correctable
+    parasites, ranked by pre-DRAG excitation amplitude ``g/|det|`` (the same ordering
+    :func:`interaction_channels` itself returns). The cap exists because channel count
+    is not free: :mod:`snail_solver.drag` needs the base envelope to vanish to order
+    ``len(channels)`` at both gate edges, which sets ``envelope_m`` and hence the pulse
+    area and ``t_g``.
+
+    Channels a chirp would sweep onto their own collision, or that sit inside the skip
+    window, are dropped by ``sweep_common._drag_channels_filtered`` -- reported, not
+    silently absent.
+
+    Parameters
+    ----------
+    config : dict
+        Merged device configuration. Read-only.
+    t_g_ns : float
+        Gate duration (ns). Sets the pulse bandwidth every verdict is judged against.
+    max_channels : int, default 4
+        Hard cap on the recursion depth.
+    require : sequence of str, default ("leakage", "coupler")
+        Categories that are always corrected when present.
+    min_g_MHz : float, default 1e-3
+        Floor on channel coupling for the audit.
+    max_ratio : float, default 0.3
+        Above this ``g/|det|`` a channel is NOT correctable perturbatively and is
+        excluded from the recursion (still reported). ``drag_verdict`` already calls
+        ``ratio >= 0.3`` "marginal: weak suppression", and it is the same threshold
+        ``device_utils.drag_correction_ratio`` warns at -- the DRAG quadrature is then
+        a third of the pulse it corrects, so the composition is a guess rather than a
+        correction. Composing several such channels does not merely help less, it
+        DIVERGES: the chirp<->DRAG fixed point runs away instead of settling.
+    min_ratio : float, default 0.02
+        Below this pre-DRAG excitation amplitude ``g/|det|`` a channel is NEGLIGIBLE
+        and stops being mandatory, however its category classifies. A parasite at
+        ``ratio = 0.01`` contributes ``P_exc ~ 2e-4``; spending a recursion order on it
+        costs a unit of ``envelope_m`` -- and hence pulse area and gate length -- to buy
+        nothing. Set 0 to make every categorised channel mandatory.
+
+    Returns
+    -------
+    channels : tuple of envelope.DragChannel
+        What to hand ``run_tune_up(drag_channels=...)``.
+    audit : dict
+        ``rows`` (every channel, each with ``selected`` and ``reason``), ``blocking``
+        (mandatory channels no pulse shape can fix), ``n_selected``,
+        ``envelope_m_min``, ``w_p_GHz``, ``eta_peak``, ``t_g_ns`` and
+        ``total_error_MHz``.
+    """
+    from snail_solver import sweep_common as SC
+    from snail_solver.device_utils import build_coupler
+    from snail_solver.envelope import DragChannel
+
+    t_g = float(t_g_ns)
+    # chirp_coeffs_GHz=[] so the audit is of the UNCHIRPED tone: the chirp is what the
+    # tune-up is about to calibrate, and build_coupler would otherwise inherit whatever
+    # the device file happens to carry.
+    cpl, w_p_GHz, eta_peak = build_coupler(config, t_g, float(amp_scale),
+                                           float(wp_offset_GHz),
+                                           spec_abs_GHz=spec_abs_GHz,
+                                           chirp_coeffs_GHz=[])
+    rows = [dict(r) for r in
+            interaction_channels(cpl, window_GHz=float(window_GHz), t_g_ns=t_g,
+                                 min_g_MHz=float(min_g_MHz),
+                                 has_spectator=(spec_abs_GHz is not None))]
+
+    # --- the mode subharmonics, from the collision enumeration -------------------
+    # no_spectator when there is no 4th mode, so _collision_candidates emits the
+    # subharmonics only rather than inventing spectator beats against wspec = 0.
+    sub_cfg = dict(config)
+    if spec_abs_GHz is None:
+        sub_cfg["no_spectator"] = True
+    wa, wb = (float(x) for x in config["qubit_freqs_GHz"])
+    ws = float(config["coupler_freq_GHz"])
+    wspec = float(spec_abs_GHz) if spec_abs_GHz is not None else 0.0
+    sub_chans = SC.collision_drag_channels(
+        sub_cfg, wa, wb, ws, wspec, w_p_GHz, n=max(int(max_channels), 8),
+        chirp_coeffs_GHz=chirp_coeffs_GHz, t_g=t_g, quotient_rule=quotient_rule)
+    sub_by_beat = {(_audit_beat_key(c.beat_GHz), int(c.n_pump)): c
+                   for c in sub_chans}
+
+    # --- mark up the audit -------------------------------------------------------
+    req = tuple(str(c) for c in require)
+    by_beat: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        r["beat_GHz"] = float(r["detuning_MHz"]) / 1e3
+        r["n_photon"] = max(int(r.get("n_pump", 1) or 1), 1)
+        # Same definition spectator_channels uses, so these rows drop straight into
+        # total_error_estimate / print_table rather than needing a parallel helper.
+        _ratio = float(r.get("ratio", 0.0) or 0.0)
+        r["P_exc"] = 1.0 if not np.isfinite(_ratio) else min(1.0, 2.0 * _ratio ** 2)
+        key = (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0))
+        r["is_subharmonic"] = key in sub_by_beat
+        r["negligible"] = bool(_ratio < float(min_ratio))
+        r["too_strong"] = bool(_ratio >= float(max_ratio))
+        r["mandatory"] = bool(r["category"] != "target" and not r["negligible"]
+                              and (r["category"] in req or r["is_subharmonic"]))
+        r["selected"], r["reason"] = False, ""
+        by_beat.setdefault(key, r)
+
+    # A subharmonic with no matching Hamiltonian term above min_g_MHz still gets a row,
+    # so "always considered" is visible in the report rather than an absence.
+    for key, ch in sub_by_beat.items():
+        if key in by_beat:
+            continue
+        rows.append(dict(category="subharm", name="mode subharmonic (2 w_p)",
+                         transition="--", process="--", g_MHz=0.0,
+                         detuning_MHz=float(ch.beat_GHz) * 1e3,
+                         beat_GHz=float(ch.beat_GHz), n_pump=int(ch.n_pump),
+                         n_photon=int(ch.n_photon), ratio=0.0, suppression=1.0,
+                         P_exc=0.0,
+                         verdict="below the audit's g floor", victim_tag="--",
+                         is_subharmonic=True, mandatory=False, negligible=True,
+                         too_strong=False, selected=False, reason=""))
+        by_beat[key] = rows[-1]
+
+    def _fails(r: Dict[str, Any]) -> bool:
+        """Not selectable: DRAG either cannot help, or would not converge."""
+        return (str(r.get("verdict", "")).startswith("fails")
+                or bool(r.get("too_strong")))
+
+    blocking = [r for r in rows
+                if r["category"] != "target"
+                and "not perturbative" in str(r.get("verdict", ""))]
+
+    # --- select ------------------------------------------------------------------
+    def _rank(r: Dict[str, Any]) -> float:
+        return -float(r.get("ratio", 0.0) or 0.0)      # strongest parasite first
+
+    cand = [r for r in rows if r["category"] != "target"]
+    mand = sorted((r for r in cand if r["mandatory"] and not _fails(r)), key=_rank)
+    rest = sorted((r for r in cand if not r["mandatory"] and not _fails(r)), key=_rank)
+    cap = max(int(max_channels), 0)
+
+    chosen: List[Dict[str, Any]] = []
+    taken: set = set()
+    for r in mand + rest:
+        ident = (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0))
+        if ident in taken:
+            # Same beat AND same pump count as one already chosen: the identical
+            # substitution. Composing it twice would double the correction instead of
+            # suppressing a second process (cf. collision_drag_channels).
+            r["reason"] = "duplicate substitution (same beat and pump count)"
+            continue
+        if len(chosen) >= cap:
+            r["reason"] = ("capped: mandatory but over --max-drag-channels"
+                           if r["mandatory"] else "capped")
+            continue
+        r["selected"], r["reason"] = True, ("mandatory" if r["mandatory"]
+                                            else "strongest remaining parasite")
+        taken.add(ident)
+        chosen.append(r)
+    for r in cand:
+        if not r["selected"] and not r["reason"]:
+            _hard = str(r.get("verdict", "")).startswith("fails")
+            r["reason"] = (
+                f"left uncorrected: g/|det| >= {float(max_ratio):g}, the recursion "
+                f"would not converge" if r.get("too_strong") and not _hard
+                else f"not DRAG-correctable ({r['verdict']})" if _fails(r)
+                else f"negligible (g/|det| < {float(min_ratio):g})"
+                if r.get("negligible") else "not selected")
+
+    built = tuple(sub_by_beat.get((_audit_beat_key(r["beat_GHz"]),
+                                   int(r["n_pump"] or 0)))
+                  or DragChannel(float(r["beat_GHz"]), n_pump=int(r["n_pump"]),
+                                 n_photon=int(r["n_photon"]),
+                                 quotient_rule=bool(quotient_rule))
+                  for r in chosen)
+    # The same safety filter every other auto-fill path uses; a channel a chirp would
+    # sweep through zero is dropped here rather than dividing by ~0 mid-pulse.
+    channels = SC._drag_channels_filtered(config, built, chirp_coeffs_GHz, t_g)
+    kept = {(_audit_beat_key(c.beat_GHz), int(c.n_pump)) for c in channels}
+    for r in chosen:
+        if (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0)) not in kept:
+            r["selected"], r["reason"] = False, "dropped: inside the DRAG skip window"
+
+    rows.sort(key=lambda r: (r["category"] != "target", not r["selected"], _rank(r)))
+    audit = {"rows": rows, "blocking": blocking, "n_selected": len(channels),
+             "envelope_m_min": len(channels), "w_p_GHz": float(w_p_GHz),
+             "eta_peak": float(eta_peak), "t_g_ns": t_g,
+             # The target is resonant by design; including it would peg the budget at 1.
+             "total_error": float(total_error_estimate(
+                 [r for r in rows if r["category"] != "target"])),
+             "max_channels": cap, "require": list(req),
+             "min_ratio": float(min_ratio), "max_ratio": float(max_ratio),
+             "uncorrected": [r for r in rows
+                             if r.get("too_strong") and r["category"] != "target"],
+             "n_mandatory": sum(1 for r in rows if r.get("mandatory")),
+             "n_capped": sum(1 for r in rows
+                             if str(r.get("reason", "")).startswith("capped"))}
+    return channels, audit
+
 CATEGORY_STYLE = {
     "target":    dict(colour="#111111", marker="*", label="target iSWAP  $a\\!\\leftrightarrow\\!b$"),
     "spectator": dict(colour="#d62728", marker="o", label="spectator excitation"),
@@ -778,6 +999,40 @@ def plot_interaction_chart(config: Dict[str, Any], channels: Sequence[Dict[str, 
 def total_error_estimate(channels: Sequence[Dict[str, Any]]) -> float:
     """Summed excitation estimate over channels, capped at 1 (a rough error budget)."""
     return float(min(1.0, sum(c["P_exc"] for c in channels)))
+
+
+def print_channel_audit(audit: Dict[str, Any], top: int = 14) -> None:
+    """Print a :func:`select_drag_channels` audit: what will be corrected, and what not.
+
+    Deliberately printed BEFORE any solve. The point is that a channel the recursion
+    is not going to touch -- capped out, non-perturbative, or inside the skip window --
+    is visible as a line with a reason, rather than as an absence nobody notices.
+    """
+    rows = audit.get("rows", [])
+    print(f"  DRAG channel audit: w_p={audit['w_p_GHz']:.4f} GHz  "
+          f"t_g={audit['t_g_ns']:.1f} ns  peak|eta|={audit['eta_peak']:.3f}  "
+          f"bandwidth 1/t_g={1e3 / max(audit['t_g_ns'], 1e-9):.1f} MHz")
+    print(f"  selected {audit['n_selected']}/{audit['max_channels']} channels; "
+          f"needs sine_power m >= {audit['envelope_m_min']}; "
+          f"parasitic budget ~{audit['total_error']:.2e}")
+    print(f"    {'':1s} {'category':9s} {'g(MHz)':>8s} {'det(MHz)':>10s} {'g/|det|':>8s} "
+          f"{'k':>2s} {'sub':>3s}  {'verdict':30s}  reason")
+    for r in rows[:int(top)]:
+        ratio = float(r.get("ratio", 0.0) or 0.0)
+        print(f"    {'*' if r.get('selected') else ' '} {r.get('category', '?'):9s} "
+              f"{r.get('g_MHz', 0.0):8.3f} {r.get('detuning_MHz', 0.0):10.2f} "
+              f"{ratio:8.3f} {int(r.get('n_pump', 0) or 0):2d} "
+              f"{'yes' if r.get('is_subharmonic') else '  -':>3s}  "
+              f"{str(r.get('verdict', ''))[:30]:30s}  {str(r.get('reason', ''))[:38]}")
+    if len(rows) > int(top):
+        print(f"    ... {len(rows) - int(top)} weaker channel(s) not shown")
+    for u in audit.get("uncorrected", []):
+        print(f"    ~~ LEFT UNCORRECTED: {u['name']} g={u['g_MHz']:.2f} MHz "
+              f"det={u['detuning_MHz']:.2f} MHz  g/|det|={u.get('ratio', 0):.3f} "
+              f">= {audit.get('max_ratio', 0.3):g} -- recursion would not converge")
+    for b in audit.get("blocking", []):
+        print(f"    !! NOT PERTURBATIVE: {b['name']} g={b['g_MHz']:.2f} MHz "
+              f"det={b['detuning_MHz']:.2f} MHz -- frequency allocation, not pulse shaping")
 
 
 def scan_band(config: Dict[str, Any], t_g_ns: float, *, n_points: int = 161,

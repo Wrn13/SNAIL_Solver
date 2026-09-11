@@ -797,6 +797,43 @@ ENVELOPE_KINDS = {
 }
 
 
+def envelope_from_config(config: Dict[str, Any], t_g: float, amp: float = 1.0):
+    """The envelope THIS device is configured to play, at a real gate length.
+
+    Every probe that claims to be "the actual gate pulse" has to be built from the
+    configured shape, not from a hardcoded one. ``tune_up.chirp_from_measured_shift``
+    already reads the envelope off the config for exactly this reason -- selecting a
+    different base shape (which recursive DRAG requires past one channel, see
+    :class:`SinePowerRamp`) must not leave a calibration tracking a pulse the solver
+    is not playing. This is the same rule for the chevron probes.
+
+    Parameters
+    ----------
+    config : dict
+        Merged device configuration. Reads ``envelope`` (default
+        ``"raised_cosine"``) and, for ``sine_power``, ``envelope_m`` and
+        ``envelope_rise_frac``.
+    t_g : float
+        Gate duration (ns). ``envelope_rise_frac`` is a FRACTION of it, which is what
+        keeps the shape -- and hence the chirp built from it -- independent of `t_g`.
+    amp : float, default 1.0
+        Peak amplitude before any iSWAP normalization.
+
+    Returns
+    -------
+    Envelope
+    """
+    kind = str(config.get("envelope", "raised_cosine"))
+    cls = ENVELOPE_KINDS.get(kind)
+    if cls is None:
+        raise ValueError(f"unknown envelope {kind!r}; known: {sorted(ENVELOPE_KINDS)}")
+    kw: Dict[str, Any] = {}
+    if cls is SinePowerRamp:
+        kw = {"m": int(config.get("envelope_m", 3)),
+              "t_rise": float(t_g) * float(config.get("envelope_rise_frac", 0.5))}
+    return cls(amp=float(amp), t_g=float(t_g), **kw)
+
+
 # ===========================================================================
 # DRAG channels
 # ===========================================================================

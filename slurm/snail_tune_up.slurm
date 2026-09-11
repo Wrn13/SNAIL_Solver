@@ -129,7 +129,9 @@
 #   OUT         HDF5 path for the full record + per-stage data  [tuneup_<dev>.h5]
 #               (a .json suffix still writes the old text format instead). The
 #               figures below are embedded in it as well as written to their own
-#               paths, so this one file is the whole run:
+#               paths, and so is a copy of the device config the solves ran with
+#               (COUPLER_LEVELS override included), so this one file is the whole
+#               run -- it reads back the same after the device JSON moves on:
 #                 python -m snail_solver.h5_io results/<out>.h5 --extract figs/
 #   PLOT        set to 0 to skip rendering the Rabi sweep                  [1]
 #   PLOT_OUT    figure path; defaults to its OWN folder per device+eta so
