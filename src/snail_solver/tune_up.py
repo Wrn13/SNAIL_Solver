@@ -2270,7 +2270,9 @@ def length_rabi(config: Dict[str, Any], target_eta: float,
                 drag_channels=None,
                 spec_abs_GHz: Optional[float] = None,
                 solver: Optional[Dict[str, Any]] = None,
-                refine: bool = True,
+                refine: bool = True, extend: bool = True,
+                max_t_g_factor: float = 2.0, min_t_g_factor: float = 0.5,
+                extend_rounds: int = 6,
                 logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Step 4: sweep the gate LENGTH at fixed peak |eta| and find the full swap.
 
@@ -2282,6 +2284,40 @@ def length_rabi(config: Dict[str, Any], target_eta: float,
     At each `t_g` the amplitude is re-derived by :func:`fixed_eta_amp_scale`, which is
     what holds the physical drive constant while the length varies. The grid defaults
     to +/-30% about ``t_g0``, where a full iSWAP sits by construction.
+
+    The window is an ASSUMPTION, and `extend` stops it being a silent one
+    ---------------------------------------------------------------------
+    ``t_g0 = 2A/eta`` is the full-swap length for the BARE exchange rate
+    ``6 g3 lam_a lam_b eta``. Anything lowering the EFFECTIVE rate needs a longer
+    gate, and the amplitude cannot take up the slack: `fixed_eta_amp_scale` pins the
+    peak ``|eta|`` at every candidate length by design, so ``t_g`` is the only free
+    knob. A rate reduced by ``r`` needs ``1/r`` more time, so +-30% tolerates only
+    ``r >= 0.77``. Near a subharmonic the chirp (whose whole excursion is the Stark
+    shift), coupler occupation and parasite dressing all push ``r`` below that.
+
+    A maximum on an endpoint was never BRACKETED, and returning it reports a boundary
+    as an optimum: the gate is left UNDER-ROTATED and the un-swapped population reads
+    as leakage. On the 2026-09-16 above-branch grid 18 of 73 columns sat exactly on
+    ``1.3 t_g0``. With `extend` (default) an endpoint maximum grows the grid by its
+    own step, up to ``max_t_g_factor * t_g0``, until the maximum is bracketed or the
+    cap is hit; ``railed`` then means "no interior optimum out to the cap", a RESULT.
+
+    Because the loop stops as soon as the argmax becomes interior, it returns the
+    FIRST swap rather than a later Rabi cycle -- transfer at fixed peak ``|eta|``
+    oscillates, and at ``delta = -120 MHz`` it peaks at 0.993 (1.20 ``t_g0``) and
+    rises again to 0.558 by 3.0 ``t_g0``. A global argmax over a wide window would
+    return three iSWAPs scored as one.
+
+    ``max_t_g_factor`` is 2.0 because a longer gate is not free: this module's score
+    is the closed-system transfer, which charges NOTHING for duration, while the
+    incoherent error grows as ``t_g / T_eff``. At ``eta = 1.3`` (``t_g0`` = 107 ns)
+    and ``T_eff`` = 12.5 us, 2.0 ``t_g0`` already costs ~1.7e-2 incoherently --
+    above the best ``infidelity_total`` measured anywhere in this study. A first swap
+    that needs more than ~2 ``t_g0`` is therefore not a usable gate, so extending
+    past it would spend solves locating a length nothing would operate at. The
+    decoherence cost of the fitted length is charged downstream by
+    ``subharmonic_gate_scan.coherence_penalty`` / ``total_infidelity``, which is what
+    the best operating point is ranked on.
     """
     from snail_solver.device_utils import maximize_1d, transfer_probability
 
@@ -2297,21 +2333,71 @@ def length_rabi(config: Dict[str, Any], target_eta: float,
             drag_beat_GHz=drag_beat_GHz, chirp_coeffs_GHz=chirp_coeffs_GHz,
             drag_n_pump=drag_n_pump, drag_channels=drag_channels)
 
+    grid = np.sort(np.asarray(grid, dtype=float))
     P = np.array([score(t) for t in grid])
     k = int(np.argmax(P))
+    nfev = int(grid.size)
     if logger:
         logger.info(f"  length: coarse best t_g={grid[k]:.3f} ns  P={P[k]:.5f} "
                     f"(t_g0={t_g0:.3f} ns)")
 
-    best_t, best_P, nfev = float(grid[k]), float(P[k]), int(grid.size)
-    if refine and 0 < k < grid.size - 1:
+    # Bracket the maximum; do not report a boundary as one. See the docstring.
+    n_extend = 0
+    if extend and grid.size > 1:
+        step = float(np.median(np.diff(grid)))
+        hi_cap, lo_cap = float(max_t_g_factor) * t_g0, float(min_t_g_factor) * t_g0
+        while n_extend < int(extend_rounds) and not 0 < k < grid.size - 1:
+            if k == grid.size - 1:
+                new_t = grid[-1] + step * np.arange(1.0, 4.0)
+                new_t = new_t[new_t <= hi_cap + 1e-9]
+                if new_t.size == 0:
+                    break
+                grid = np.concatenate([grid, new_t])
+                P = np.concatenate([P, [score(t) for t in new_t]])
+                where = "upper"
+            else:
+                new_t = grid[0] - step * np.arange(1.0, 4.0)
+                new_t = np.sort(new_t[new_t >= lo_cap - 1e-9])
+                if new_t.size == 0:
+                    break
+                grid = np.concatenate([new_t, grid])
+                P = np.concatenate([[score(t) for t in new_t], P])
+                where = "lower"
+            nfev += int(new_t.size)
+            k = int(np.argmax(P))
+            n_extend += 1
+            if logger:
+                logger.info(f"  length: maximum was on the {where} edge; extended to "
+                            f"[{grid[0]:.1f}, {grid[-1]:.1f}] ns "
+                            f"({grid[0]/t_g0:.2f}-{grid[-1]/t_g0:.2f} t_g0), best now "
+                            f"t_g={grid[k]:.3f} ns P={P[k]:.5f}")
+
+    railed = not 0 < k < grid.size - 1
+    best_t, best_P = float(grid[k]), float(P[k])
+    if n_extend and logger:
+        # The transfer score charges nothing for duration; say what the extra length
+        # costs so a lengthened gate is never silently accepted as an improvement.
+        logger.info(f"  length: extended fit sits at {best_t / t_g0:.2f} t_g0 "
+                    f"({best_t:.1f} ns), i.e. {100 * (best_t / t_g0 - 1):+.0f}% gate "
+                    f"time against t_g0 -- the incoherent error scales with it and is "
+                    f"charged by total_infidelity, not by this transfer score.")
+    if refine and not railed:
         lo, hi = float(grid[k - 1]), float(grid[k + 1])
         best_t, best_P, n = maximize_1d(score, lo, hi, n_points=7, n_refine=2)
         nfev += int(n)
+    if railed and logger:
+        logger.info(f"  length: STILL railed at t_g={best_t:.3f} ns "
+                    f"({best_t/t_g0:.2f} t_g0, P={best_P:.5f}) after {n_extend} "
+                    f"extension(s) -- no interior optimum out to "
+                    f"[{min_t_g_factor:g}, {max_t_g_factor:g}] t_g0. That is a RESULT "
+                    f"about this operating point, not a fitted length.")
     return {"t_g_grid": grid, "P": P, "t_g_ns": best_t, "transfer": best_P,
             "t_g0_ns": t_g0, "amp_scale": fixed_eta_amp_scale(config, best_t,
                                                               target_eta),
-            "nfev": nfev, "railed": bool(k in (0, grid.size - 1))}
+            "nfev": nfev, "railed": bool(railed),
+            "t_g_over_t_g0": float(best_t / t_g0),
+            "n_extensions": int(n_extend),
+            "grid_span_t_g0": [float(grid[0] / t_g0), float(grid[-1] / t_g0)]}
 
 
 # ===========================================================================
@@ -2756,6 +2842,14 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         "target_eta": float(target_eta),
         "metric": "transfer", "score": float(length["transfer"]),
         "source": "tune_up",
+        # The length fit's own verdict, carried WITH the record. It was already
+        # computed and already warned about in the log, and every consumer still
+        # discarded it -- which is how 18 of 73 columns came to report a search-window
+        # boundary as a calibrated gate length.
+        "t_g_railed": bool(length["railed"]),
+        "t_g_over_t_g0": float(length.get("t_g_over_t_g0", t_g / t_g0)),
+        "t_g_grid_span_t_g0": length.get("grid_span_t_g0"),
+        "t_g_extensions": int(length.get("n_extensions", 0)),
     }
 
     if post_chirp_points:

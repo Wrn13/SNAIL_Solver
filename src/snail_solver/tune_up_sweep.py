@@ -222,6 +222,7 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
                solver: Optional[Dict[str, Any]] = None,
                fit_virtual_z: bool = True, refit_length: bool = False,
                tg_points: int = 13, tg_lo: float = 0.7, tg_hi: float = 1.3,
+               drag_channels=None,
                logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Score the REAL gate at a calibrated operating point.
 
@@ -238,6 +239,14 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
         which would silently score a device-level chirp instead of no chirp;
         ``[]`` goes through ``make_chirp`` to a trivial (None) tone chirp, i.e. the
         byte-identical un-chirped solver path.
+    drag_channels : sequence of DragChannel, optional
+        The recursive-DRAG channels to PLAY. Multi-channel DRAG does not go through
+        ``record["drag_beat_GHz"]`` -- that field is the one-channel legacy path and
+        is ``None`` whenever `drag_channels` was used -- so omitting this scores an
+        UN-DRAGGED pulse. The chirp is still DRAG-aware either way (the chirp<->DRAG
+        fixed point folds the corrected envelope back into the Stark law), which is
+        what made the omission invisible: the numbers moved with the channel set
+        while the scored pulse carried no correction at all.
     refit_length : bool, default False
         Re-fit the length for THIS chirp before scoring, instead of reusing the
         record's. Costs a full length scan (~`tg_points` + 19 serial solves). The
@@ -273,7 +282,8 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
                                            int(tg_points)),
                         wp_offset_GHz=wp, chirp_coeffs_GHz=chirp,
                         drag_beat_GHz=drag_beat_GHz, drag_n_pump=drag_n_pump,
-                        spec_abs_GHz=spec_abs_GHz, solver=solver, logger=logger)
+                        spec_abs_GHz=spec_abs_GHz, solver=solver, logger=logger,
+                        drag_channels=drag_channels)
         t_g = float(L["t_g_ns"])
     # amp_scale is never free: it is whatever holds |eta| at the target for THIS
     # length. Recomputing (rather than reading record["amp_scale"]) is what makes
@@ -282,15 +292,23 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
 
     cpl, _w_p, peak_eta = build_coupler(
         config, t_g, amp, wp, spec_abs_GHz, drag_beat_GHz,
-        chirp_coeffs_GHz=chirp, drag_n_pump=drag_n_pump)
+        chirp_coeffs_GHz=chirp, drag_n_pump=drag_n_pump,
+        drag_channels=drag_channels)
     F, leak, _U = cpl.iswap_fidelity(0, 1, t_g, fit_virtual_z=fit_virtual_z, **solver)
     P = transfer_probability(config, t_g, amp, wp, solver,
                              spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz,
-                             chirp_coeffs_GHz=chirp, drag_n_pump=drag_n_pump)
+                             chirp_coeffs_GHz=chirp, drag_n_pump=drag_n_pump,
+                             drag_channels=drag_channels)
     return {"t_g_ns": float(t_g), "amp_scale": float(amp), "wp_offset_GHz": float(wp),
             "peak_eta": float(peak_eta), "chirp_coeffs_GHz": chirp,
             "F_avg": float(F), "leakage": float(leak), "transfer": float(P),
-            "refit_length": bool(refit_length)}
+            "refit_length": bool(refit_length),
+            # What was PLAYED, not what was designed. Recorded because a scored
+            # number that silently dropped the DRAG is indistinguishable from one
+            # that kept it.
+            "n_drag_channels": int(len(drag_channels) if drag_channels else 0),
+            "drag_beat_GHz": (float(drag_beat_GHz)
+                              if drag_beat_GHz is not None else None)}
 
 
 # ===========================================================================

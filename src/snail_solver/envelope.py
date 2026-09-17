@@ -876,6 +876,26 @@ class DragChannel:
     kappa : float, optional
         Coupling-per-unit-drive ``g = kappa Omega`` of this process. Required only by
         ``mode="givens"``.
+    stark_scale : float, default 0.0
+        This channel's OWN AC-Stark shift, as a multiple of the chirp
+        (``spectator_audit.stark_scales``). Default 0.0 keeps the historical
+        behaviour, a static beat.
+
+        The chirp is the target transition's measured Stark curve, and every other
+        transition shifts at the same leading order in the same envelope, so a
+        channel's shift is proportional to it and can be tracked by reusing the curve
+        the pulse already carries::
+
+            Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)
+
+        It matters: measured against a wide chevron survey, the ``|2>``-involving
+        channels shift 6-10x HARDER than the target (``stark_scale`` ~ +10 for
+        ``a|1>->|2>``, ~ -8 for ``b|1>->|2>`` -- opposite signs at the same operating
+        point, so no single global factor can stand in for them). Against detunings of
+        100-200 MHz that is a 15-30% error in the DRAG denominator, concentrated on
+        exactly the marginal channels where ``g/|Delta|`` is largest. The subharmonic
+        channels, by contrast, barely move (~ -0.2), which is why a static beat worked
+        as well as it did for the channels that carry most of the correction.
     """
 
     beat_GHz: float
@@ -884,6 +904,7 @@ class DragChannel:
     mode: str = "perturbative"
     quotient_rule: bool = False
     kappa: Optional[float] = None
+    stark_scale: float = 0.0
 
     @classmethod
     def from_collision(cls, beat_GHz: float, kind: str, **kw: Any) -> "DragChannel":
@@ -1008,25 +1029,40 @@ class PumpTone:
                 and chs[0].mode == "perturbative" and not chs[0].quotient_rule)
 
     def channel_detuning(self, ch: DragChannel, t: Any, xp: Any = np) -> Any:
-        """Instantaneous beat ``Delta_j(t)`` of one channel, in rad/ns."""
+        """Instantaneous beat ``Delta_j(t)`` of one channel, in rad/ns.
+
+        ``Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)``. Two distinct
+        effects share the chirp's shape and so collapse into one coefficient:
+
+        * ``-n_pump delta(t)`` -- the PUMP moved, and this process carries `n_pump`
+          pump quanta. Always present.
+        * ``+stark_scale delta(t)`` -- the channel's OWN levels Stark-shift, and the
+          chirp is the target transition's Stark curve, so this channel's shift is a
+          multiple of it (:attr:`DragChannel.stark_scale`). Zero by default.
+        """
         detuning = float(ch.beat_GHz) * TWO_PI
-        if self.chirp is None or not ch.n_pump:
+        coeff = float(ch.stark_scale) - float(ch.n_pump)
+        if self.chirp is None or coeff == 0.0:
             return detuning + 0.0 * xp.asarray(t)
-        return detuning - int(ch.n_pump) * self.chirp.detuning(t, xp)
+        return detuning + coeff * self.chirp.detuning(t, xp)
 
     def channel_detuning_jet(self, ch: DragChannel, t: Any, order: int,
                              xp: Any = np) -> tuple:
         """``Delta_j`` and its derivatives to `order`, in rad/ns.
 
-        ``Delta_j(t) = 2 pi beat - n_pump delta(t)``, so every derivative comes from
-        the chirp alone: ``Delta_j^(m) = -n_pump delta^(m)`` for m >= 1.
+        ``Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)``, so every
+        derivative still comes from the chirp alone:
+        ``Delta_j^(m) = (stark_scale - n_pump) delta^(m)`` for m >= 1. Tracking the
+        channel's own Stark shift therefore costs the recursion NOTHING -- it reuses
+        the chirp jet the pulse already computes, with a different coefficient.
         """
         value = self.channel_detuning(ch, t, xp)
         order = int(order)
-        if self.chirp is None or not ch.n_pump:
+        coeff = float(ch.stark_scale) - float(ch.n_pump)
+        if self.chirp is None or coeff == 0.0:
             return (value,) + tuple(0.0 * xp.asarray(t) for _ in range(order))
         dj = self.chirp.detuning_jet(t, order, xp)
-        return (value,) + tuple(-int(ch.n_pump) * dj[m] for m in range(1, order + 1))
+        return (value,) + tuple(coeff * dj[m] for m in range(1, order + 1))
 
     def channel_detuning_jets(self, channels: Sequence[DragChannel], t: Any,
                               order: int, xp: Any = np) -> list:

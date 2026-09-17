@@ -142,6 +142,42 @@ def column_tag(delta_GHz: float, target_eta: Optional[float] = None) -> str:
     return tag if target_eta is None else f"{tag}_{eta_tag(target_eta)}"
 
 
+def channel_labels(chans, audit: Dict[str, Any]) -> list:
+    """Pair played ``DragChannel``s to their audit rows, so a channel can be NAMED.
+
+    The scan used to record only ``beat_GHz``/``n_pump``, which makes a channel set
+    unreadable: `+0.200/2` says nothing about WHICH parasite is being corrected, and at
+    strong drive the shed-and-retry leaves one channel whose identity differs column to
+    column. The audit already carries ``process``, ``transition``, ``category`` and the
+    verdict per row; this joins them on the same 0.5 MHz beat bucket the selector uses,
+    so no new physics enumeration is involved.
+
+    A channel with no matching audit row is reported as such rather than dropped --
+    that would mean the selector and the audit disagree, which is worth seeing.
+    """
+    from snail_solver.spectator_audit import _audit_beat_key
+
+    by_key: Dict[tuple, Dict[str, Any]] = {}
+    for r in (audit.get("rows") or ()):
+        if r.get("beat_GHz") is None:
+            continue
+        by_key.setdefault((_audit_beat_key(float(r["beat_GHz"])),
+                           int(r.get("n_pump") or 0)), r)
+    out = []
+    for c in chans:
+        r = by_key.get((_audit_beat_key(float(c.beat_GHz)), int(c.n_pump))) or {}
+        out.append({"beat_GHz": float(c.beat_GHz), "n_pump": int(c.n_pump),
+                    "n_photon": int(c.n_photon),
+                    "label": r.get("process") or "(no matching audit row)",
+                    "transition": r.get("transition"),
+                    "category": r.get("category"),
+                    "g_MHz": r.get("g_MHz"),
+                    "detuning_MHz": r.get("detuning_MHz"),
+                    "ratio": r.get("ratio"),
+                    "verdict": r.get("verdict")})
+    return out
+
+
 def scan_config(config: Dict[str, Any], *, max_drag_channels: int) -> Dict[str, Any]:
     """The grid-wide base config: a sine_power envelope with enough vanishing edges.
 
@@ -294,8 +330,61 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             # different measurement of the same column.
             "ridge_grid": bool(settings.get("ridge_grid")),
             # A bigger pass budget turns a column that "diverged" into a solved one,
-            # so a cached failure must not be reused under a larger one.
-            "chirp_max_passes": int(settings.get("chirp_max_passes", 12))}
+            # so a cached failure must not be reused under a larger one. BOTH
+            # relaxations count: the inner fixed point (chirp_max_passes) and the
+            # outer chirp<->length loop (max_drag_iters). Leaving the latter out was
+            # an omission -- it is a convergence budget on exactly the same footing,
+            # and a real 9-column run failed in it.
+            "chirp_max_passes": int(settings.get("chirp_max_passes", 12)),
+            "max_drag_iters": int(settings.get("max_drag_iters", 4)),
+            # The length-fit WINDOW is not grid resolution, whatever its neighbours
+            # above suggest: `length_rabi` searches t_g in [tg_lo, tg_hi] * t_g0 and
+            # RETURNS THE BOUNDARY when the optimum lies outside it. 18 of 73 columns
+            # in the 2026-09-16 run sat exactly on tg_hi and were 5.7x worse than the
+            # free ones, so widening the window changes the answer and must re-solve.
+            # Defaults mirror the CLI so a synthetic settings dict still keys, the
+            # same tolerance chirp_max_passes/max_drag_iters use; a real run always
+            # supplies all three.
+            "tg_lo": float(settings.get("tg_lo", 0.7)),
+            "tg_hi": float(settings.get("tg_hi", 1.3)),
+            "tg_points": int(settings.get("tg_points", 13)),
+            # Not physics, but it changes the stored NUMBER: before 2026-09-16 the two
+            # score_gate calls passed no `drag_channels`, so every cached row holds a
+            # chirped pulse that played NO DRAG. A cached row from then must not be
+            # served as if it were a DRAG-corrected one. Bump this if the scoring
+            # contract changes again.
+            "score_drag": 1,
+            # Likewise for the LENGTH contract: columns solved before 2026-09-17 ran a
+            # length_rabi that returned its search-window BOUNDARY when the optimum lay
+            # outside, instead of extending the grid to bracket it. Their t_g -- and so
+            # their fidelity -- is a bound, not a calibration, and must not be served to
+            # a run that expects the bracketed value.
+            "length_extend": 1}
+
+
+def _failure_type(exc: BaseException) -> str:
+    """Name the failure so a row says WHICH relaxation gave up, not just that one did.
+
+    The two are fixed by different knobs, so collapsing them into one label sends
+    someone to the wrong one: the fixed point wants ``--chirp-max-passes``, the
+    chirp<->length loop wants ``--max-drag-iters``.
+    """
+    m = str(exc)
+    if "fixed point did not settle" in m:
+        return "DragFixedPointDiverged"
+    if "did not converge" in m:
+        return "ChirpLengthLoopDiverged"
+    return type(exc).__name__
+
+
+def _failure_stage(exc: BaseException) -> str:
+    """Which tune-up stage owns the failure, for the row's ``error.stage``."""
+    m = str(exc)
+    if "fixed point did not settle" in m:
+        return "chirp"
+    if "did not converge" in m:
+        return "length"
+    return "tune_up"
 
 
 def audit_column(config: Dict[str, Any], col: Dict[str, Any],
@@ -350,9 +439,7 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
     row.update({"branch": str(settings["branch"]),
                 "t_g0_ns": audit["t_g0_ns"],
                 "channel_audit": audit,
-                "drag_channels": [{"beat_GHz": float(c.beat_GHz),
-                                   "n_pump": int(c.n_pump),
-                                   "n_photon": int(c.n_photon)} for c in channels],
+                "drag_channels": channel_labels(channels, audit),
                 "n_drag_channels": len(channels),
                 "total_error": audit["total_error"]})
 
@@ -387,7 +474,26 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             **settings.get("map_kw", {}))
 
     def _diverged(exc):
-        return "fixed point did not settle" in str(exc)
+        """Did this column fail to CONVERGE (vs. fail unexpectedly)?
+
+        There are TWO relaxations and they raise different messages, so matching only
+        the inner one let the outer one escape the retry below and kill the whole scan
+        -- a 9-column run died on its first bad column, which is exactly the contract
+        this module is supposed to keep ("a column that cannot be calibrated at high
+        drive is a RESULT").
+
+        * inner, `chirp_from_measured_shift`: the chirp <-> DRAG-quadrature fixed
+          point, "... fixed point did not settle in N passes" (`--chirp-max-passes`).
+        * outer, `run_tune_up`: the chirp <-> length loop, "... did not converge in N
+          passes" (`--max-drag-iters`). With DRAG on, the quadrature scales as 1/t_g,
+          so the chirp and the fitted length are genuinely coupled and this one
+          oscillates in t_g at strong drive.
+
+        Both mean "shed a channel and retry, and if that fails record the column as
+        uncalibrated". Anything else is a bug and still propagates.
+        """
+        m = str(exc)
+        return ("fixed point did not settle" in m or "did not converge" in m)
 
     used = list(channels)
     try:
@@ -426,14 +532,11 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                     out = None
         if out is None:
             row.update({"ok": False, "seconds": time.perf_counter() - t0,
-                        "error": {"type": ("DragFixedPointDiverged" if _diverged(exc)
-                                           else type(exc).__name__),
-                                  "stage": ("chirp" if _diverged(exc) else "tune_up"),
+                        "error": {"type": _failure_type(exc),
+                                  "stage": _failure_stage(exc),
                                   "message": str(exc)}})
             return row
-        row["drag_channels"] = [{"beat_GHz": float(c.beat_GHz),
-                                 "n_pump": int(c.n_pump),
-                                 "n_photon": int(c.n_photon)} for c in used]
+        row["drag_channels"] = channel_labels(used, audit)
         row["n_drag_channels"] = len(used)
         row["drag_shed"] = len(channels) - len(used)
 
@@ -442,8 +545,20 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
     scfg = config_at_wp(config, col["w_p_GHz"], branch=settings["branch"],
                         levels=settings["coupler_levels"], chirp_coeffs_GHz=chirp)
     # `[]` and never None for the flat reference: None means "inherit the config chirp".
-    chirped = score_gate(scfg, rec, chirp, solver=solver)
-    flat = score_gate(scfg, rec, [], solver=solver)
+    #
+    # `drag_channels=used` is LOAD-BEARING. Multi-channel DRAG does not travel through
+    # `rec["drag_beat_GHz"]` -- that field is the one-channel legacy path and is None
+    # whenever channels were passed -- so omitting it scores an UN-DRAGGED pulse while
+    # the calibration spends its whole time selecting channels and converging the
+    # chirp<->DRAG fixed point. That was the state of every scan in results/ until
+    # 2026-09-15; it hid because the chirp IS DRAG-aware, so the coefficients moved
+    # with the channel set even though nothing was played. `used` is the post-shed set.
+    #
+    # The flat reference passes None, not `[]`: `[]` is FALSY at device_utils.py:317
+    # and so is indistinguishable from None there -- unlike `chirp_coeffs_GHz`, where
+    # the distinction is enforced by a raise. Do not mirror the chirp convention here.
+    chirped = score_gate(scfg, rec, chirp, solver=solver, drag_channels=used)
+    flat = score_gate(scfg, rec, [], solver=solver, drag_channels=None)
 
     stages = out["stages"]
     fit = (stages.get("rabi") or {}).get("fit") or {}
@@ -457,8 +572,13 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                   "quartic_fraction": chirp_stage.get("quartic_fraction"),
                   "drag_correction_ratio": chirp_stage.get("drag_correction_ratio"),
                   "min_abs_detuning_GHz": chirp_stage.get("min_abs_detuning_GHz")},
-        "fidelity": {k: chirped.get(k) for k in ("F_avg", "leakage", "transfer")},
-        "flat": {k: flat.get(k) for k in ("F_avg", "leakage", "transfer")},
+        # t_g_ns and n_drag_channels are kept because a scored number that silently
+        # dropped its DRAG is otherwise indistinguishable from one that kept it, and
+        # because the gate LENGTH of each trace is a reported quantity.
+        "fidelity": {k: chirped.get(k) for k in
+                     ("F_avg", "leakage", "transfer", "t_g_ns", "n_drag_channels")},
+        "flat": {k: flat.get(k) for k in
+                 ("F_avg", "leakage", "transfer", "t_g_ns", "n_drag_channels")},
         "delta_F": ((chirped.get("F_avg") or 0.0) - (flat.get("F_avg") or 0.0)),
         # The scan solves a CLOSED system, so this is the only place gate LENGTH is
         # charged for. Without it the scan is biased toward weak drive: t_g = 2A/eta,
@@ -472,6 +592,23 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
         "run_doc": {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
                     "stages": stages, "device": dict(scfg)},
     })
+    # `length_rabi` now EXTENDS its grid to bracket the maximum, and reports
+    # `railed` only when no interior optimum exists out to its cap -- a result about
+    # the operating point rather than a boundary masquerading as a calibration. Take
+    # its word for it; re-deriving this from tg_lo/tg_hi would miss the extension.
+    _t_g0 = float(out["t_g0_ns"])
+    _t_g = float(rec["t_g_ns"])
+    _rail = bool(rec.get("t_g_railed"))
+    row["t_g_railed"] = ("hi" if _rail and _t_g > _t_g0 else
+                         "lo" if _rail else None)
+    row["t_g_over_t_g0"] = float(rec.get("t_g_over_t_g0", _t_g / _t_g0))
+    row["t_g_grid_span_t_g0"] = rec.get("t_g_grid_span_t_g0")
+    row["t_g_extensions"] = int(rec.get("t_g_extensions", 0))
+    if _rail:
+        log.info(f"  WARNING: t_g={_t_g:.2f} ns ({_t_g / _t_g0:.2f} t_g0) is still on "
+                 f"an edge after {row['t_g_extensions']} grid extension(s) over "
+                 f"{row['t_g_grid_span_t_g0']} x t_g0 -- no interior full swap exists "
+                 f"here, so this length is a bound, not a calibration")
     row["infidelity_total"] = total_infidelity(
         row["fidelity"]["F_avg"] or 0.0, row["coherence"]["eps_incoherent"])
     row["infidelity_coherent"] = float(1.0 - (row["fidelity"]["F_avg"] or 0.0))
@@ -733,6 +870,16 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                         if row['coherence']['eps_incoherent'] is not None else "")
                      + f"n_s={row['n_coupler']:.2e}  "
                      f"{row['n_drag_channels']} chan  {row['seconds']:.1f}s")
+            # Name the channels that were actually PLAYED. A bare count hides which
+            # parasite is being corrected, and the shed-and-retry leaves a different
+            # survivor column to column at strong drive.
+            for ch in (row.get("drag_channels") or ()):
+                log.info(f"    drag: {ch['beat_GHz']:+.4f} GHz k={ch['n_pump']} "
+                         f"[{ch.get('category') or '?'}] {ch.get('label')}"
+                         + (f"  g={ch['g_MHz']:.2f} MHz" if ch.get("g_MHz") is not None
+                            else "")
+                         + (f"  ratio={ch['ratio']:.3f}" if ch.get("ratio") is not None
+                            else ""))
             if path:                              # only on success
                 with open(path, "w") as fh:
                     json.dump(row, fh, default=float)
@@ -847,8 +994,14 @@ def attach_all_column_figures(path: str, *, figdir: Optional[str] = None,
             rows[column_tag(float(r["delta_GHz"]), float(r["target_eta"]))] = r
         except (KeyError, TypeError, ValueError):
             continue
+    # Per-FILE subdirectory. Two scans of the same grid live side by side (a constant-
+    # probe run and a shaped-probe one, say) and their column TAGS are identical, so a
+    # shared directory means the second replot silently overwrites the first's PNGs.
+    # The embedded copies are safe either way -- each is inside its own file -- but the
+    # loose ones are what someone opens.
+    stem = os.path.splitext(os.path.basename(os.path.abspath(path)))[0]
     figdir = figdir or os.path.join(os.path.dirname(os.path.abspath(path)) or ".",
-                                    "column_figs")
+                                    "column_figs", stem)
     total = 0
     for tag in sorted(columns):
         if only and tag not in set(only):

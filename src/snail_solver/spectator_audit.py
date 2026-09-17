@@ -436,10 +436,27 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
     spec_indices = list(spec_indices)
     info = mode_tags(cpl, spec_indices)
     # expand_terms carries the HARMONIC carrier only: the transmon anharmonicity is a
-    # separate static diagonal operator. A transition i->f therefore sits at
-    #     Omega_total = Omega + (E_anh[f] - E_anh[i]),
-    # which is what shifts every |2>-involving channel by the anharmonicity (e.g.
-    # |11> -> |02> is resonant in the harmonic expansion but really detuned by alpha).
+    # separate static diagonal operator, so it has to be folded in by hand here.
+    #
+    # SIGN, because it was wrong until 2026-09-17 and the error was a factor of 3 on a
+    # real channel. `Omega` is (pump) MINUS (harmonic transition): a two-pump drive on
+    # qubit a reports Omega = 2 w_p - w_a, verified against stored audits. A detuning
+    # is therefore (pump) - (FULL transition), and the full transition is the harmonic
+    # one PLUS the anharmonic energy difference, so that difference is SUBTRACTED:
+    #
+    #     det = Omega - (E_anh[f] - E_anh[i])
+    #
+    # Adding it instead placed the two-pump a |1>->|2> resonance at delta = -alpha/2
+    # rather than +alpha/2 -- mirrored about the subharmonic. Concretely, at
+    # delta = -120 MHz it reported that channel 360 MHz off resonance (ratio 0.120,
+    # "DRAG effective", selected as mandatory) when it is 120 MHz off (ratio 0.359,
+    # past max_ratio, i.e. too strong to correct).
+    #
+    # The check that settles it needs no code: E(n) = n w_a + alpha n(n-1)/2, so the
+    # |1>->|2> transition sits at w_a + alpha and two pumps are resonant with it when
+    # 2 (w_a/2 + delta) = w_a + alpha, i.e. at delta = alpha/2. For |11> -> |02>,
+    # resonant in the harmonic expansion, the true detuning from a gate-resonant pump
+    # is -alpha, not +alpha.
     E_anh = np.real(np.diag(np.asarray(cpl._anharm_op)))
 
     starts = []
@@ -461,7 +478,7 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                 if f == i:
                     continue                                    # diagonal -> Stark shift
                 of = cpl.decode_index(f)
-                det = (Omega + (E_anh[f] - E_anh[i])) / TWO_PI   # signed GHz, anharm-shifted
+                det = (Omega - (E_anh[f] - E_anh[i])) / TWO_PI   # signed GHz, anharm-shifted
                 if abs(det) > window_GHz:
                     continue
                 g = abs(col[f]) * scale / TWO_PI                 # GHz
@@ -487,6 +504,12 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                 spec_id = (spec_indices.index(victim) + 1
                            if victim is not None and victim in spec_indices else 0)
                 rec = dict(g_MHz=g * 1e3, detuning_MHz=det * 1e3, n_pump=n_pump,
+                           # The Fock indices this process connects. Recorded because
+                           # `transition`/`process` are DISPLAY strings, and pairing a
+                           # channel back to its (i, f) is what any level-resolved
+                           # quantity needs -- the AC-Stark shift of the channel's own
+                           # levels above all (see `stark_scales`).
+                           i_index=int(i), f_index=int(f),
                            category=cat, transition=_label(cpl, i, f, n_pump, info),
                            name=_process_name(cpl, i, f, n_pump, info,
                                               is_target=(cat == "target")),
@@ -512,6 +535,115 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
     # target first, then strongest parasites by pre-DRAG excitation amplitude
     out.sort(key=lambda r: (r["category"] != "target",
                             -(r["g_MHz"] / max(abs(r["detuning_MHz"]), 1e-6))))
+    return out
+
+
+def level_stark_shifts(cpl, eta: float, window_GHz: float = 2.0) -> np.ndarray:
+    r"""Second-order AC-Stark shift of EVERY level, in GHz, at peak drive `eta`.
+
+    :func:`interaction_channels` keeps only the OFF-diagonal matrix elements (they are
+    the couplings `g`) and skips the diagonal with the comment "diagonal -> Stark
+    shift". This is the piece it skips, computed the standard way: every level is
+    pushed by the couplings that leave it,
+
+        dE_i = - sum_{k != i} |g_ik|^2 / Delta_ik ,   Delta_ik = Omega + E_k - E_i
+
+    summed over pump sidebands, with each coupling scaled by ``eta**n_pump`` because a
+    process carrying `n` pump quanta is `n`-th order in the drive.
+
+    This is what makes a channel's detuning DRIVE-DEPENDENT. It is second order in
+    `eta`, i.e. the same `eta^2` leading order as the target transition's measured
+    Stark law -- which is why :func:`stark_scales` can express it as a MULTIPLE of the
+    chirp rather than as an independent curve.
+
+    Parameters
+    ----------
+    cpl : ZhouCoupler
+        Built coupler, as :func:`interaction_channels` uses.
+    eta : float
+        Peak drive.
+    window_GHz : float, default 2.0
+        Sideband cutoff, matching the audit's own enumeration window.
+
+    Returns
+    -------
+    ndarray
+        Shift per Fock index, in GHz.
+    """
+    E_anh = np.real(np.diag(np.asarray(cpl._anharm_op)))
+    n = len(E_anh)
+    dE = np.zeros(n, dtype=float)
+    for Omega, pump_sig, O in cpl.expand_terms(cutoff_GHz=float(window_GHz) + 0.5):
+        Oa = np.asarray(O) * (float(eta) ** len(pump_sig))
+        for i in range(n):
+            col = Oa[:, i]
+            for k in np.nonzero(np.abs(col) > 1e-12)[0]:
+                if k == i:
+                    continue
+                det = Omega + (E_anh[k] - E_anh[i])          # rad/ns
+                if abs(det) < 1e-9:
+                    continue                                  # resonant: not a shift
+                dE[i] -= (abs(col[k]) ** 2) / det
+    return dE / TWO_PI                                        # GHz
+
+
+def stark_scales(config: Dict[str, Any], t_g_ns: float, rows: Sequence[Dict[str, Any]],
+                 *, k2_MHz: float, k4_MHz: float = 0.0, eta: float = 1.0,
+                 amp_scale: float = 1.0, wp_offset_GHz: float = 0.0,
+                 window_GHz: float = 2.0) -> Dict[int, float]:
+    r"""``kappa`` per channel: its Stark shift as a MULTIPLE of the chirp.
+
+    The chirp IS the target transition's measured Stark curve --
+    ``tune_up.chirp_from_measured_shift`` builds it as ``k2 |eta(t)|^2 + k4
+    |eta(t)|^4``. Every other transition shifts at the same leading order in the same
+    envelope, so to lowest order its shift is PROPORTIONAL to the chirp::
+
+        dDelta_j(t) ~ kappa_j * delta_chirp(t),
+        kappa_j = [dE(f) - dE(i)] / [k2 eta^2 + k4 eta^4]
+
+    That proportionality is the whole point: a channel's detuning can then be tracked
+    in time for free, by reusing the chirp the pulse already carries, instead of
+    integrating a second curve (:attr:`envelope.DragChannel.stark_scale`).
+
+    It is a LEADING-ORDER model. The numerator is second order in `eta` while the
+    denominator carries the measured quartic, so `kappa` drifts with drive; measured
+    against a wide chevron survey it held to ~30% over ``eta = 0.6..1.0``, which is
+    what matters against channel detunings of 100-200 MHz.
+
+    Parameters
+    ----------
+    config : dict
+        Merged device configuration.
+    t_g_ns : float
+        Gate length, for building the coupler.
+    rows : sequence of dict
+        Audit rows from :func:`interaction_channels`, carrying ``i_index``/``f_index``.
+    k2_MHz, k4_MHz : float
+        The MEASURED target Stark law -- the same coefficients the chirp is built
+        from, so that `kappa` is a ratio against the curve actually being played.
+    eta : float, default 1.0
+        Drive at which to evaluate both shift and reference.
+
+    Returns
+    -------
+    dict
+        ``{_audit_beat_key(beat): kappa}``, keyed so a channel can look itself up.
+    """
+    from snail_solver.device_utils import build_coupler
+    cpl, _w_p, _eta_pk = build_coupler(config, float(t_g_ns), float(amp_scale),
+                                       float(wp_offset_GHz), None, None,
+                                       chirp_coeffs_GHz=[])
+    dE = level_stark_shifts(cpl, float(eta), window_GHz=window_GHz)
+    ref_MHz = float(k2_MHz) * eta ** 2 + float(k4_MHz) * eta ** 4
+    if not np.isfinite(ref_MHz) or abs(ref_MHz) < 1e-12:
+        raise ValueError("stark_scales needs a non-zero measured target law")
+    out: Dict[int, float] = {}
+    for r in rows:
+        i, f = r.get("i_index"), r.get("f_index")
+        if i is None or f is None:
+            continue
+        d_MHz = (dE[int(f)] - dE[int(i)]) * 1e3
+        out[_audit_beat_key(float(r["detuning_MHz"]) / 1e3)] = float(d_MHz / ref_MHz)
     return out
 
 
