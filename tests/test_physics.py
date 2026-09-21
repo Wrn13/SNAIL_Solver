@@ -6457,5 +6457,90 @@ class TestTheAnharmonicShiftHasTheRightSign(unittest.TestCase):
         self.assertAlmostEqual(hits[0]["detuning_MHz"], -self.ALPHA * 1e3, places=6)
 
 
+class TestShardingSplitsTheGridExactly(unittest.TestCase):
+    """`--shard I/N` lets one grid run across several machines.
+
+    Two properties make it safe to point N machines at the same grid: the shards are
+    DISJOINT (so the per-column caches never race, even on a shared filesystem) and
+    they COVER the grid exactly (so a merged analysis is not silently missing
+    columns). The analysis pass keys rows on ``(delta, target_eta)``, which stays
+    unique across shards precisely because of disjointness.
+    """
+
+    def _cols(self, n=47):
+        return [{"w_p_GHz": 1.6 + 0.01 * i, "target_eta": 1.3} for i in range(n)]
+
+    def test_shards_are_disjoint_and_cover_the_grid(self):
+        from snail_solver.subharmonic_gate_scan import shard_columns
+        for n in (1, 2, 3, 4, 8, 13):
+            with self.subTest(n_shards=n):
+                cols = self._cols()
+                parts = [shard_columns(cols, i, n) for i in range(n)]
+                flat = [c for p in parts for c in p]
+                self.assertEqual(len(flat), len(cols))          # covers
+                ids = [id(c) for c in flat]
+                self.assertEqual(len(set(ids)), len(ids))       # disjoint
+                self.assertEqual(sorted(c["w_p_GHz"] for c in flat),
+                                 sorted(c["w_p_GHz"] for c in cols))
+
+    def test_the_split_is_strided_not_blocked(self):
+        """Cost varies hugely along the axis -- a column near a collision is refused
+        in milliseconds, one at the window edge solves for 40 minutes. Contiguous
+        blocks would leave one machine hours behind; a stride interleaves cheap and
+        expensive columns into every shard."""
+        from snail_solver.subharmonic_gate_scan import shard_columns
+        cols = self._cols(12)
+        first = shard_columns(cols, 0, 4)
+        self.assertEqual([c["w_p_GHz"] for c in first],
+                         [cols[i]["w_p_GHz"] for i in (0, 4, 8)])
+        # A blocked split would have handed shard 0 columns 0,1,2.
+        self.assertNotEqual([c["w_p_GHz"] for c in first],
+                            [cols[i]["w_p_GHz"] for i in (0, 1, 2)])
+
+    def test_shard_sizes_differ_by_at_most_one(self):
+        from snail_solver.subharmonic_gate_scan import shard_columns
+        sizes = [len(shard_columns(self._cols(47), i, 6)) for i in range(6)]
+        self.assertLessEqual(max(sizes) - min(sizes), 1)
+
+    def test_a_bad_shard_spec_raises_rather_than_silently_dropping_work(self):
+        """The failure that matters: an out-of-range shard returning [] would run a
+        machine to completion having solved nothing, and look like success."""
+        from snail_solver.subharmonic_gate_scan import shard_columns
+        for bad in ((0, 0), (-1, 4), (4, 4), (5, 4)):
+            with self.subTest(spec=bad):
+                with self.assertRaises(ValueError):
+                    shard_columns(self._cols(), *bad)
+
+    def test_one_shard_is_the_whole_grid(self):
+        from snail_solver.subharmonic_gate_scan import shard_columns
+        cols = self._cols()
+        self.assertEqual(len(shard_columns(cols, 0, 1)), len(cols))
+
+
+class TestProvenanceIdentifiesTheCode(unittest.TestCase):
+    """A stored command is not a reproducible result.
+
+    This repo's physics changed under a running grid three times -- a scoring
+    contract, a length-fit contract and an audit sign -- so a file that records the
+    command but not the commit cannot be tied to the behaviour that produced it.
+    """
+
+    def test_the_commit_is_recorded_and_marks_a_dirty_tree(self):
+        from snail_solver.tune_up import _run_attrs
+        a = _run_attrs()
+        self.assertIn("git_commit", a)
+        sha = a["git_commit"]
+        self.assertIsInstance(sha, str)
+        if sha:                       # empty outside a git checkout, which is fine
+            self.assertRegex(sha, r"^[0-9a-f]{7,40}(-dirty)?$")
+
+    def test_provenance_never_raises(self):
+        """It runs on every save; a git failure must not lose a grid."""
+        from unittest import mock
+        from snail_solver import tune_up
+        with mock.patch("subprocess.run", side_effect=OSError("no git")):
+            self.assertEqual(tune_up._git_describe(), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

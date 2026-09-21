@@ -99,6 +99,7 @@ document it read -- including one group of a sweep file. Get them back out with:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -2870,6 +2871,23 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
 # ===========================================================================
 # CLI
 # ===========================================================================
+def _git_describe() -> str:
+    """``<sha>`` or ``<sha>-dirty`` for the repo this module lives in, else ""."""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        sha = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        if sha.returncode != 0:
+            return ""
+        out = sha.stdout.strip()
+        st = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=5)
+        return out + ("-dirty" if st.stdout.strip() else "")
+    except Exception:                      # provenance must never fail a run
+        return ""
+
+
 def _run_attrs(device_path: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
     """Provenance for the root of an ``--out`` file.
 
@@ -2888,7 +2906,13 @@ def _run_attrs(device_path: Optional[str] = None, **extra: Any) -> Dict[str, Any
     # anyone can paste back; the module spelling is the one the docs and the SLURM
     # scripts use, so rebuild it rather than record something unrunnable.
     argv = " ".join(shlex.quote(a) for a in sys.argv[1:])
+    # The command alone does not identify the RESULT: this repo's physics changed
+    # under a running grid more than once (a scoring contract, a length-fit
+    # contract, an audit sign). Without the commit a stored file is plausible
+    # rather than reproducible, so record it -- and record whether the tree was
+    # dirty, since "fa63b2f" plus uncommitted edits is not fa63b2f.
     return {"tool": "snail_solver.tune_up",
+            "git_commit": _git_describe(),
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "command": f"python -m snail_solver.tune_up {argv}".strip(),
             "device_path": str(device_path) if device_path else "",

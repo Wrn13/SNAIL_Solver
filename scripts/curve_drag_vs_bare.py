@@ -22,6 +22,7 @@ show where the drive ceiling bit rather than interpolate across it.
 Usage:  curve_drag_vs_bare.py SCAN.h5[,SCAN2.h5...] OUT.json [WORKERS]
 """
 import json
+import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -82,6 +83,22 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     from snail_solver.subharmonic_gate_scan import coherence_penalty, total_infidelity
 
+    # Reuse anything already scored: this pass costs minutes per solve, and widening
+    # the eta set should not re-pay for the eta already done. A cached trace is keyed
+    # on (delta, eta, variant) and only reused when it is actually populated.
+    cached = {}
+    if os.path.exists(OUT):
+        try:
+            for r in json.load(open(OUT)):
+                k = f"{r['delta_GHz']:+.4f}|{r['target_eta']:.2f}"
+                for v, t in (r.get("traces") or {}).items():
+                    if t is not None:
+                        cached[(k, v)] = t
+            print(f"reusing {len(cached)} already-scored traces from {OUT}",
+                  flush=True)
+        except Exception as exc:                       # a corrupt cache is not fatal
+            print(f"(ignoring unreadable {OUT}: {exc})", flush=True)
+
     jobs, meta, skipped = [], {}, []
     for src in SRC_LIST:
         rows, dev, settings = _scan_of(src)
@@ -107,12 +124,15 @@ if __name__ == "__main__":
                 skipped.append(key)
                 continue
             for v in VARIANTS:
+                if (key, v[0]) in cached:
+                    continue
                 jobs.append({"key": key, "row": r, "device": dev, "variant": v,
                              "tg_points": tgp, "tg_lo": tlo, "tg_hi": thi})
 
-    print(f"{len(meta)} column(s): {len(meta) - len(skipped)} to score x "
-          f"{len(VARIANTS)} variants = {len(jobs)} solves, {WORKERS} workers "
-          f"({len(skipped)} uncalibrated, carried as ok=false)", flush=True)
+    print(f"{len(meta)} column(s): {len(meta) - len(skipped)} calibrated x "
+          f"{len(VARIANTS)} variants; {len(jobs)} solves to run on {WORKERS} workers "
+          f"({len(cached)} reused, {len(skipped)} uncalibrated -> ok=false)",
+          flush=True)
 
     res, done = {}, 0
     with ProcessPoolExecutor(max_workers=WORKERS) as ex:
@@ -128,7 +148,7 @@ if __name__ == "__main__":
         row = dict(m)
         row["traces"] = {}
         for name, *_ in VARIANTS:
-            s = (res.get(k) or {}).get(name)
+            s = (res.get(k) or {}).get(name) or cached.get((k, name))
             if s is None:
                 row["traces"][name] = None
                 continue

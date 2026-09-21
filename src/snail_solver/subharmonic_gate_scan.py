@@ -178,6 +178,30 @@ def channel_labels(chans, audit: Dict[str, Any]) -> list:
     return out
 
 
+def shard_columns(cols: Sequence[Dict[str, Any]], shard: int,
+                  n_shards: int) -> list:
+    """Every ``n_shards``-th column starting at `shard` -- one machine's share.
+
+    STRIDED, not blocked, and that is the point: cost varies enormously along the
+    axis (a column near a collision is refused in milliseconds, one at the edge of
+    the window solves for 40 minutes), so contiguous blocks would leave one machine
+    running hours after the others finished. A stride interleaves cheap and
+    expensive columns into every shard.
+
+    Shards are disjoint and cover the grid exactly, so the per-column caches never
+    race even on a shared filesystem, and the resulting HDF5 files concatenate: the
+    analysis pass keys rows on ``(delta, target_eta)``, which is unique across
+    shards.
+    """
+    n = int(n_shards)
+    i = int(shard)
+    if n < 1:
+        raise ValueError(f"n_shards must be >= 1, got {n}")
+    if not 0 <= i < n:
+        raise ValueError(f"shard must be in [0, {n}), got {i}")
+    return list(cols)[i::n]
+
+
 def scan_config(config: Dict[str, Any], *, max_drag_channels: int) -> Dict[str, Any]:
     """The grid-wide base config: a sine_power envelope with enough vanishing edges.
 
@@ -672,6 +696,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 drop_origin: bool = True, column_figures: bool = True,
                 ridge_grid: bool = False,
+                shard: int = 0, n_shards: int = 1,
                 outdir: Optional[str] = None, sweep_path: Optional[str] = None,
                 overwrite: bool = False, force: bool = False,
                 jobs: int = 0, solver: Optional[Dict[str, Any]] = None,
@@ -742,6 +767,9 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "leak_max": (None if leak_max is None else float(leak_max)),
         "map_kw": ({} if leak_max is None else {"leak_max": float(leak_max)}),
         "drop_origin": bool(drop_origin), "envelope": base["envelope"],
+        # A sharded file holds PART of the grid; say which part, or a merged
+        # analysis cannot tell an incomplete run from a complete one.
+        "shard": int(shard), "n_shards": int(n_shards),
         "drag_retries": int(drag_retries),
         "t1_us": (None if t1_us is None else float(t1_us)),
         "t2_us": (None if t2_us is None else float(t2_us)),
@@ -758,6 +786,10 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
     # eta slices comparable rather than a ragged edge.
     base_cols = columns_for(base, offsets_GHz, drop_origin=drop_origin)
     cols = [{**c, "target_eta": e} for c in base_cols for e in etas]
+    n_all = len(cols)
+    cols = shard_columns(cols, shard, n_shards)
+    if int(n_shards) > 1:
+        log.info(f"shard {int(shard)}/{int(n_shards)}: {len(cols)} of {n_all} columns")
     landmarks = collision_landmarks(base, branch=branch)
 
     cache_dir = os.path.join(outdir, "columns") if outdir else None
@@ -1505,6 +1537,16 @@ def main() -> None:
                     help="do not store each column's chevron/ridge figures in the "
                          "scan file. They are on by default: the chevrons are the "
                          "column's whole cost and the only way to read a failed one")
+    ap.add_argument("--shard", metavar="I/N", default=None,
+                    help="run only this machine's share of the grid, e.g. --shard "
+                         "0/4. Columns are taken with a STRIDE (every N-th), not in "
+                         "blocks: cost varies hugely along the axis, so contiguous "
+                         "blocks would leave one machine hours behind. Shards are "
+                         "disjoint and cover the grid exactly, so the per-column "
+                         "caches cannot race and the HDF5 files concatenate (the "
+                         "analysis keys rows on (delta, eta)). Give each shard its "
+                         "own --out, and its own --outdir unless the machines share "
+                         "a filesystem.")
     ap.add_argument("--overwrite", action="store_true",
                     help="ignore cached columns and re-solve")
     ap.add_argument("--dry-run", action="store_true",
@@ -1576,6 +1618,16 @@ def main() -> None:
         print(f"note: --amp-points {args.amp_points} leaves no margin -- the shift-curve "
               f"fit needs 4 usable rows and drops them for contrast/leakage.")
 
+    _shard, _n_shards = 0, 1
+    if args.shard:
+        try:
+            _a, _b = str(args.shard).split("/")
+            _shard, _n_shards = int(_a), int(_b)
+        except Exception:
+            ap.error(f"--shard wants I/N (e.g. 0/4), got {args.shard!r}")
+        if not (_n_shards >= 1 and 0 <= _shard < _n_shards):
+            ap.error(f"--shard {args.shard}: need 0 <= I < N and N >= 1")
+
     if args.dry_run:
         text = describe_grid(config, offsets, target_etas, branch=args.branch,
                              coupler_levels=args.coupler_levels,
@@ -1590,6 +1642,14 @@ def main() -> None:
         # --no-audit it returns the geometry instead, which still has to be shown.
         if text:
             print(text)
+        if _n_shards > 1:
+            _n_cols = len(columns_for(config, offsets,
+                                      drop_origin=not args.keep_origin))
+            _mine = len(shard_columns(
+                [(c, e) for c in range(_n_cols) for e in target_etas],
+                _shard, _n_shards))
+            print(f"  shard       {_shard}/{_n_shards} would solve {_mine} of "
+                  f"{_n_cols * len(target_etas)} columns (strided)")
         return
 
     stem = os.path.splitext(os.path.basename(device_path))[0]
@@ -1623,6 +1683,7 @@ def main() -> None:
         moment_weighting=args.moment_weighting,
         column_figures=not args.no_column_figures,
         ridge_grid=args.ridge_grid,
+        shard=_shard, n_shards=_n_shards,
         column_workers=args.column_workers,
         t1_us=args.t1_us, t2_us=args.t2_us,
         decoh_prefactor=args.decoh_prefactor,
@@ -1659,6 +1720,17 @@ def main() -> None:
     if args.open_system is not None:
         if args.t1_us is None:
             ap.error("--open-system needs --t1-us (and usually --t2-us)")
+        # Save FIRST. The rescore is a handful of mesolve runs on the full
+        # Liouvillian and has twice taken longer than the entire scan that produced
+        # it -- once for 2 days -- and because save_doc ran after it, both of those
+        # runs lost their /scan group entirely and had to be rebuilt from the column
+        # caches by hand. The rescore only ADDS an `open_system` block, so writing
+        # now and rewriting after costs one file write and makes the summary
+        # unlosable.
+        if out_path:
+            pre = save_doc(out_path, doc, attrs=attrs,
+                           group=("scan" if holds_runs else None))
+            print(f"  written {pre} (before the open-system rescore)")
         doc = rescore_open_system(doc, t1_us=args.t1_us, t2_us=args.t2_us,
                                   coupler_t1_us=args.coupler_t1_us,
                                   top=args.open_system,
