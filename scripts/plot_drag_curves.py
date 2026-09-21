@@ -20,6 +20,12 @@ import numpy as np
 
 CURVES, OUTDIR = sys.argv[1], sys.argv[2]
 DEVICE = sys.argv[3] if len(sys.argv) > 3 else "devices/6Gate4.7SNAIL.json"
+# Optional 4th arg: a curves.json from a run calibrated with --max-drag-channels 0.
+# That is the HONEST no-DRAG baseline. The `bare` trace of a DRAG run is not one:
+# its length and carrier come from a chirp<->DRAG fixed point that assumed the
+# correction would be played, so it is a DRAG-aware calibration with the correction
+# switched off at scoring time, not a pulse designed without DRAG.
+BASELINE = sys.argv[4] if len(sys.argv) > 4 else None
 
 # name -> (colour, linestyle, marker, filled, label). Categorical slots 1 and 2 of the
 # validated default palette, in fixed order; style and fill duplicate the encoding so
@@ -27,6 +33,13 @@ DEVICE = sys.argv[3] if len(sys.argv) > 3 else "devices/6Gate4.7SNAIL.json"
 STYLE = {
     "bare":       ("#eb6834", "--", "s", False, "no chirp, no DRAG"),
     "chirp+DRAG": ("#2a78d6", "-",  "o", True,  "chirp + DRAG"),
+}
+# Series pulled from the independently calibrated baseline file, if one is given.
+# Its "chirp+DRAG" variant carries ZERO channels by construction, so it is a
+# chirp-only pulse whose chirp was derived without the DRAG fixed point.
+BASE_STYLE = {
+    "chirp+DRAG": ("#1baf7a", "-", "^", True,
+                   "chirp only, calibrated without DRAG"),
 }
 INK, MUTED, GRID = "#1a1a19", "#5c5b55", "#d8d7d0"
 
@@ -90,6 +103,21 @@ def _trend(d, y, sigma=20.0, gap=60.0):
     return m, s, segments
 
 
+def load_baseline(path):
+    """{(delta_rounded, eta): row} from an independently calibrated no-DRAG run."""
+    if not path:
+        return {}
+    try:
+        return {(round(r["delta_GHz"] * 1e3), round(float(r["target_eta"]), 3)): r
+                for r in json.load(open(path))}
+    except Exception as exc:
+        print(f"(ignoring baseline {path}: {exc})")
+        return {}
+
+
+BASE_ROWS = load_baseline(BASELINE)
+
+
 def figure_for(eta, rows, outdir):
     """One eta, one panel: grouped bars, bare against chirp+DRAG.
 
@@ -101,7 +129,6 @@ def figure_for(eta, rows, outdir):
     rows = sorted(rows, key=lambda r: r["delta_GHz"])
     x = np.arange(len(rows), dtype=float)
     d = np.array([r["delta_GHz"] * 1e3 for r in rows])
-    w = 0.38
 
     fig, ax = plt.subplots(figsize=(max(11.0, 0.26 * len(rows) + 4.0), 6.2))
     ax.grid(axis="y", which="major", color=GRID, lw=0.6, alpha=0.9)
@@ -125,18 +152,32 @@ def figure_for(eta, rows, outdir):
             seen_stages[st] = col
             ax.axvspan(i - 0.5, i + 0.5, color=col, alpha=0.13, lw=0, zorder=0)
 
+    # Series to draw: the run's own two, plus the independent baseline if given.
+    series = [(n, s, None) for n, s in STYLE.items()]
+    if BASE_ROWS:
+        series += [(n, s, "baseline") for n, s in BASE_STYLE.items()]
+    nser = len(series)
+    w = 0.86 / nser
     trend = {}
-    for k, (name, (col, _ls, _mk, filled, lab)) in enumerate(STYLE.items()):
-        y = np.array([(1.0 - t["F_avg"])
-                      if (t := (r.get("traces") or {}).get(name)) else np.nan
-                      for r in rows])
-        ax.bar(x + (k - 0.5) * w, y, w, label=lab, color=col,
+    for k, (name, (col, _ls, _mk, filled, lab), src_tag) in enumerate(series):
+        if src_tag == "baseline":
+            y = np.array([
+                (1.0 - t["F_avg"])
+                if (br := BASE_ROWS.get((round(r["delta_GHz"] * 1e3),
+                                         round(float(r["target_eta"]), 3))))
+                and (t := (br.get("traces") or {}).get(name)) else np.nan
+                for r in rows])
+        else:
+            y = np.array([(1.0 - t["F_avg"])
+                          if (t := (r.get("traces") or {}).get(name)) else np.nan
+                          for r in rows])
+        ax.bar(x + (k - (nser - 1) / 2.0) * w, y, w, label=lab, color=col,
                edgecolor=col, linewidth=0.8,
                alpha=1.0 if filled else 0.45, zorder=3)
         ok = np.isfinite(y)
         if ok.sum() >= 4:
             lm, _sd, segs = _trend(d[ok], np.log10(y[ok]))
-            trend[name] = (x[ok], lm, segs, col, lab)
+            trend[(name, src_tag)] = (x[ok], lm, segs, col, lab)
 
     # The band is the PAIRED scatter, not each trace's own.
     #
@@ -146,36 +187,40 @@ def figure_for(eta, rows, outdir):
     # not: the paired scatter is 11-27x narrower, and the best columns sit 2.9-7.0
     # paired sd above unity. The shaded wedge between the trends IS the improvement,
     # and the hairline band around it is how well that improvement is determined.
-    both = [n for n in ("bare", "chirp+DRAG") if n in trend]
-    if len(both) == 2:
-        # One mask for everything: a column counts only if BOTH traces scored. Two
-        # separately-built masks would misalign silently the first time a row carried
-        # one trace and not the other.
-        pair_ok = np.array([
-            bool((r.get("traces") or {}).get("bare")
-                 and (r.get("traces") or {}).get("chirp+DRAG")) for r in rows])
-        if pair_ok.sum() >= 4:
-            ratio = np.array([
-                (1.0 - r["traces"]["bare"]["F_avg"])
-                / (1.0 - r["traces"]["chirp+DRAG"]["F_avg"])
-                for r in np.asarray(rows, dtype=object)[pair_ok]])
-            _pm, psd, segs_p = _trend(d[pair_ok], np.log10(ratio))
-            xb, lb, _s1, _c1, _l1 = trend["bare"]
-            xg, lg, _s2, gcol, _l2 = trend["chirp+DRAG"]
-            if xb.size == psd.size and xg.size == psd.size:
+    # The wedge measures what DRAG buys over the BEST pulse available without it.
+    # With an independent baseline that is the chirp-only run calibrated with
+    # --max-drag-channels 0; without one it falls back to this run's bare trace,
+    # which is a weaker claim (that pulse's length and carrier came from a
+    # DRAG-aware fixed point).
+    ref_key = (("chirp+DRAG", "baseline") if ("chirp+DRAG", "baseline") in trend
+               else ("bare", None))
+    ref_lab = ("DRAG gain over an independent no-DRAG calibration"
+               if ref_key[1] == "baseline" else "improvement")
+    if ref_key in trend and ("chirp+DRAG", None) in trend:
+        xr, lr, segs, _cr, _lr = trend[ref_key]
+        xg, lg, _s2, gcol, _l2 = trend[("chirp+DRAG", None)]
+        if xr.size == xg.size and np.allclose(xr, xg):
+            # Paired scatter: both traces are scored at the same operating point, so
+            # their common calibration wander cancels and the band is 11-27x narrower
+            # than either trace's own.
+            pair_ok = np.array([
+                bool((r.get("traces") or {}).get("bare")
+                     and (r.get("traces") or {}).get("chirp+DRAG")) for r in rows])
+            if pair_ok.sum() == xr.size:
+                ratio = 10.0 ** (lr - lg)
+                _pm, psd, segs_p = _trend(d[pair_ok], np.log10(ratio))
                 for seg in segs_p:
                     if seg.size < 2:
                         continue
-                    ax.fill_between(xb[seg], 10.0 ** lg[seg], 10.0 ** lb[seg],
+                    ax.fill_between(xr[seg], 10.0 ** lg[seg], 10.0 ** lr[seg],
                                     color="#1baf7a", alpha=0.22, lw=0, zorder=2,
-                                    label=("improvement"
-                                           if seg is segs_p[0] else None))
-                    ax.fill_between(xb[seg], 10.0 ** (lg[seg] - psd[seg]),
+                                    label=(ref_lab if seg is segs_p[0] else None))
+                    ax.fill_between(xr[seg], 10.0 ** (lg[seg] - psd[seg]),
                                     10.0 ** (lg[seg] + psd[seg]), color=gcol,
                                     alpha=0.35, lw=0, zorder=4)
 
-    for name in both:
-        xi, lm, segs, col, lab = trend[name]
+    for key in trend:
+        xi, lm, segs, col, lab = trend[key]
         for seg in segs:
             if seg.size < 2:
                 continue

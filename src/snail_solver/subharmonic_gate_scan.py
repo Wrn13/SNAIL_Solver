@@ -202,7 +202,8 @@ def shard_columns(cols: Sequence[Dict[str, Any]], shard: int,
     return list(cols)[i::n]
 
 
-def scan_config(config: Dict[str, Any], *, max_drag_channels: int) -> Dict[str, Any]:
+def scan_config(config: Dict[str, Any], *, max_drag_channels: int,
+                envelope_m: Optional[int] = None) -> Dict[str, Any]:
     """The grid-wide base config: a sine_power envelope with enough vanishing edges.
 
     A raised cosine has ``eps''(0) != 0`` and supports exactly ONE derivative
@@ -214,7 +215,15 @@ def scan_config(config: Dict[str, Any], *, max_drag_channels: int) -> Dict[str, 
     one number for the whole grid: ``area_factor`` -- and hence ``t_g`` at fixed peak
     ``|eta|`` -- must not drift column to column, or the fidelities are not comparable.
     """
-    m = max(int(max_drag_channels), 2)
+    # `envelope_m` overrides the cap-derived value, which matters for exactly one
+    # comparison: an independently calibrated NO-DRAG baseline runs with
+    # max_drag_channels = 0, and the derived m would then be 2 against the DRAG run's
+    # 3. `area_factor` is 1 - rise_frac for any m, so t_g would agree -- but the SHAPE
+    # would not (11.6% of the gate within 1% of peak at m = 2 against 15.6% at m = 3),
+    # and a baseline that is a different pulse is not a baseline.
+    m = int(envelope_m) if envelope_m is not None else max(int(max_drag_channels), 2)
+    if m < 1:
+        raise ValueError(f"envelope_m must be >= 1, got {m}")
     return {**config, "envelope": "sine_power", "envelope_m": m}
 
 
@@ -697,6 +706,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 drop_origin: bool = True, column_figures: bool = True,
                 ridge_grid: bool = False,
                 shard: int = 0, n_shards: int = 1,
+                envelope_m: Optional[int] = None,
                 outdir: Optional[str] = None, sweep_path: Optional[str] = None,
                 overwrite: bool = False, force: bool = False,
                 jobs: int = 0, solver: Optional[Dict[str, Any]] = None,
@@ -734,7 +744,8 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                                                       nearest_landmark)
 
     log = logger or logging.getLogger("wp_scan")
-    base = scan_config(config, max_drag_channels=max_drag_channels)
+    base = scan_config(config, max_drag_channels=max_drag_channels,
+                       envelope_m=envelope_m)
     levels = int(coupler_levels if coupler_levels is not None
                  else base.get("coupler_levels", 7))
     etas = [float(e) for e in target_etas]
@@ -1201,7 +1212,8 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
                                                       nearest_landmark)
     from snail_solver.tune_up import nominal_t_g
 
-    base = scan_config(config, max_drag_channels=max_drag_channels)
+    base = scan_config(config, max_drag_channels=max_drag_channels,
+                       envelope_m=envelope_m)
     levels = int(coupler_levels if coupler_levels is not None
                  else base.get("coupler_levels", 7))
     tetas = [float(e) for e in target_etas]
@@ -1537,6 +1549,12 @@ def main() -> None:
                     help="do not store each column's chevron/ridge figures in the "
                          "scan file. They are on by default: the chevrons are the "
                          "column's whole cost and the only way to read a failed one")
+    ap.add_argument("--envelope-m", type=int, default=None,
+                    help="override the sine_power vanishing order, which otherwise "
+                         "comes from --max-drag-channels. Needed for an independently "
+                         "calibrated NO-DRAG baseline: --max-drag-channels 0 would "
+                         "derive m=2 against a DRAG run's m=3, and a baseline that is "
+                         "a different pulse shape is not a baseline.")
     ap.add_argument("--shard", metavar="I/N", default=None,
                     help="run only this machine's share of the grid, e.g. --shard "
                          "0/4. Columns are taken with a STRIDE (every N-th), not in "
@@ -1683,7 +1701,7 @@ def main() -> None:
         moment_weighting=args.moment_weighting,
         column_figures=not args.no_column_figures,
         ridge_grid=args.ridge_grid,
-        shard=_shard, n_shards=_n_shards,
+        shard=_shard, n_shards=_n_shards, envelope_m=args.envelope_m,
         column_workers=args.column_workers,
         t1_us=args.t1_us, t2_us=args.t2_us,
         decoh_prefactor=args.decoh_prefactor,
