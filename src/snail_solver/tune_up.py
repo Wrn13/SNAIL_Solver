@@ -827,6 +827,7 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                      leak_max: float = 0.35, stability_max: float = 0.3,
                      stability_cutoffs: Sequence[float] = (1.0, 0.9, 0.8, 0.7),
                      window_tg: float = 2.0, n_time: int = 161, jobs: int = 0,
+                     zero_chirp_frac: float = 0.0,
                      probe_shape: str = "constant",
                      moment_weighting: str = "rabi",
                      solver: Optional[Dict[str, Any]] = None,
@@ -1090,7 +1091,45 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     stability = shift_curve_stability(eta, ridge, weights=quality, target_eta=target_eta,
                                       cutoffs=stability_cutoffs)
     partial["stability"] = stability
-    if not (fit["r2"] >= r2_min):
+
+    # "No measurable shift" and "the fit is tracking the wrong thing" both fail r2,
+    # and they want opposite responses. r2 = 1 - SS_res/SS_tot is RELATIVE, so a
+    # column whose Stark shift is near zero fails it on a small denominator even
+    # with pristine chevrons: delta = -100 MHz on the 2026-09-17 grid had minimum
+    # contrast 0.874 and maximum leakage 0.001 -- the cleanest data in the set --
+    # and was rejected at r2 = 0.585 because the whole drive-dependent signal was
+    # 0.405 MHz.
+    #
+    # The discriminator is not the fit quality, it is whether a chirp would DO
+    # anything: the excursion |k2 eta^2 + k4 eta^4| against the resonance half-width
+    # 1/(2 t_g). Measured on that grid, delta = -130 sweeps 48% of a half-width and
+    # the chirp is worth 2.81x, so this must stay conservative -- at 36%
+    # (delta = +100) zeroing the chirp would give up something real. Columns at
+    # 10-15% are the recoverable ones.
+    #
+    # Off by default: it changes the pulse, and a default that quietly changes
+    # physics is how three separate contracts drifted under running grids here.
+    _exc = abs(fit["k2"] * target_eta ** 2 + fit["k4"] * target_eta ** 4)
+    _half_lw = 1e3 / (2.0 * float(partial.get("t_g_ref_ns") or nominal_t_g(
+        config, target_eta)))
+    _frac = _exc / _half_lw if _half_lw else float("inf")
+    fit["chirp_excursion_MHz"] = float(_exc)
+    fit["chirp_excursion_frac_linewidth"] = float(_frac)
+    fit["chirp_zeroed"] = False
+    if (not (fit["r2"] >= r2_min)) and zero_chirp_frac > 0.0 \
+            and _frac <= zero_chirp_frac:
+        fit["k2"], fit["k4"] = 0.0, 0.0
+        fit["chirp_zeroed"] = True
+        fit["stark_span_MHz"] = 0.0
+        if logger:
+            logger.info(
+                f"  rabi: r2 = {fit['r2']:.3f} < {r2_min}, but the chirp would sweep "
+                f"only {_exc:.3f} MHz = {_frac:.0%} of the {_half_lw:.2f} MHz "
+                f"half-linewidth (<= --zero-chirp-frac {zero_chirp_frac:g}). The "
+                f"shift is not measurable AND not worth chirping: proceeding with "
+                f"ZERO chirp. The static offset delta0 = {fit['delta0']:+.4f} MHz is "
+                f"unaffected and still calibrated.")
+    if not (fit["r2"] >= r2_min) and not fit["chirp_zeroed"]:
         raise RabiFitError(
             f"the ridge is not well described by delta0 + k2|eta|^2 + k4|eta|^4 "
             f"(r2 = {fit['r2']:.3f} < {r2_min}, residual {fit['resid_MHz']:.4f} MHz). "
@@ -1101,7 +1140,7 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     # a chirp built from it would be fitted noise dressed as physics. The STATIC part
     # is still trustworthy -- it is the bulk of the signal -- so this is a chirp
     # problem, not an offset problem.
-    if fit["stark_span_MHz"] <= fit["resid_MHz"]:
+    if fit["stark_span_MHz"] <= fit["resid_MHz"] and not fit["chirp_zeroed"]:
         raise RabiFitError(
             f"the DRIVE-DEPENDENT shift ({fit['stark_span_MHz']:.4f} MHz across "
             f"|eta| in [{eta[0]:.2f}, {eta[-1]:.2f}]) is smaller than the fit residual "
@@ -1169,12 +1208,21 @@ def parse_drag_channels(specs: Optional[Sequence[str]]) -> Optional[list]:
 
 
 def _shape_envelope(shape: str = "raised_cosine",
-                    shape_kw: Optional[Dict[str, Any]] = None):
-    """Unit-amplitude envelope on ``t_g = 2``, so ``t = u + 1`` maps [-1,1] -> [0,2].
+                    shape_kw: Optional[Dict[str, Any]] = None,
+                    t_g: float = 2.0):
+    """Unit-amplitude envelope on `t_g`, 2 by default so ``t = u + 1`` maps to [0,2].
 
     Used to read the pulse shape in NORMALIZED gate time. t_g = 2 is arbitrary and
     harmless precisely because every envelope here is t_g-independent in u -- the
     property the module docstring's "Why fix the amplitude" section depends on.
+
+    Pass the REAL gate length whenever the envelope's derivatives IN PHYSICAL TIME
+    are wanted, as recursive DRAG's do. ``SinePowerRamp`` carries its ramp as an
+    absolute ``t_rise`` and precomputes ``pi/t_rise`` and its normalization in
+    ``__init__``, so building at t_g = 2 and reassigning ``.t_g`` afterwards does
+    NOT rescale the shape: it leaves a 1 ns rise on a 100 ns gate, i.e. a nearly
+    square pulse whose derivatives are ~t_g/2 too large. `rise_frac` is a fraction
+    of the gate precisely so this call can stay t_g-agnostic.
     """
     from snail_solver.envelope import ENVELOPE_KINDS
     cls = ENVELOPE_KINDS.get(str(shape))
@@ -1182,11 +1230,12 @@ def _shape_envelope(shape: str = "raised_cosine",
         raise ValueError(f"unknown envelope shape {shape!r}; "
                          f"known: {sorted(ENVELOPE_KINDS)}")
     kw = dict(shape_kw or {})
+    t_g = float(t_g)
     if cls.__name__ == "SinePowerRamp":
-        # rise given as a FRACTION of the gate; t_g = 2 here
+        # rise given as a FRACTION of the gate
         kw = {"m": int(kw.get("m", 3)),
-              "t_rise": 2.0 * float(kw.get("rise_frac", 0.5))}
-    return cls(amp=1.0, t_g=2.0, **kw)
+              "t_rise": t_g * float(kw.get("rise_frac", 0.5))}
+    return cls(amp=1.0, t_g=t_g, **kw)
 
 
 def shape_config(config: Dict[str, Any]) -> tuple:
@@ -1448,8 +1497,12 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
         # because a first-order correction is purely imaginary. Recursive DRAG's
         # correction has a real part (-eta''/(Da Db)), so abs() is the general form
         # and the old expression is simply wrong beyond one channel.
-        env = _shape_envelope(shape, shape_kw)
-        env.amp, env.t_g = eta_star, t_g
+        # Built AT t_g, not rescaled to it: see `_shape_envelope`. Reassigning
+        # `.t_g` on a SinePowerRamp leaves t_rise, its angular rate and its
+        # normalization at the t_g = 2 values, so the fixed point would iterate on
+        # a near-square pulse while `amp` above carries the real shape.
+        env = _shape_envelope(shape, shape_kw, t_g)
+        env.amp = eta_star
         order = _drag.required_order(channels)
         shape = env.jet_at(t_g * (u + 1.0) / 2.0, order, np)
         min_abs = float("inf")
@@ -2562,6 +2615,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 contrast_min: float = 0.35,
                 chirp_tol_GHz: float = 1e-4, offset_tol_MHz: float = 0.2,
                 do_time_rabi: bool = True, jobs: int = 0,
+                zero_chirp_frac: float = 0.0,
+                chirp_free_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 post_chirp_points: int = 0,
                 solver: Optional[Dict[str, Any]] = None,
@@ -2614,10 +2669,50 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     # -- 1: the Rabi sweep, measured once ------------------------------------
     log.info(f"step 1: Rabi ({'SHAPED gate-pulse' if probe_shape != 'constant' else 'constant-probe'}"
              f" chevron per drive strength), DRAG OFF")
-    table = rabi_shift_table(config, target_eta, **common)
+    # A failed shift-law fit kills the chirp, not the gate. The bare pulse needs a
+    # length, an amplitude derived from it, and a carrier -- none of which require
+    # k2/k4. `delta0`, the STATIC part of the ridge, is measured fine even when the
+    # drive-dependent part is not (at delta = -100 MHz on the 2026-09-17 grid the
+    # chevrons had minimum contrast 0.874 and maximum leakage 0.001, and the column
+    # was still discarded), and step 3 then MEASURES the leftover offset on the
+    # assembled zero-chirp pulse rather than extrapolating it.
+    #
+    # This matters beyond recovering columns: the ones that fail are exactly the
+    # near-zero-shift ones, i.e. where a chirp has least to do, so excluding them
+    # biases any measurement of what chirping buys. On that grid the chirp's median
+    # benefit is 1.69x over the 26 columns that fitted and ~1.50x once the 9 that
+    # did not are included at ~1.0x.
+    chirp_free = False
+    try:
+        table = rabi_shift_table(config, target_eta, **common)
+    except RabiFitError as exc:
+        if not chirp_free_fallback:
+            raise
+        table = exc.table
+        chirp_free = True
+        log.info(f"step 1: no usable shift law ({exc}). Falling back to a CHIRP-FREE "
+                 f"calibration -- delta0 sets the carrier, step 3 measures the rest, "
+                 f"and the length scan never needed the law. The chirped variant is "
+                 f"NOT available at this column.")
 
     def project(t_g: float) -> Dict[str, Any]:
         """The chirp implied by the measured law at this gate length."""
+        if chirp_free:
+            # No law, so no chirp. delta0 is still the measured static carrier
+            # retune; everything downstream reads these same keys.
+            return {"coeffs_GHz": [], "chirp_free": True,
+                    "mean_shift_GHz": float((table.get("fit") or {}).get(
+                        "delta0", 0.0)) * 1e-3,
+                    # A zero chirp is trivially perturbative and extrapolates
+                    # nothing; these keys exist so every downstream reader works
+                    # unchanged rather than needing a chirp_free branch of its own.
+                    "quartic_fraction": 0.0, "rel_diff": 0.0,
+                    "perturbative_ok": True, "extrapolation_ratio": 1.0,
+                    "measured_eta_max": float(target_eta),
+                    "target_eta": float(target_eta), "degree": int(chirp_degree),
+                    "stark_mean_GHz": 0.0,
+                    "static_GHz": float((table.get("fit") or {}).get(
+                        "delta0", 0.0)) * 1e-3}
         return chirp_from_measured_shift(
             table, target_eta, degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
             drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
@@ -2847,6 +2942,10 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         # computed and already warned about in the log, and every consumer still
         # discarded it -- which is how 18 of 73 columns came to report a search-window
         # boundary as a calibrated gate length.
+        # The chirp was not measurable here; this gate carries none. Without this
+        # flag a chirp-free fallback is indistinguishable from a chirp that
+        # happened to fit to zero.
+        "chirp_free": bool(chirp_free),
         "t_g_railed": bool(length["railed"]),
         "t_g_over_t_g0": float(length.get("t_g_over_t_g0", t_g / t_g0)),
         "t_g_grid_span_t_g0": length.get("grid_span_t_g0"),

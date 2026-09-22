@@ -386,6 +386,9 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             # chirped pulse that played NO DRAG. A cached row from then must not be
             # served as if it were a DRAG-corrected one. Bump this if the scoring
             # contract changes again.
+            # Changes the pulse: a zeroed chirp is a different gate.
+            "zero_chirp_frac": float(settings.get("zero_chirp_frac", 0.0)),
+            "chirp_free_fallback": bool(settings.get("chirp_free_fallback", False)),
             "score_drag": 1,
             # Likewise for the LENGTH contract: columns solved before 2026-09-17 ran a
             # length_rabi that returned its search-window BOUNDARY when the optimum lay
@@ -501,6 +504,8 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             chirp_max_passes=settings.get("chirp_max_passes", 12),
             contrast_min=settings["contrast_min"],
             quartic_warn=settings["quartic_warn"],
+            zero_chirp_frac=float(settings.get("zero_chirp_frac", 0.0)),
+            chirp_free_fallback=bool(settings.get("chirp_free_fallback", False)),
             probe_shape=settings["probe_shape"],
             moment_weighting=settings["moment_weighting"],
             do_time_rabi=False, jobs=jobs, solver=solver, logger=logger,
@@ -702,6 +707,8 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 chirp_max_passes: int = 12,
                 contrast_min: float = 0.35, quartic_warn: float = 0.25,
                 leak_max: Optional[float] = None,
+                zero_chirp_frac: float = 0.0,
+                chirp_free_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 drop_origin: bool = True, column_figures: bool = True,
                 ridge_grid: bool = False,
@@ -769,6 +776,8 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         # chevron the shift fit needs, while the shaped pulse at the same peak leaks
         # 4e-3. Its rungs are deconvolved back to a pointwise law by the envelope
         # moments, so nothing downstream changes.
+        "zero_chirp_frac": float(zero_chirp_frac),
+        "chirp_free_fallback": bool(chirp_free_fallback),
         "probe_shape": str(probe_shape),
         "moment_weighting": str(moment_weighting),
         # A Rabi row is a CONSTANT-probe chevron, so at strong drive it leaks far more
@@ -1549,6 +1558,24 @@ def main() -> None:
                     help="do not store each column's chevron/ridge figures in the "
                          "scan file. They are on by default: the chevrons are the "
                          "column's whole cost and the only way to read a failed one")
+    ap.add_argument("--chirp-free-fallback", action="store_true",
+                    help="when the shift law cannot be fitted, calibrate a CHIRP-FREE "
+                         "gate instead of discarding the column: delta0 sets the "
+                         "carrier, step 3 measures the rest, and the length scan "
+                         "never needed the law. The columns that fail are the "
+                         "near-zero-shift ones -- exactly where a chirp has least to "
+                         "do -- so excluding them biases any measurement of what "
+                         "chirping buys (1.69x over the fitted columns vs ~1.50x "
+                         "including the rest).")
+    ap.add_argument("--zero-chirp-frac", type=float, default=0.0,
+                    help="when the shift-law fit fails r2 BUT the chirp would sweep "
+                         "less than this fraction of the resonance half-width "
+                         "1/(2 t_g), proceed with ZERO chirp instead of discarding "
+                         "the column. r2 is relative, so a column whose Stark shift "
+                         "is near zero fails it on a small denominator even with "
+                         "pristine chevrons. Keep it small: at 48%% of a half-width "
+                         "the chirp was measured to be worth 2.8x, so 0.15 is "
+                         "already generous. 0 disables.")
     ap.add_argument("--envelope-m", type=int, default=None,
                     help="override the sine_power vanishing order, which otherwise "
                          "comes from --max-drag-channels. Needed for an independently "
@@ -1702,6 +1729,8 @@ def main() -> None:
         column_figures=not args.no_column_figures,
         ridge_grid=args.ridge_grid,
         shard=_shard, n_shards=_n_shards, envelope_m=args.envelope_m,
+        zero_chirp_frac=args.zero_chirp_frac,
+        chirp_free_fallback=args.chirp_free_fallback,
         column_workers=args.column_workers,
         t1_us=args.t1_us, t2_us=args.t2_us,
         decoh_prefactor=args.decoh_prefactor,

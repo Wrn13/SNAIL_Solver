@@ -18,6 +18,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# --bars-only strips every overlay: the smoothed trend, the paired band and the
+# improvement wedge. Worth having as the default view now that the smoothing's
+# justification is gone -- it was added on the reading that the column-to-column
+# scatter was calibration noise, and replaying a fixed pulse across the axis
+# disproved that (the locally calibrated pulse wins everywhere, by 1.4-6x). The
+# structure is real physics, including a resonance that MOVES with drive, so a
+# 20 MHz kernel averages across genuine features rather than through noise.
+_argv = [a for a in sys.argv if a != "--bars-only"]
+BARS_ONLY = len(_argv) != len(sys.argv)
+sys.argv = _argv
+
 CURVES, OUTDIR = sys.argv[1], sys.argv[2]
 DEVICE = sys.argv[3] if len(sys.argv) > 3 else "devices/6Gate4.7SNAIL.json"
 # Optional 4th arg: a curves.json from a run calibrated with --max-drag-channels 0.
@@ -34,12 +45,15 @@ STYLE = {
     "bare":       ("#eb6834", "--", "s", False, "no chirp, no DRAG"),
     "chirp+DRAG": ("#2a78d6", "-",  "o", True,  "chirp + DRAG"),
 }
-# Series pulled from the independently calibrated baseline file, if one is given.
-# Its "chirp+DRAG" variant carries ZERO channels by construction, so it is a
-# chirp-only pulse whose chirp was derived without the DRAG fixed point.
+# With a baseline file, the BARE series is taken from it and this run's own bare is
+# dropped. They are not the same pulse: this run's bare takes its length and carrier
+# from a chirp<->DRAG fixed point that assumed the correction would be played, and
+# those partly compensate for the missing chirp -- at delta = -130 it reads 4.80e-3
+# against 1.155e-2 for an honestly calibrated bare pulse, a factor 2.4 too good.
+# Using the flattering one understates the correction's benefit by the same factor.
 BASE_STYLE = {
-    "chirp+DRAG": ("#1baf7a", "-", "^", True,
-                   "chirp only, calibrated without DRAG"),
+    "bare": ("#eb6834", "--", "s", False,
+             "no chirp, no DRAG (independently calibrated)"),
 }
 INK, MUTED, GRID = "#1a1a19", "#5c5b55", "#d8d7d0"
 
@@ -153,9 +167,12 @@ def figure_for(eta, rows, outdir):
             ax.axvspan(i - 0.5, i + 0.5, color=col, alpha=0.13, lw=0, zorder=0)
 
     # Series to draw: the run's own two, plus the independent baseline if given.
-    series = [(n, s, None) for n, s in STYLE.items()]
     if BASE_ROWS:
-        series += [(n, s, "baseline") for n, s in BASE_STYLE.items()]
+        # baseline bare + this run's chirp+DRAG; this run's own bare is superseded.
+        series = ([(n, s, "baseline") for n, s in BASE_STYLE.items()]
+                  + [(n, s, None) for n, s in STYLE.items() if n != "bare"])
+    else:
+        series = [(n, s, None) for n, s in STYLE.items()]
     nser = len(series)
     w = 0.86 / nser
     trend = {}
@@ -175,7 +192,7 @@ def figure_for(eta, rows, outdir):
                edgecolor=col, linewidth=0.8,
                alpha=1.0 if filled else 0.45, zorder=3)
         ok = np.isfinite(y)
-        if ok.sum() >= 4:
+        if (not BARS_ONLY) and ok.sum() >= 4:
             lm, _sd, segs = _trend(d[ok], np.log10(y[ok]))
             trend[(name, src_tag)] = (x[ok], lm, segs, col, lab)
 
@@ -192,9 +209,9 @@ def figure_for(eta, rows, outdir):
     # --max-drag-channels 0; without one it falls back to this run's bare trace,
     # which is a weaker claim (that pulse's length and carrier came from a
     # DRAG-aware fixed point).
-    ref_key = (("chirp+DRAG", "baseline") if ("chirp+DRAG", "baseline") in trend
+    ref_key = (("bare", "baseline") if ("bare", "baseline") in trend
                else ("bare", None))
-    ref_lab = ("DRAG gain over an independent no-DRAG calibration"
+    ref_lab = ("improvement over an independently calibrated bare pulse"
                if ref_key[1] == "baseline" else "improvement")
     if ref_key in trend and ("chirp+DRAG", None) in trend:
         xr, lr, segs, _cr, _lr = trend[ref_key]
@@ -204,7 +221,9 @@ def figure_for(eta, rows, outdir):
             # their common calibration wander cancels and the band is 11-27x narrower
             # than either trace's own.
             pair_ok = np.array([
-                bool((r.get("traces") or {}).get("bare")
+                bool((BASE_ROWS.get((round(r["delta_GHz"] * 1e3),
+                                     round(float(r["target_eta"]), 3))) or r)
+                     .get("traces", {}).get("bare")
                      and (r.get("traces") or {}).get("chirp+DRAG")) for r in rows])
             if pair_ok.sum() == xr.size:
                 ratio = 10.0 ** (lr - lg)
@@ -272,16 +291,21 @@ def figure_for(eta, rows, outdir):
     # Out-of-window resonances belong in the footer: inside the axes they sit on top
     # of the bars at either end.
     outside = ";  ".join(f"{lab} at {xr:+.0f} MHz" for xr, lab in RES_OUT)
-    fig.text(0.005, 0.021, "green wedge = the improvement;  narrow band = +-1 PAIRED "
-             "sd (both traces share one calibration, so their common scatter cancels; "
-             "the paired band is 11-27x narrower than each trace's own)",
-             ha="left", va="bottom", fontsize=7.5, color=MUTED)
+    if not BARS_ONLY:
+        fig.text(0.005, 0.021, "green wedge = the improvement;  narrow band = +-1 "
+                 "PAIRED sd (both traces share one operating point, so their common "
+                 "scatter cancels). NOTE the column-to-column structure is PHYSICS, "
+                 "not calibration noise -- a replayed fixed pulse is 1.4-6x worse "
+                 "than the locally calibrated one -- so the trend averages across "
+                 "real features, including a resonance that moves with drive.",
+                 ha="left", va="bottom", fontsize=7.0, color=MUTED)
     fig.text(0.005, 0.005, f"outside the window -- {outside}",
              ha="left", va="bottom", fontsize=7.5, color=MUTED)
     fig.text(0.995, 0.005, f"{n_ok}/{len(rows)} columns calibrated; gate lengths in "
              f"table.txt", ha="right", va="bottom", fontsize=8, color=MUTED)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
-    out = f"{outdir}/curve_eta{('%g' % eta).replace('.', 'p')}.png"
+    out = (f"{outdir}/curve_eta{('%g' % eta).replace('.', 'p')}"
+           f"{'_bars' if BARS_ONLY else ''}.png")
     fig.savefig(out, dpi=170, facecolor="white")
     plt.close(fig)
     return out, n_ok, len(rows)

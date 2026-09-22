@@ -2094,6 +2094,90 @@ class TestTuneUpRecursiveDrag(unittest.TestCase):
         self.assertIn("_drag_on = drag_beat_GHz is not None or bool(drag_channels)", src)
 
 
+class TestTheChirpFitSeesTheRealPulseShape(unittest.TestCase):
+    """The chirp<->DRAG fixed point must iterate on the pulse the solver plays.
+
+    ``_shape_envelope`` reads the shape in NORMALIZED gate time, on t_g = 2. That is
+    only harmless while the shape is t_g-independent in u, and `SinePowerRamp` is
+    not: it carries an ABSOLUTE ``t_rise`` and precomputes ``pi/t_rise`` and its
+    normalization in ``__init__``. Building it at t_g = 2 and reassigning ``.t_g``
+    afterwards therefore left a 1 ns rise on a 100 ns gate -- a nearly square pulse,
+    whose derivatives (and so whose DRAG quadrature) are ~t_g/2 too large, while the
+    base ``amp`` the Stark law is evaluated on kept the true shape. The chirp that
+    came out was the projection of an almost CONSTANT shift, which `pin_c0` then
+    removes: measured on `results/drag_curve_lev9_2026-09-17`, 0.16 MHz peak-to-peak
+    where the measured law implies 2.57.
+    """
+
+    T_G = 80.0
+    SHAPE_KW = {"m": 3, "rise_frac": 0.5}
+
+    def _table(self):
+        return {"fit": {"k2": -0.9, "k4": 0.12, "delta0": -0.7}, "target_eta": 1.8,
+                "eta": np.linspace(0.5, 1.9, 9)}
+
+    def test_the_shape_is_the_same_curve_at_every_gate_length(self):
+        """Built at t_g, sampled in real time == built at 2, sampled in u + 1."""
+        from snail_solver.tune_up import _shape_envelope
+        u = np.linspace(-1.0, 1.0, 257)
+        # `shape_kw` is per shape: only SinePowerRamp takes m/rise_frac.
+        for shape, kw in (("raised_cosine", None), ("sine_power", self.SHAPE_KW),
+                          ("sine_power", {"m": 2, "rise_frac": 0.3})):
+            for t_g in (17.0, self.T_G, 240.0):
+                with self.subTest(shape=shape, kw=kw, t_g=t_g):
+                    ref = _shape_envelope(shape, kw)
+                    got = _shape_envelope(shape, kw, t_g)
+                    np.testing.assert_allclose(
+                        np.abs(got.value_at(t_g * (u + 1.0) / 2.0, np)),
+                        np.abs(ref.value_at(u + 1.0, np)), rtol=1e-12, atol=1e-14)
+
+    def test_a_sine_power_chirp_is_not_flattened_by_a_stale_rise(self):
+        """DRAG barely moves |eta|, so the chirp must stay the DRAG-off one.
+
+        The quadrature is a PHASE to leading order; it changes the magnitude the
+        Stark law reads only at second order. A DRAG-on chirp that differs from the
+        DRAG-off projection by more than a few percent is reporting a pulse shape,
+        not a correction.
+        """
+        from snail_solver.envelope import DragChannel
+        from snail_solver.tune_up import chirp_from_measured_shift
+        kw = dict(degree=8, t_g=self.T_G, shape="sine_power",
+                  shape_kw=self.SHAPE_KW)
+        off = np.asarray(chirp_from_measured_shift(self._table(), 1.8,
+                                                   **kw)["coeffs_GHz"])
+        for chans in ([DragChannel(0.30)],
+                      [DragChannel(0.30), DragChannel(-0.22)]):
+            with self.subTest(n=len(chans)):
+                on = chirp_from_measured_shift(self._table(), 1.8,
+                                               drag_channels=chans, **kw)
+                np.testing.assert_allclose(on["coeffs_GHz"], off, rtol=0.05,
+                                           atol=1e-6)
+                # and the correction it reports is the second-order one it is
+                self.assertLess(on["drag_correction_ratio"], 0.05)
+
+    def test_the_chirp_is_flat_where_the_envelope_is_flat(self):
+        """delta(t) = k2 |eta(t)|^2 + k4 |eta(t)|^4 -- it can only vary with |eta|.
+
+        With ``rise_frac < 0.5`` the shape has a genuine plateau, and the chirp over
+        it must be constant to within the degree-8 truncation ripple. Under the
+        stale rise the pulse was flat over ~98% of the gate instead, which is the
+        same statement made about the wrong pulse.
+        """
+        from numpy.polynomial import legendre as L
+        from snail_solver.envelope import DragChannel
+        from snail_solver.tune_up import chirp_from_measured_shift
+        rise_frac = 0.3
+        out = chirp_from_measured_shift(
+            self._table(), 1.8, degree=8, t_g=self.T_G, shape="sine_power",
+            shape_kw={"m": 3, "rise_frac": rise_frac},
+            drag_channels=[DragChannel(0.30)])
+        u = np.linspace(-1.0, 1.0, 2001)
+        delta = L.legvander(u, 8) @ np.asarray(out["coeffs_GHz"])
+        plateau = np.abs(u) <= 1.0 - 2.0 * rise_frac
+        self.assertGreater(np.ptp(delta), 1e-3)            # there IS a chirp
+        self.assertLess(np.ptp(delta[plateau]), 0.15 * np.ptp(delta))
+
+
 class TestEtaCacheAndCollisionChannels(unittest.TestCase):
     """The per-Hamiltonian eta cache, and auto-filling channels from collisions."""
 
@@ -6540,6 +6624,80 @@ class TestProvenanceIdentifiesTheCode(unittest.TestCase):
         from snail_solver import tune_up
         with mock.patch("subprocess.run", side_effect=OSError("no git")):
             self.assertEqual(tune_up._git_describe(), "")
+
+
+class TestAFailedShiftLawStillAllowsABarePulse(unittest.TestCase):
+    """A chirp that cannot be measured must not take the gate down with it.
+
+    The bare pulse needs a length, an amplitude derived from it, and a carrier --
+    none of which require k2/k4. `delta0`, the static part of the ridge, is measured
+    fine even when the drive-dependent part is not: at delta = -100 MHz on the
+    2026-09-17 grid the chevrons had minimum contrast 0.874 and maximum leakage
+    0.001, the cleanest in the set, and the column was discarded at r2 = 0.585
+    because the whole drive-dependent signal was 0.405 MHz.
+
+    The bias this creates is the reason it matters. The columns that fail are the
+    near-zero-shift ones -- exactly where a chirp has least to do -- so excluding
+    them measures the chirp only where it helps: 1.69x median over the 26 columns
+    that fitted, ~1.50x once the 9 that did not are counted at ~1.0x.
+    """
+
+    DELTA0 = -0.067e-3          # GHz; the static carrier retune, still measured
+
+    def _run(self, fallback):
+        from unittest import mock
+        from snail_solver.tune_up import RabiFitError, run_tune_up
+        cfg = _cfg(envelope="sine_power", envelope_m=3)
+        table = {"fit": {"delta0": -0.067, "k2": 0.26, "k4": 0.02, "r2": 0.585,
+                         "resid_MHz": 0.153, "stark_span_MHz": 0.405, "n_used": 9},
+                 "eta": np.linspace(0.26, 1.3, 9)}
+        boom = RabiFitError("the ridge is not well described ... (r2 = 0.585)", table)
+        seen = {}
+
+        def fake_length(config, target_eta, grid=None, **kw):
+            seen["chirp"] = list(kw.get("chirp_coeffs_GHz") or [])
+            t0 = 106.8
+            return {"t_g_ns": 1.1 * t0, "transfer": 0.99, "t_g0_ns": t0,
+                    "amp_scale": 1.0, "railed": False, "nfev": 9,
+                    "t_g_over_t_g0": 1.1, "n_extensions": 0,
+                    "grid_span_t_g0": [0.7, 1.3], "t_g_grid": np.array([1.0]),
+                    "P": np.array([0.99])}
+
+        with mock.patch("snail_solver.tune_up.rabi_shift_table", side_effect=boom), \
+             mock.patch("snail_solver.tune_up.length_rabi", fake_length), \
+             mock.patch("snail_solver.find_stark_resonance.scan",
+                        lambda *a, **k: {"resonance_offset_GHz": self.DELTA0}):
+            out = run_tune_up(cfg, 1.3, chirp_free_fallback=fallback)
+        return out, seen
+
+    def test_without_the_fallback_the_column_is_still_lost(self):
+        from snail_solver.tune_up import RabiFitError
+        with self.assertRaises(RabiFitError):
+            self._run(False)
+
+    def test_with_the_fallback_a_chirp_free_gate_is_calibrated(self):
+        out, seen = self._run(True)
+        rec = out["operating_point"]
+        self.assertTrue(rec["chirp_free"])
+        self.assertEqual(list(rec["chirp_coeffs_GHz"]), [])
+        self.assertEqual(seen["chirp"], [])          # the length scan saw no chirp
+        self.assertGreater(rec["t_g_ns"], 0.0)
+
+    def test_the_static_offset_seeds_the_carrier(self):
+        """delta0 survives a failed fit and is the one piece of the ridge still
+        trustworthy, so it seeds wp_offset; discarding it would detune the carrier
+        for no reason. Step 3 then MEASURES the remainder on the assembled
+        zero-chirp pulse -- here the mocked chevron agrees with the seed, so the
+        offset must come back unchanged rather than collapsing to zero."""
+        out, _ = self._run(True)
+        self.assertAlmostEqual(out["operating_point"]["wp_offset_GHz"],
+                               self.DELTA0, places=9)
+
+    def test_a_chirp_free_gate_is_labelled_as_such(self):
+        """Otherwise it is indistinguishable from a chirp that fitted to zero, and
+        the two mean opposite things about the operating point."""
+        out, _ = self._run(True)
+        self.assertIn("chirp_free", out["operating_point"])
 
 
 if __name__ == "__main__":
