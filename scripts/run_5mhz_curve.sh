@@ -42,6 +42,9 @@ AMP=${AMP:-41}
 WORKERS=${WORKERS:-12}
 JOBS=${JOBS:-6}
 ETAS=${ETAS:-"1.3 1.5"}
+# Pass A never enters the chirp<->DRAG fixed point, so it is not gated on whatever
+# pass B is doing: PASSES=A can be started while B is still being validated.
+PASSES=${PASSES:-"A B"}
 
 # 5 MHz spacing over [-160, +160]. delta = 0 is dropped by columns_for.
 # FORCED omits +-10 MHz of delta = 0 and of delta = -60; UNFORCED is exactly those.
@@ -88,7 +91,7 @@ echo "[$(date +%H:%M:%S)] 5 MHz curve -> $OUT  (amp-points=$AMP, ${WORKERS}x${JO
 "$PY" -c 'import subprocess' >/dev/null 2>&1 || { echo "no $PY" >&2; exit 1; }
 
 for eta in $ETAS; do
-    for pass in A B; do
+    for pass in $PASSES; do
         run_one "$pass" "$eta" forced   "$FORCED"   --force
         run_one "$pass" "$eta" excluded "$UNFORCED"
     done
