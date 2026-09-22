@@ -73,8 +73,11 @@ run_one() {                                   # run_one PASS ETA SETNAME OFFSETS
     local dir="$OUT/pass${pass}_$([ "$pass" = A ] && echo nodrag || echo drag)"
     local tag="eta$(printf '%g' "$eta" | tr '.' 'p')_${setname}"
     mkdir -p "$dir"
-    if [ -f "$dir/$tag.h5" ]; then
-        echo "[$(date +%H:%M:%S)] skip $pass/$tag (h5 exists)"
+    # Sentinel, not the .h5: main() TRUNCATES the HDF5 up front (save_tree with
+    # an empty tree), so the file exists from the first second and an interrupted
+    # pass would otherwise be skipped as if it had finished.
+    if [ -f "$dir/$tag.done" ]; then
+        echo "[$(date +%H:%M:%S)] skip $pass/$tag (already finished)"
         return 0
     fi
     echo "[$(date +%H:%M:%S)] start pass $pass  eta=$eta  $setname  ${force:-(no force)}"
@@ -83,7 +86,9 @@ run_one() {                                   # run_one PASS ETA SETNAME OFFSETS
         --offsets="$offs" --target-eta "$eta" $force \
         --outdir "$dir" --out "$dir/$tag.h5" \
         --log "$dir/$tag.log" --plot "$dir/$tag.png"
-    echo "[$(date +%H:%M:%S)] done  pass $pass  eta=$eta  $setname  (exit $?)"
+    rc=$?
+    [ "$rc" -eq 0 ] && touch "$dir/$tag.done"
+    echo "[$(date +%H:%M:%S)] done  pass $pass  eta=$eta  $setname  (exit $rc)"
 }
 
 mkdir -p "$OUT"
