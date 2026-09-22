@@ -119,6 +119,21 @@ def main(argv):
                       end="")
         print()
 
+        # A chirp built on a law that did not converge is not evidence either
+        # way. Report those columns rather than averaging them into the gain.
+        for path, label in ((nodrag_path, "chirp"), (drag_path, "chirp+DRAG")):
+            bad = [(round(float(r["delta_GHz"]) * 1e3), r.get("quartic_fraction"))
+                   for r in json.load(open(path))
+                   if round(float(r["target_eta"]), 2) == eta and r.get("ok")
+                   and r.get("perturbative_ok") is False]
+            if bad:
+                print(f"\n  {label}: shift law NOT converged (quartic fraction "
+                      f"above the warn threshold) at {len(bad)} solved column(s):")
+                for d, q in sorted(bad):
+                    inpair = " [in the paired set]" if d in triple else ""
+                    print(f"    delta={d:+5d}  quartic fraction {q:7.2f}{inpair}")
+
+        print()
         for label, errs in (("chirp pass", nd_err), ("DRAG pass", d_err)):
             for kind, ds in sorted((errs.get(eta) or {}).items()):
                 print(f"  {label} failed {kind:<24} {len(ds):>2d}: "

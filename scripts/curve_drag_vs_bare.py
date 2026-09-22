@@ -36,6 +36,33 @@ VARIANTS = (("chirp+DRAG", True, True, False),
             ("bare", False, False, True))
 
 
+def _chirp_quality(row, quartic_warn=0.25):
+    """Whether the chirp this column carries rests on a law that converged.
+
+    `r2` can be 0.998 while `quartic_fraction` is 20 -- a confident fit to a
+    series that is not a series, because `delta = k2 eta^2 (1 + (k4/k2) eta^2)`
+    is a TRUNCATION and `quartic_fraction` is how big the last kept term is next
+    to the first. When it is not small the unmeasured eta^6 term is plausibly the
+    same size, so the chirp is a candidate, not a calibration.
+
+    `perturbative_ok` is computed rather than read: the scan stores
+    `quartic_fraction` on the row but not the verdict. `min_abs_detuning_GHz` is
+    the floor the chirp<->DRAG fixed point reached, which is the quantity that
+    goes to zero when the loop chases its own denominator.
+    """
+    ch = row.get("chirp")
+    if not isinstance(ch, dict):
+        ch = {}
+    q = ch.get("quartic_fraction")
+    q = float(q) if q is not None else None
+    free = ch.get("coeffs_GHz") is not None and len(ch.get("coeffs_GHz") or []) == 0
+    return {"quartic_fraction": q,
+            "perturbative_ok": (None if q is None else bool(q < quartic_warn)),
+            "min_abs_detuning_GHz": ch.get("min_abs_detuning_GHz"),
+            "shift_law_r2": ch.get("r2"),
+            "chirp_free": bool(free)}
+
+
 def _one(job):
     """Score ONE (column, variant). Runs in a worker process."""
     import warnings
@@ -119,7 +146,14 @@ if __name__ == "__main__":
                          "drag_channels": r.get("drag_channels"),
                          "drag_shed": r.get("drag_shed"),
                          "t1_us": t1, "t2_us": t2, "decoh_prefactor": pre,
-                         "error": r.get("error")}
+                         "error": r.get("error"),
+                         # Whether the chirp this column carries rests on a shift
+                         # law that converged. r2 can be 0.998 while
+                         # quartic_fraction is 20 -- a confident fit to a series
+                         # that is not a series. Carried through so the analysis
+                         # can separate those columns instead of averaging a
+                         # meaningless chirp into the gain.
+                         **_chirp_quality(r, float(settings.get("quartic_warn", 0.25) or 0.25))}
             if not r.get("ok"):
                 skipped.append(key)
                 continue
