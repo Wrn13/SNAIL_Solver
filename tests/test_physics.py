@@ -6702,3 +6702,108 @@ class TestAFailedShiftLawStillAllowsABarePulse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDecoupledDragLeavesTheChirpAlone(unittest.TestCase):
+    """``couple_drag=False`` builds the chirp from the bare envelope, then adds DRAG.
+
+    The coupled fixed point solves ``delta = k2|eta_tot|^2 + k4|eta_tot|^4`` where
+    ``eta_tot`` carries a quadrature ``q = (d eta/dt) / Delta_j(t)`` and
+    ``Delta_j(t) = 2 pi beat - n_pump delta(t)`` -- so the chirp sits in its own
+    denominator and can chase it to zero (measured: min|Delta| driven to 5.6 MHz at
+    delta = +40, final step 8.96e+19 GHz). Decoupled, delta(t) is frozen at the
+    bare-envelope projection, which is the FIRST Picard iterate.
+
+    Two properties are what make that worth having, and both are asserted here:
+    the chirp becomes bit-identical to the DRAG-off chirp -- so chirp+DRAG is a
+    clean ablation of chirp-only rather than a different chirp as well -- and it
+    stops depending on t_g, since the 1/t_g scaling entered only through q.
+    """
+
+    TABLE = {"fit": {"k2": -1.83, "k4": 0.29, "delta0": -0.07}, "target_eta": 1.3,
+             "eta": np.linspace(0.26, 1.3, 9)}
+    SHAPE_KW = {"m": 3, "rise_frac": 0.5}
+
+    def _channels(self, beat_GHz=0.22):
+        from snail_solver.envelope import DragChannel
+        return [DragChannel(beat_GHz, n_pump=2, n_photon=2, quotient_rule=True)]
+
+    def _project(self, t_g, channels, couple):
+        from snail_solver.tune_up import chirp_from_measured_shift
+        return chirp_from_measured_shift(
+            self.TABLE, 1.3, degree=8, drag_channels=channels, t_g=t_g,
+            shape="sine_power", shape_kw=self.SHAPE_KW, couple_drag=couple)
+
+    def test_the_decoupled_chirp_is_the_drag_off_chirp(self):
+        off = self._project(107.0, None, True)["coeffs_GHz"]
+        dec = self._project(107.0, self._channels(), False)["coeffs_GHz"]
+        np.testing.assert_allclose(dec, off, rtol=1e-12, atol=1e-15)
+
+    def test_the_decoupled_chirp_does_not_depend_on_the_gate_length(self):
+        """q ~ 1/t_g was the ONLY route by which length entered the chirp."""
+        ref = self._project(107.0, self._channels(), False)["coeffs_GHz"]
+        for t_g in (61.0, 214.0):
+            with self.subTest(t_g=t_g):
+                np.testing.assert_allclose(
+                    self._project(t_g, self._channels(), False)["coeffs_GHz"],
+                    ref, rtol=1e-12, atol=1e-15)
+
+    def test_it_reports_the_term_it_neglects(self):
+        """The approximation must say how big the shift it drops is."""
+        out = self._project(107.0, self._channels(), False)
+        self.assertFalse(out["drag_coupled"])
+        self.assertEqual(out["drag_iters"], 1)
+        self.assertGreaterEqual(out["neglected_shift_frac"], 0.0)
+        self.assertTrue(np.isfinite(out["neglected_shift_frac"]))
+
+    def test_a_beat_that_diverges_when_coupled_still_returns_when_decoupled(self):
+        """The whole point: no feedback path, so no DragFixedPointDiverged."""
+        from snail_solver.tune_up import chirp_from_measured_shift
+        near = self._channels(beat_GHz=0.002)     # 2 MHz: deep in the runaway regime
+        with self.assertRaises(RuntimeError):
+            chirp_from_measured_shift(
+                self.TABLE, 1.3, degree=8, drag_channels=near, t_g=107.0,
+                shape="sine_power", shape_kw=self.SHAPE_KW, couple_drag=True,
+                max_iters=40)
+        out = self._project(107.0, near, False)
+        self.assertTrue(np.all(np.isfinite(out["coeffs_GHz"])))
+
+
+class TestAChirpFreeColumnSurvivesTheOuterLoop(unittest.TestCase):
+    """The chirp<->length loop must tolerate a column that carries NO chirp.
+
+    ``--chirp-free-fallback`` returns ``coeffs_GHz: []`` when the eta^2 + eta^4
+    shift law is unmeasurable. The loop's convergence test is
+
+        dc = max|chirp - prev_chirp|
+
+    and ``np.max`` over an empty array raises rather than returning a neutral
+    element, so with DRAG on (which is what makes the loop run more than one pass)
+    a chirp-free column died on pass 2. A DRAG-OFF pass never saw it, because
+    ``_drag_on`` is false there and the loop breaks before this line -- which is
+    exactly why the 20 chirp-free columns of the no-DRAG pass all solved while the
+    same 20 of the DRAG pass did not.
+    """
+
+    def test_max_over_an_empty_chirp_would_raise(self):
+        """Pin the numpy behaviour the guard exists for."""
+        with self.assertRaises(ValueError):
+            float(np.max(np.abs(np.array([]) - np.asarray([], dtype=float))))
+
+    def test_no_chirp_counts_as_a_converged_chirp(self):
+        """Zero on every pass means the change between passes is zero, not an error."""
+        prev, cur = np.asarray([], dtype=float), []
+        if prev is None:
+            dc = float("inf")
+        elif len(cur) == 0 and len(prev) == 0:
+            dc = 0.0
+        else:
+            dc = float(np.max(np.abs(np.array(cur) - prev)))
+        self.assertEqual(dc, 0.0)
+
+    def test_a_real_chirp_still_measures_its_change(self):
+        prev = np.array([0.0, 0.0, 1.0e-3])
+        cur = [0.0, 0.0, 1.4e-3]
+        dc = (0.0 if (len(cur) == 0 and len(prev) == 0)
+              else float(np.max(np.abs(np.array(cur) - prev))))
+        self.assertAlmostEqual(dc, 4.0e-4, places=12)

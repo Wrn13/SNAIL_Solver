@@ -1381,7 +1381,8 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
                               shape_kw: Optional[Dict[str, Any]] = None,
                               max_iters: int = 12,
                               tol_GHz: float = 1e-12,
-                              quartic_warn: float = 0.25) -> Dict[str, Any]:
+                              quartic_warn: float = 0.25,
+                              couple_drag: bool = True) -> Dict[str, Any]:
     """Step 2: project the measured shift onto the Legendre chirp basis.
 
     Evaluates the fitted shift along the pulse -- ``|eta(u)| = eta* cos^2(pi u / 2)``
@@ -1506,7 +1507,27 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
         order = _drag.required_order(channels)
         shape = env.jet_at(t_g * (u + 1.0) / 2.0, order, np)
         min_abs = float("inf")
-        for it in range(int(max_iters)):
+        # ONE-SHOT mode: build the chirp from the bare envelope, then apply DRAG on
+        # top of that fixed chirp without feeding the quadrature back. This is the
+        # FIRST Picard iterate of the loop below, and it buys three things the
+        # fixed point cannot:
+        #
+        #   * it cannot diverge. The loop's failure mode is that q = (d eta/dt) /
+        #     Delta_j(t) moves Delta_j, which contains -n_pump delta(t), so the
+        #     chirp chases its own denominator toward zero. With delta(t) frozen
+        #     there is no feedback path and no DragFixedPointDiverged.
+        #   * the chirp is then IDENTICAL to the DRAG-off chirp at the same column,
+        #     which makes chirp+DRAG a clean ablation of chirp-only: DRAG is a pure
+        #     add-on rather than something that also silently changes the chirp.
+        #   * q scales as 1/t_g, so the coupled chirp depends on the gate length and
+        #     forces run_tune_up's outer loop to re-solve both together. Frozen, the
+        #     chirp is length-independent again and one pass suffices.
+        #
+        # The cost is that the Stark shift of the ADDED quadrature power is not
+        # cancelled. `drag_correction_ratio` and `drag_delta_frac` below say how big
+        # that neglected term is, so the approximation reports its own error.
+        iters = int(max_iters) if couple_drag else 1
+        for it in range(iters):
             # Iterate on the LEGENDRE COEFFICIENTS, not on sampled values: the
             # detuning JET needs d/dt of the current chirp iterate, and only a
             # coefficient representation has an analytic derivative.
@@ -1529,6 +1550,10 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
             eta_tot = np.abs(_drag.apply_drag(shape, jets, channels, np))
             new = shift_GHz(eta_tot)
             step = float(np.max(np.abs(new - delta_GHz)))
+            if not couple_drag:
+                # Keep the BARE-envelope chirp; `new` was evaluated only to report
+                # how much the quadrature would have added had it been fed back.
+                break
             delta_GHz = new
             if step < tol_GHz:
                 break
@@ -1543,6 +1568,11 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
                 f"more passes.")
         drag_norm = float(np.linalg.norm(delta_GHz))
         extra = {"drag_iters": it + 1, "min_abs_detuning_GHz": min_abs,
+                 "drag_coupled": bool(couple_drag),
+                 "neglected_shift_frac": (
+                     float(np.max(np.abs(new - delta_GHz))
+                           / max(float(np.max(np.abs(delta_GHz))), 1e-30))
+                     if not couple_drag else 0.0),
                  "min_abs_detuning_per_channel_GHz": floors,
                  "n_drag_channels": len(channels),
                  "drag_correction_ratio": float(
@@ -2617,6 +2647,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 do_time_rabi: bool = True, jobs: int = 0,
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
+                couple_drag: bool = True,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 post_chirp_points: int = 0,
                 solver: Optional[Dict[str, Any]] = None,
@@ -2717,7 +2748,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
             table, target_eta, degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
             drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
             shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn,
-            max_iters=int(chirp_max_passes))
+            max_iters=int(chirp_max_passes), couple_drag=bool(couple_drag))
 
     def shaped_residual(t_g: float, chirp, wp_offset: float) -> float:
         """Residual offset of the ASSEMBLED gate: shaped pulse, chirp and DRAG on.
@@ -2753,7 +2784,12 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     _shape_kind, _shape_kw = shape_config(config)
     _drag_on = drag_beat_GHz is not None or bool(drag_channels)
     _n_ch = len(_resolve_drag_channels(drag_beat_GHz, drag_n_pump, drag_channels))
-    n_outer = (max(int(max_drag_iters), 2 * _n_ch) if _drag_on else 1)
+    # The outer loop exists ONLY because the coupled quadrature scales as 1/t_g,
+    # so the chirp depends on the length it is being fitted with. Decoupled, the
+    # chirp is built from the bare envelope alone and is length-independent
+    # again -- exactly as in the DRAG-off case, which has always used one pass.
+    n_outer = (max(int(max_drag_iters), 2 * _n_ch)
+               if (_drag_on and couple_drag) else 1)
 
     for it in range(n_outer):
         prev_chirp = None if chirp is None else np.array(chirp)
@@ -2821,13 +2857,21 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 f"wider window -- rerun with --tg-{'lo' if edge == 'lower' else 'hi'} "
                 f"past {tg_lo if edge == 'lower' else tg_hi:g}.")
 
-        dc = (float("inf") if prev_chirp is None
-              else float(np.max(np.abs(np.array(chirp) - prev_chirp))))
+        # A CHIRP-FREE column carries no coefficients at all, and np.max over an
+        # empty array raises rather than returning a neutral element. Its chirp is
+        # the constant zero on every pass, so the change between passes is exactly
+        # 0 -- the loop has converged in the only sense available to it.
+        if prev_chirp is None:
+            dc = float("inf")
+        elif len(chirp) == 0 and len(prev_chirp) == 0:
+            dc = 0.0
+        else:
+            dc = float(np.max(np.abs(np.array(chirp) - prev_chirp)))
         dt = abs(t_g - prev_t_g)
         history.append({"iter": it, "t_g_ns": t_g, "max_dc_GHz": dc,
                         "d_t_g_ns": dt, "wp_offset_GHz": wp_offset,
                         "residual_GHz": residual_GHz, "chirp_GHz": list(chirp)})
-        if not _drag_on:
+        if not _drag_on or not couple_drag:
             break
         log.info(f"  pass {it + 1}: max|dc|={dc:.2e} GHz, |d t_g|={dt:.4f} ns")
         if dc < chirp_tol_GHz and dt < 1e-3 * t_g0:

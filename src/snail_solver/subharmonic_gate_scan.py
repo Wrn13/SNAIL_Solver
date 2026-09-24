@@ -389,6 +389,7 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             # Changes the pulse: a zeroed chirp is a different gate.
             "zero_chirp_frac": float(settings.get("zero_chirp_frac", 0.0)),
             "chirp_free_fallback": bool(settings.get("chirp_free_fallback", False)),
+            "couple_drag": bool(settings.get("couple_drag", True)),
             "score_drag": 1,
             # Likewise for the LENGTH contract: columns solved before 2026-09-17 ran a
             # length_rabi that returned its search-window BOUNDARY when the optimum lay
@@ -506,6 +507,7 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             quartic_warn=settings["quartic_warn"],
             zero_chirp_frac=float(settings.get("zero_chirp_frac", 0.0)),
             chirp_free_fallback=bool(settings.get("chirp_free_fallback", False)),
+            couple_drag=bool(settings.get("couple_drag", True)),
             probe_shape=settings["probe_shape"],
             moment_weighting=settings["moment_weighting"],
             do_time_rabi=False, jobs=jobs, solver=solver, logger=logger,
@@ -709,6 +711,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 leak_max: Optional[float] = None,
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
+                couple_drag: bool = True,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 drop_origin: bool = True, column_figures: bool = True,
                 ridge_grid: bool = False,
@@ -778,6 +781,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         # moments, so nothing downstream changes.
         "zero_chirp_frac": float(zero_chirp_frac),
         "chirp_free_fallback": bool(chirp_free_fallback),
+        "couple_drag": bool(couple_drag),
         "probe_shape": str(probe_shape),
         "moment_weighting": str(moment_weighting),
         # A Rabi row is a CONSTANT-probe chevron, so at strong drive it leaks far more
@@ -1576,6 +1580,16 @@ def main() -> None:
                          "pristine chevrons. Keep it small: at 48%% of a half-width "
                          "the chirp was measured to be worth 2.8x, so 0.15 is "
                          "already generous. 0 disables.")
+    ap.add_argument("--decouple-drag", action="store_true",
+                    help="build the chirp from the bare envelope and apply DRAG "
+                         "on top of it, instead of iterating the two to a fixed "
+                         "point. This is the first Picard iterate: it cannot "
+                         "diverge, it makes the chirp IDENTICAL to the DRAG-off "
+                         "chirp so chirp+DRAG is a clean ablation of chirp-only, "
+                         "and it restores length-independence (the coupled "
+                         "quadrature scales as 1/t_g). It does not cancel the "
+                         "Stark shift of the added quadrature power; "
+                         "neglected_shift_frac reports how big that term is.")
     ap.add_argument("--envelope-m", type=int, default=None,
                     help="override the sine_power vanishing order, which otherwise "
                          "comes from --max-drag-channels. Needed for an independently "
@@ -1731,6 +1745,7 @@ def main() -> None:
         shard=_shard, n_shards=_n_shards, envelope_m=args.envelope_m,
         zero_chirp_frac=args.zero_chirp_frac,
         chirp_free_fallback=args.chirp_free_fallback,
+        couple_drag=not args.decouple_drag,
         column_workers=args.column_workers,
         t1_us=args.t1_us, t2_us=args.t2_us,
         decoh_prefactor=args.decoh_prefactor,
