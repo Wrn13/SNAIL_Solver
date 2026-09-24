@@ -100,7 +100,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -120,6 +120,24 @@ class RabiFitError(ValueError):
     def __init__(self, message: str, table: Dict[str, Any]):
         super().__init__(message)
         self.table = table
+
+
+class DragFixedPointDiverged(RuntimeError):
+    """The chirp<->DRAG fixed point ran away instead of settling.
+
+    ``q = (d eta/dt) / Delta_j(t)`` and ``Delta_j(t) = 2 pi beat - n_pump delta(t)``,
+    so the chirp being solved for sits in its own denominator: a larger shift shrinks
+    |Delta_j|, which grows the quadrature, which grows the shift. Near a collision the
+    two chase each other.
+
+    A RuntimeError subclass so that callers already matching on the message keep
+    working, and ``min_abs_detuning_GHz`` rides along because how close the loop drove
+    its own denominator to zero is the diagnosis.
+    """
+
+    def __init__(self, message: str, min_abs_detuning_GHz: float = float("nan")):
+        super().__init__(message)
+        self.min_abs_detuning_GHz = float(min_abs_detuning_GHz)
 
 
 # ===========================================================================
@@ -1558,14 +1576,14 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
             if step < tol_GHz:
                 break
         else:
-            raise RuntimeError(
+            raise DragFixedPointDiverged(
                 f"the chirp<->DRAG fixed point did not settle in {max_iters} passes "
                 f"(last step {step:.2e} GHz, min|Delta(t)| = {min_abs * 1e3:.3f} MHz, "
                 f"{len(channels)} channel(s)). Near a collision the quadrature and the "
                 f"chirp can chase each other; pick a further-detuned beat or a weaker "
                 f"drive. Note the d-th nested correction scales as 1/t_g^d, so a deeper "
                 f"recursion couples the chirp and the length more tightly and may need "
-                f"more passes.")
+                f"more passes.", min_abs)
         drag_norm = float(np.linalg.norm(delta_GHz))
         extra = {"drag_iters": it + 1, "min_abs_detuning_GHz": min_abs,
                  "drag_coupled": bool(couple_drag),
@@ -2648,6 +2666,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
                 couple_drag: bool = True,
+                drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 post_chirp_points: int = 0,
                 solver: Optional[Dict[str, Any]] = None,
@@ -2744,11 +2763,32 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                     "stark_mean_GHz": 0.0,
                     "static_GHz": float((table.get("fit") or {}).get(
                         "delta0", 0.0)) * 1e-3}
-        return chirp_from_measured_shift(
-            table, target_eta, degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
-            drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
-            shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn,
-            max_iters=int(chirp_max_passes), couple_drag=bool(couple_drag))
+        kw = dict(degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
+                  drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
+                  shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn,
+                  max_iters=int(chirp_max_passes))
+        try:
+            return chirp_from_measured_shift(
+                table, target_eta, couple_drag=bool(couple_drag), **kw)
+        except DragFixedPointDiverged as exc:
+            if not drag_decouple_fallback or not couple_drag:
+                raise
+            # Fall back to the FIRST Picard iterate rather than losing the column:
+            # build the chirp from the bare envelope and apply DRAG on top of it,
+            # with no feedback path for the quadrature to chase. Only on this
+            # failure, so every column that CAN be solved coupled still is, and the
+            # series stays calibrated the same way wherever the loop converges.
+            drag_decoupled.append(float(exc.min_abs_detuning_GHz))
+            log.info(
+                f"step 2: the chirp<->DRAG fixed point diverged "
+                f"(min|Delta| = {exc.min_abs_detuning_GHz * 1e3:.3f} MHz). Falling "
+                f"back to DECOUPLED DRAG at this column -- the chirp is the "
+                f"bare-envelope one and the quadrature is applied on top of it. "
+                f"neglected_shift_frac reports the term that is then dropped.")
+            out = chirp_from_measured_shift(
+                table, target_eta, couple_drag=False, **kw)
+            out["drag_decoupled_fallback"] = True
+            return out
 
     def shaped_residual(t_g: float, chirp, wp_offset: float) -> float:
         """Residual offset of the ASSEMBLED gate: shaped pulse, chirp and DRAG on.
@@ -2776,6 +2816,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     stages: Dict[str, Any] = {"rabi": table}
     history = []
     t_g = t_g0
+    drag_decoupled: List[float] = []      # min|Delta| at each fallback, if any
     chirp, wp_offset, length = None, 0.0, None
     # With DRAG off nothing below depends on t_g, so one pass IS the fixed point.
     # A recursive tone couples the chirp and the length harder than a first-order
@@ -2990,6 +3031,11 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         # flag a chirp-free fallback is indistinguishable from a chirp that
         # happened to fit to zero.
         "chirp_free": bool(chirp_free),
+        # Non-empty when the coupled fixed point diverged and this column fell
+        # back to decoupled DRAG; the values are min|Delta| at each fallback.
+        "drag_decoupled": bool(drag_decoupled),
+        "drag_decoupled_min_abs_detuning_GHz": (min(drag_decoupled)
+                                                if drag_decoupled else None),
         "t_g_railed": bool(length["railed"]),
         "t_g_over_t_g0": float(length.get("t_g_over_t_g0", t_g / t_g0)),
         "t_g_grid_span_t_g0": length.get("grid_span_t_g0"),

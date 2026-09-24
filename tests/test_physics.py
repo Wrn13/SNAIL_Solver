@@ -6807,3 +6807,51 @@ class TestAChirpFreeColumnSurvivesTheOuterLoop(unittest.TestCase):
         dc = (0.0 if (len(cur) == 0 and len(prev) == 0)
               else float(np.max(np.abs(np.array(cur) - prev))))
         self.assertAlmostEqual(dc, 4.0e-4, places=12)
+
+
+class TestDecoupleOnlyRescuesTheColumnsThatDiverged(unittest.TestCase):
+    """``--drag-decouple-fallback`` must be a FALLBACK, not a mode switch.
+
+    Decoupling is an approximation -- it drops the Stark shift of the quadrature's
+    own power -- so applying it everywhere would degrade the columns whose coupled
+    fixed point settles perfectly well, and would leave the series calibrated two
+    different ways with nothing marking the boundary. The rule is therefore: solve
+    coupled wherever the loop converges, and decouple ONLY where it diverges.
+    """
+
+    TABLE = {"fit": {"k2": -1.83, "k4": 0.29, "delta0": -0.07}, "target_eta": 1.3,
+             "eta": np.linspace(0.26, 1.3, 9)}
+    SHAPE_KW = {"m": 3, "rise_frac": 0.5}
+
+    def _chan(self, beat_GHz):
+        from snail_solver.envelope import DragChannel
+        return [DragChannel(beat_GHz, n_pump=2, n_photon=2, quotient_rule=True)]
+
+    def _project(self, beat, couple, max_iters=40):
+        from snail_solver.tune_up import chirp_from_measured_shift
+        return chirp_from_measured_shift(
+            self.TABLE, 1.3, degree=8, drag_channels=self._chan(beat), t_g=107.0,
+            shape="sine_power", shape_kw=self.SHAPE_KW, couple_drag=couple,
+            max_iters=max_iters)
+
+    def test_the_divergence_is_its_own_exception_type(self):
+        """Catchable precisely, rather than by matching on the message text."""
+        from snail_solver.tune_up import DragFixedPointDiverged
+        with self.assertRaises(DragFixedPointDiverged) as ctx:
+            self._project(0.002, True)
+        self.assertIsInstance(ctx.exception, RuntimeError)   # old callers still work
+        self.assertIn("fixed point did not settle", str(ctx.exception))
+        self.assertTrue(np.isfinite(ctx.exception.min_abs_detuning_GHz))
+
+    def test_a_converging_column_is_left_coupled(self):
+        """A well-detuned beat must NOT be silently decoupled."""
+        out = self._project(0.22, True)
+        self.assertTrue(out["drag_coupled"])
+        self.assertNotIn("drag_decoupled_fallback", out)
+        self.assertEqual(out["neglected_shift_frac"], 0.0)
+
+    def test_the_coupled_and_decoupled_chirps_actually_differ(self):
+        """Otherwise the fallback would be untestable and pointless."""
+        coup = np.asarray(self._project(0.22, True)["coeffs_GHz"])
+        dec = np.asarray(self._project(0.22, False)["coeffs_GHz"])
+        self.assertGreater(float(np.max(np.abs(coup - dec))), 0.0)

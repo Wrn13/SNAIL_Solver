@@ -390,6 +390,8 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             "zero_chirp_frac": float(settings.get("zero_chirp_frac", 0.0)),
             "chirp_free_fallback": bool(settings.get("chirp_free_fallback", False)),
             "couple_drag": bool(settings.get("couple_drag", True)),
+            "drag_decouple_fallback": bool(
+                settings.get("drag_decouple_fallback", False)),
             "score_drag": 1,
             # Likewise for the LENGTH contract: columns solved before 2026-09-17 ran a
             # length_rabi that returned its search-window BOUNDARY when the optimum lay
@@ -508,6 +510,8 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             zero_chirp_frac=float(settings.get("zero_chirp_frac", 0.0)),
             chirp_free_fallback=bool(settings.get("chirp_free_fallback", False)),
             couple_drag=bool(settings.get("couple_drag", True)),
+            drag_decouple_fallback=bool(
+                settings.get("drag_decouple_fallback", False)),
             probe_shape=settings["probe_shape"],
             moment_weighting=settings["moment_weighting"],
             do_time_rabi=False, jobs=jobs, solver=solver, logger=logger,
@@ -712,6 +716,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
                 couple_drag: bool = True,
+                drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 drop_origin: bool = True, column_figures: bool = True,
                 ridge_grid: bool = False,
@@ -782,6 +787,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "zero_chirp_frac": float(zero_chirp_frac),
         "chirp_free_fallback": bool(chirp_free_fallback),
         "couple_drag": bool(couple_drag),
+        "drag_decouple_fallback": bool(drag_decouple_fallback),
         "probe_shape": str(probe_shape),
         "moment_weighting": str(moment_weighting),
         # A Rabi row is a CONSTANT-probe chevron, so at strong drive it leaks far more
@@ -1580,6 +1586,14 @@ def main() -> None:
                          "pristine chevrons. Keep it small: at 48%% of a half-width "
                          "the chirp was measured to be worth 2.8x, so 0.15 is "
                          "already generous. 0 disables.")
+    ap.add_argument("--drag-decouple-fallback", action="store_true",
+                    help="keep the coupled chirp<->DRAG fixed point, but when it "
+                         "DIVERGES at a column, fall back to decoupled DRAG there "
+                         "instead of losing the column. Every column that can be "
+                         "solved coupled still is, so the series stays calibrated "
+                         "the same way wherever the loop converges; the fallback "
+                         "columns are flagged by operating_point.drag_decoupled "
+                         "and report neglected_shift_frac.")
     ap.add_argument("--decouple-drag", action="store_true",
                     help="build the chirp from the bare envelope and apply DRAG "
                          "on top of it, instead of iterating the two to a fixed "
@@ -1746,6 +1760,7 @@ def main() -> None:
         zero_chirp_frac=args.zero_chirp_frac,
         chirp_free_fallback=args.chirp_free_fallback,
         couple_drag=not args.decouple_drag,
+        drag_decouple_fallback=args.drag_decouple_fallback,
         column_workers=args.column_workers,
         t1_us=args.t1_us, t2_us=args.t2_us,
         decoh_prefactor=args.decoh_prefactor,
