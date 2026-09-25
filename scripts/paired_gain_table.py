@@ -28,19 +28,44 @@ from statistics import median, geometric_mean
 USAGE = __doc__.strip().splitlines()[2].strip()
 
 
-def load(path, variant):
-    """{(eta, delta_mhz): infidelity_coherent} for one variant of one curves file."""
+def load(path, variant, drop_excluded=False):
+    """{(eta, delta_mhz): infidelity_coherent} for one variant of one curves file.
+
+    `drop_excluded` removes the columns where a chirp could not be MEASURED -- the
+    ridge changed transition inside the drive sweep, so the calibration fell back to
+    a chirp-free gate. Their "chirp" trace is the bare gate by construction, and
+    counting it as a 1.00x gain is not a measurement of the chirp being useless; it
+    is the absence of a measurement, biasing the chirp's benefit downwards precisely
+    at the detunings where the device is hardest. On the 2026-09-22 grid 14 of 31
+    chirp-free columns were of this kind and every one was reported at 1.00x.
+
+    Columns that are chirp-free because there was NO SHIFT TO CHIRP are kept: there
+    the 1.00x is the result.
+    """
     try:
         rows = json.load(open(path))
     except (OSError, ValueError) as exc:
         sys.exit(f"cannot read {path}: {exc}")
     out = {}
     for r in rows:
+        if drop_excluded and r.get("chirp_excluded"):
+            continue
         tr = (r.get("traces") or {}).get(variant) or {}
         v = tr.get("infidelity_coherent")
         if v is not None and v > 0:
             out[(round(float(r["target_eta"]), 2),
                  round(float(r["delta_GHz"]) * 1e3))] = float(v)
+    return out
+
+
+def excluded_columns(path):
+    """{eta: [(delta_mhz, crossing_eta)]} for columns whose chirp is unmeasurable."""
+    out = {}
+    for r in json.load(open(path)):
+        if not r.get("chirp_excluded"):
+            continue
+        out.setdefault(round(float(r["target_eta"]), 2), []).append(
+            (round(float(r["delta_GHz"]) * 1e3), r.get("stark_crossing_eta")))
     return out
 
 
@@ -77,8 +102,13 @@ def main(argv):
         sys.exit(f"usage: {USAGE}")
     nodrag_path, drag_path = argv[1], argv[2]
     bare = load(nodrag_path, "bare")
-    chirp = load(nodrag_path, "chirp+DRAG")      # no channels were played
-    cd = load(drag_path, "chirp+DRAG")
+    # The chirp series drops the columns where no chirp could be measured; `bare`
+    # does not, because the bare gate at those columns is perfectly well measured.
+    chirp = load(nodrag_path, "chirp+DRAG", drop_excluded=True)
+    cd = load(drag_path, "chirp+DRAG", drop_excluded=True)
+    excl = {k: v for d in (excluded_columns(nodrag_path),
+                           excluded_columns(drag_path))
+            for k, v in d.items()}
 
     etas = sorted({e for e, _ in set(bare) | set(chirp) | set(cd)})
     if not etas:
@@ -134,6 +164,17 @@ def main(argv):
                     print(f"    delta={d:+5d}  quartic fraction {q:7.2f}{inpair}")
 
         print()
+        if excl.get(eta):
+            rows_e = sorted(excl[eta])
+            print(f"\n  chirp EXCLUDED (the ridge changed transition inside the "
+                  f"drive sweep, so no chirp could be measured) at "
+                  f"{len(rows_e)} column(s):")
+            for d, ce in rows_e:
+                at = f" at |eta| = {float(ce):.3f}" if ce is not None else ""
+                print(f"    delta={d:+5d}  crossing{at}")
+            print("    These are NOT counted as 1.00x above. Their bare and DRAG "
+                  "numbers are still measured and still in the bare column count.")
+
         for label, errs in (("chirp pass", nd_err), ("DRAG pass", d_err)):
             for kind, ds in sorted((errs.get(eta) or {}).items()):
                 print(f"  {label} failed {kind:<24} {len(ds):>2d}: "

@@ -53,14 +53,33 @@ def _chirp_quality(row, quartic_warn=0.25):
     ch = row.get("chirp")
     if not isinstance(ch, dict):
         ch = {}
+    op = row.get("operating_point")
+    if not isinstance(op, dict):
+        op = {}
     q = ch.get("quartic_fraction")
     q = float(q) if q is not None else None
     free = ch.get("coeffs_GHz") is not None and len(ch.get("coeffs_GHz") or []) == 0
+    # WHY a column carries no chirp decides whether its 1.00x is a measurement.
+    #
+    #   no_measurable_shift  there was nothing to chirp. chirp == bare is a RESULT.
+    #   stark_crossing       the ridge changed transition inside the drive sweep, so
+    #                        no chirp could be measured at eta*. chirp == bare is an
+    #                        ARTEFACT, and averaging it in at 1.00x biases the chirp's
+    #                        benefit downwards exactly where the device is hardest.
+    #
+    # Older rows predate the distinction and carry no reason at all; they are left
+    # as None rather than guessed at, and the gain table counts them separately.
+    reason = op.get("chirp_free_reason")
     return {"quartic_fraction": q,
             "perturbative_ok": (None if q is None else bool(q < quartic_warn)),
             "min_abs_detuning_GHz": ch.get("min_abs_detuning_GHz"),
             "shift_law_r2": ch.get("r2"),
-            "chirp_free": bool(free)}
+            "chirp_free": bool(free),
+            "chirp_free_reason": reason,
+            "stark_crossing_eta": op.get("stark_crossing_eta"),
+            # The one flag the ratio code needs: is this column's chirp a measured
+            # no-op, or a chirp that could not be measured?
+            "chirp_excluded": bool(free and reason == "stark_crossing")}
 
 
 def _one(job):
