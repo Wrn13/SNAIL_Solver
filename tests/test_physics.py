@@ -6644,12 +6644,18 @@ class TestAFailedShiftLawStillAllowsABarePulse(unittest.TestCase):
 
     DELTA0 = -0.067e-3          # GHz; the static carrier retune, still measured
 
-    def _run(self, fallback):
+    def _run(self, fallback, frac=0.003):
         from unittest import mock
         from snail_solver.tune_up import RabiFitError, run_tune_up
         cfg = _cfg(envelope="sine_power", envelope_m=3)
+        # `frac` is the excursion as a fraction of the half-width, and the fallback
+        # is GATED on it -- see TestTheChirpFreeFallbackIsGatedOnTheExcursion. The
+        # default here is delta = -105 on the 2026-09-22 grid: excursion 0.012 MHz
+        # against a 4.11 MHz half-width, residual 16.7x the signal. That is a column
+        # with no measurable shift, which is what the fallback is for.
         table = {"fit": {"delta0": -0.067, "k2": 0.26, "k4": 0.02, "r2": 0.585,
-                         "resid_MHz": 0.153, "stark_span_MHz": 0.405, "n_used": 9},
+                         "resid_MHz": 0.153, "stark_span_MHz": 0.405, "n_used": 9,
+                         "chirp_excursion_frac_linewidth": frac},
                  "eta": np.linspace(0.26, 1.3, 9)}
         boom = RabiFitError("the ridge is not well described ... (r2 = 0.585)", table)
         seen = {}
@@ -6855,3 +6861,131 @@ class TestDecoupleOnlyRescuesTheColumnsThatDiverged(unittest.TestCase):
         coup = np.asarray(self._project(0.22, True)["coeffs_GHz"])
         dec = np.asarray(self._project(0.22, False)["coeffs_GHz"])
         self.assertGreater(float(np.max(np.abs(coup - dec))), 0.0)
+
+
+class TestTheChirpFreeFallbackIsGatedOnTheExcursion(unittest.TestCase):
+    """"Chirp-free" must mean the chirp is ZERO, not that we failed to measure one.
+
+    ``--chirp-free-fallback`` used to catch every ``RabiFitError`` unconditionally.
+    That is two different failures wearing one coat, and only one of them is a
+    physics result. Measured over the 31 chirp-free columns of the 2026-09-22 grid,
+    the excursion ``|k2 eta^2 + k4 eta^4|`` against the half-width ``1/(2 t_g)``
+    separates them cleanly:
+
+        exc <= 10% of a half-width   residual 1.0-16.7x the excursion -> no signal
+        exc >  20% of a half-width   residual 0.21-0.58x              -> a real law
+
+    14 of the 31 sat in the second group -- delta = +85 at eta = 1.3 swept 64% of a
+    half-width, more than the 48% column whose chirp was independently worth 2.81x --
+    and every one of them was reported as chirp-free at a gain of exactly 1.00x. That
+    number is an artefact of the fit, and it biases the chirp's measured benefit
+    downwards in precisely the columns where the chirp does the most.
+
+    So the gate raises instead, and the message says to fix the MEASUREMENT.
+    """
+
+    @staticmethod
+    def _table(frac):
+        return {"fit": {"delta0": -0.067, "k2": 0.26, "k4": 0.02, "r2": 0.585,
+                        "resid_MHz": 0.153, "stark_span_MHz": 0.405, "n_used": 9,
+                        **({} if frac is None
+                           else {"chirp_excursion_frac_linewidth": frac})},
+                "eta": np.linspace(0.26, 1.3, 9)}
+
+    def _run(self, frac, max_frac=0.10):
+        from unittest import mock
+        from snail_solver.tune_up import RabiFitError, run_tune_up
+        cfg = _cfg(envelope="sine_power", envelope_m=3)
+        boom = RabiFitError("the ridge is not well described ... (r2 = 0.585)",
+                            self._table(frac))
+
+        def fake_length(config, target_eta, grid=None, **kw):
+            t0 = 106.8
+            return {"t_g_ns": 1.1 * t0, "transfer": 0.99, "t_g0_ns": t0,
+                    "amp_scale": 1.0, "railed": False, "nfev": 9,
+                    "t_g_over_t_g0": 1.1, "n_extensions": 0,
+                    "grid_span_t_g0": [0.7, 1.3], "t_g_grid": np.array([1.0]),
+                    "P": np.array([0.99])}
+
+        with mock.patch("snail_solver.tune_up.rabi_shift_table", side_effect=boom), \
+             mock.patch("snail_solver.tune_up.length_rabi", fake_length), \
+             mock.patch("snail_solver.find_stark_resonance.scan",
+                        lambda *a, **k: {"resonance_offset_GHz": -0.067e-3}):
+            return run_tune_up(cfg, 1.3, chirp_free_fallback=True,
+                               chirp_free_max_frac=max_frac)
+
+    def test_a_negligible_excursion_still_falls_back(self):
+        """delta = -105 at eta = 1.3: 0.3% of a half-width. Nothing to chirp."""
+        self.assertTrue(self._run(0.003)["operating_point"]["chirp_free"])
+
+    def test_a_measurable_excursion_raises_instead_of_being_zeroed(self):
+        """delta = +85 at eta = 1.3: 64% of a half-width, residual 0.27x the signal.
+
+        The old behaviour reported this column as chirp-free and its chirp as worth
+        1.00x. It must fail loudly instead.
+        """
+        from snail_solver.tune_up import RabiFitError
+        with self.assertRaises(RabiFitError) as cm:
+            self._run(0.643)
+        msg = str(cm.exception)
+        self.assertIn("64%", msg)
+        self.assertIn("chirp-free-max-frac", msg)
+        # the remedy has to be in the message, or the next person zeroes it again
+        self.assertIn("span-linewidths", msg)
+
+    def test_a_railed_ridge_carries_no_law_and_so_never_qualifies(self):
+        """delta = -30: 4/41 ridge rows railed, so no fit exists at all.
+
+        An unknown excursion is not a small one. The underlying error already names
+        its own remedy (raise --span-linewidths); swallowing it hid that.
+        """
+        from snail_solver.tune_up import RabiFitError
+        with self.assertRaises(RabiFitError) as cm:
+            self._run(None)
+        self.assertIn("excursion is unknown", str(cm.exception))
+
+    def test_the_threshold_is_what_decides_not_the_fit_quality(self):
+        """Same r2, same residual, same column -- only the threshold moves."""
+        self.assertTrue(
+            self._run(0.35, max_frac=0.50)["operating_point"]["chirp_free"])
+        from snail_solver.tune_up import RabiFitError
+        with self.assertRaises(RabiFitError):
+            self._run(0.35, max_frac=0.20)
+
+
+class TestAStaleChirpFreeColumnIsNotServedFromCache(unittest.TestCase):
+    """Tightening the gate must invalidate the rows it would now reject.
+
+    The threshold is deliberately NOT a `_column_expect` key: that dict is compared
+    key-by-key and every key must be present in the stored record, so adding one
+    would re-solve all 232 cached columns to re-derive numbers it cannot change. It
+    only ever turns a chirp-free fallback into a failure, so a row that did not take
+    that fallback is provably unaffected and a row that did can be re-checked from
+    the law it already stores.
+    """
+
+    @staticmethod
+    def _row(chirp_free, k2=0.26, k4=0.02, t_g=106.8, eta=1.3):
+        op = {"chirp_free": chirp_free, "t_g_ns": t_g}
+        return {"operating_point": op, "target_eta": eta,
+                "chirp": {"k2": k2, "k4": k4}}
+
+    def test_a_chirped_row_is_never_stale(self):
+        from snail_solver.subharmonic_gate_scan import _stale_chirp_free
+        self.assertFalse(_stale_chirp_free(self._row(False, k2=99.0), 0.10))
+
+    def test_a_chirp_free_row_over_the_threshold_is_stale(self):
+        from snail_solver.subharmonic_gate_scan import _stale_chirp_free
+        # k2 = 2.0 at eta = 1.3 over a 4.68 MHz half-width -> 72%
+        self.assertTrue(_stale_chirp_free(self._row(True, k2=2.0, k4=0.0), 0.10))
+
+    def test_a_chirp_free_row_under_the_threshold_is_kept(self):
+        from snail_solver.subharmonic_gate_scan import _stale_chirp_free
+        self.assertFalse(_stale_chirp_free(self._row(True, k2=0.0, k4=0.0), 0.10))
+
+    def test_a_row_with_no_stored_law_is_stale(self):
+        """The railed columns store no k2/k4, so their excursion is unknowable."""
+        from snail_solver.subharmonic_gate_scan import _stale_chirp_free
+        row = self._row(True)
+        row["chirp"] = {}
+        self.assertTrue(_stale_chirp_free(row, 0.10))

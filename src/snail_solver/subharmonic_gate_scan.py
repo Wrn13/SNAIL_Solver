@@ -337,6 +337,34 @@ def _settings_for(col: Dict[str, Any], settings: Dict[str, Any],
     return out
 
 
+def _stale_chirp_free(got: Dict[str, Any], max_frac: float) -> bool:
+    """True if a cached CHIRP-FREE row would not be chirp-free under `max_frac`.
+
+    Deliberately not a `_column_expect` key. That dict is compared key-by-key
+    against the stored record and every key in it must be PRESENT there, so
+    adding one invalidates every column ever cached -- a 30 h re-solve to
+    re-derive numbers the threshold cannot change. The threshold only ever turns
+    a chirp-free fallback into a failure, so a row that did not take that
+    fallback is unaffected by construction, and a row that did can be re-checked
+    from what it already stores: the law it was rejected for is written out even
+    when it was not used.
+
+    A railed ridge stores no k2/k4 at all. Its excursion is unknown, so it can
+    never qualify as chirp-free and is always stale here.
+    """
+    if not ((got.get("operating_point") or {}).get("chirp_free")):
+        return False
+    ch = got.get("chirp") or {}
+    k2, k4 = ch.get("k2"), ch.get("k4")
+    t_g = (got.get("operating_point") or {}).get("t_g_ns")
+    eta = got.get("target_eta")
+    if k2 is None or k4 is None or not t_g or eta is None:
+        return True
+    eta = float(eta)
+    exc = abs(float(k2) * eta ** 2 + float(k4) * eta ** 4)
+    return exc / (1e3 / (2.0 * float(t_g))) > float(max_frac)
+
+
 def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     """Physics a cached column must have been solved under to be reused.
 
@@ -509,6 +537,7 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             quartic_warn=settings["quartic_warn"],
             zero_chirp_frac=float(settings.get("zero_chirp_frac", 0.0)),
             chirp_free_fallback=bool(settings.get("chirp_free_fallback", False)),
+            chirp_free_max_frac=float(settings.get("chirp_free_max_frac", 0.10)),
             couple_drag=bool(settings.get("couple_drag", True)),
             drag_decouple_fallback=bool(
                 settings.get("drag_decouple_fallback", False)),
@@ -715,6 +744,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 leak_max: Optional[float] = None,
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
+                chirp_free_max_frac: float = 0.10,
                 couple_drag: bool = True,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
@@ -786,6 +816,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         # moments, so nothing downstream changes.
         "zero_chirp_frac": float(zero_chirp_frac),
         "chirp_free_fallback": bool(chirp_free_fallback),
+        "chirp_free_max_frac": float(chirp_free_max_frac),
         "couple_drag": bool(couple_drag),
         "drag_decouple_fallback": bool(drag_decouple_fallback),
         "probe_shape": str(probe_shape),
@@ -865,6 +896,12 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
             path = os.path.join(cache_dir, f"col_{tag}.json") if cache_dir else None
             expect = _column_expect(col, settings)
             cached = None if overwrite else _cache_load(path, expect, log)
+            if cached is not None and _stale_chirp_free(
+                    cached, settings.get("chirp_free_max_frac", 0.10)):
+                log.info("  cached CHIRP-FREE row sweeps more than "
+                         "--chirp-free-max-frac of a half-linewidth, so a chirp "
+                         "was measurable and was discarded -- re-solving")
+                cached = None
             if cached is not None:
                 cached["cached"] = True
                 cached["nearest_landmark"] = nearest_landmark(landmarks,
@@ -909,6 +946,12 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
 
         expect = _column_expect(col, settings)
         cached = None if overwrite else _cache_load(path, expect, log)
+        if cached is not None and _stale_chirp_free(
+                cached, settings.get("chirp_free_max_frac", 0.10)):
+            log.info("  cached CHIRP-FREE row sweeps more than "
+                     "--chirp-free-max-frac of a half-linewidth, so a chirp "
+                     "was measurable and was discarded -- re-solving")
+            cached = None
         if cached is not None:
             log.info("  cached")
             cached["cached"] = True
@@ -1576,7 +1619,21 @@ def main() -> None:
                          "near-zero-shift ones -- exactly where a chirp has least to "
                          "do -- so excluding them biases any measurement of what "
                          "chirping buys (1.69x over the fitted columns vs ~1.50x "
-                         "including the rest).")
+                         "including the rest). GATED on --chirp-free-max-frac: a "
+                         "column whose law still sweeps a real fraction of a "
+                         "linewidth is NOT near-zero-shift, and zeroing its chirp "
+                         "reports a 1.00x gain that is an artefact of the fit.")
+    ap.add_argument("--chirp-free-max-frac", type=float, default=0.10,
+                    help="largest chirp excursion, as a fraction of the resonance "
+                         "half-width 1/(2 t_g), that --chirp-free-fallback may treat "
+                         "as no chirp at all. On the 2026-09-22 grid the two "
+                         "populations separate cleanly here: below 10%% the fit "
+                         "residual is 1.0-16.7x the excursion (no signal), above 20%% "
+                         "it is 0.21-0.58x (a real law that merely missed r2_min). "
+                         "Columns above the threshold RAISE so the measurement gets "
+                         "fixed -- wider --span-linewidths for a railed ridge, finer "
+                         "--wp-points/--amp-points for a noisy one -- rather than "
+                         "being absorbed as chirp-free.")
     ap.add_argument("--zero-chirp-frac", type=float, default=0.0,
                     help="when the shift-law fit fails r2 BUT the chirp would sweep "
                          "less than this fraction of the resonance half-width "
@@ -1759,6 +1816,7 @@ def main() -> None:
         shard=_shard, n_shards=_n_shards, envelope_m=args.envelope_m,
         zero_chirp_frac=args.zero_chirp_frac,
         chirp_free_fallback=args.chirp_free_fallback,
+        chirp_free_max_frac=args.chirp_free_max_frac,
         couple_drag=not args.decouple_drag,
         drag_decouple_fallback=args.drag_decouple_fallback,
         column_workers=args.column_workers,

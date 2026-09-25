@@ -2665,6 +2665,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 do_time_rabi: bool = True, jobs: int = 0,
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
+                chirp_free_max_frac: float = 0.10,
                 couple_drag: bool = True,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
@@ -2732,18 +2733,49 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     # biases any measurement of what chirping buys. On that grid the chirp's median
     # benefit is 1.69x over the 26 columns that fitted and ~1.50x once the 9 that
     # did not are included at ~1.0x.
+    #
+    # The fallback is NOT a blanket catch. "Chirp-free" has to mean the chirp is
+    # zero, not that we failed to measure one: a column whose ridge sweeps a real
+    # fraction of a linewidth needs its chirp, and silently zeroing it reports a
+    # 1.00x gain that is an artefact of the fit, not of the physics. Measured on
+    # the 2026-09-22 grid, the two populations separate cleanly on the excursion
+    # |k2 eta^2 + k4 eta^4| against the half-width 1/(2 t_g):
+    #
+    #   exc <= 10% of a half-width   residual is 1.0-16.7x the excursion  -> no signal
+    #   exc >  20% of a half-width   residual is 0.21-0.58x the excursion -> real law
+    #
+    # so the large-excursion columns fail r2_min while still describing 40-80% of
+    # the shift. Those must RAISE and be fixed (wider span, finer ridge), not be
+    # absorbed. A railed ridge carries no fit at all, so its excursion is unknown
+    # and it can never qualify -- the error text already names its own remedy.
     chirp_free = False
     try:
         table = rabi_shift_table(config, target_eta, **common)
     except RabiFitError as exc:
         if not chirp_free_fallback:
             raise
+        _fit = ((exc.table or {}).get("fit") or {})
+        _frac = _fit.get("chirp_excursion_frac_linewidth")
+        if _frac is None or float(_frac) > float(chirp_free_max_frac):
+            _why = ("the ridge railed, so no shift law was fitted and the excursion "
+                    "is unknown" if _frac is None else
+                    f"the chirp would sweep {float(_frac):.0%} of a half-linewidth "
+                    f"(> --chirp-free-max-frac {chirp_free_max_frac:g})")
+            raise RabiFitError(
+                f"{exc}\n\nThe chirp-free fallback did NOT fire: {_why}. A chirp-free "
+                f"calibration at this column would discard a shift the law does "
+                f"measure and report the chirp as worth exactly 1.00x, which is an "
+                f"artefact of the fit rather than a property of the device. Fix the "
+                f"MEASUREMENT (raise --span-linewidths for a railed ridge, or "
+                f"--wp-points / --amp-points for a noisy one) instead of zeroing "
+                f"the chirp.", exc.table) from exc
         table = exc.table
         chirp_free = True
-        log.info(f"step 1: no usable shift law ({exc}). Falling back to a CHIRP-FREE "
-                 f"calibration -- delta0 sets the carrier, step 3 measures the rest, "
-                 f"and the length scan never needed the law. The chirped variant is "
-                 f"NOT available at this column.")
+        log.info(f"step 1: no usable shift law ({exc}). The chirp would sweep only "
+                 f"{float(_frac):.1%} of a half-linewidth, so there is nothing to "
+                 f"chirp: falling back to a CHIRP-FREE calibration -- delta0 sets "
+                 f"the carrier, step 3 measures the rest, and the length scan never "
+                 f"needed the law.")
 
     def project(t_g: float) -> Dict[str, Any]:
         """The chirp implied by the measured law at this gate length."""
