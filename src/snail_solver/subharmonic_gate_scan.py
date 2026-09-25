@@ -1266,6 +1266,11 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
                   max_ratio: float = 0.3,
                   eta_lo: float = 0.2, eta_hi: float = 1.0, amp_points: int = 41,
                   wp_points: int = 25, drop_origin: bool = True,
+                  # Referenced in the body since the envelope-m derivation landed,
+                  # but never added here, so --dry-run raised NameError for every
+                  # invocation: the one command whose whole job is to be run BEFORE
+                  # spending anything. Default mirrors scan_config's own derivation.
+                  envelope_m: Optional[int] = None,
                   audit: bool = True) -> str:
     """The ``--dry-run`` report: geometry, cost, and every column's channel audit.
 
@@ -1790,6 +1795,7 @@ def main() -> None:
                              eta_lo=args.eta_lo,
                              eta_hi=args.eta_hi, amp_points=args.amp_points,
                              wp_points=args.wp_points,
+                             envelope_m=args.envelope_m,
                              drop_origin=not args.keep_origin,
                              audit=not args.no_audit)
         # With the per-column audit on, describe_grid streams and returns ""; with
