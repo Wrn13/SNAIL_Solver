@@ -832,6 +832,34 @@ def chevron_quality(cen: Dict[str, Any], offsets_GHz: np.ndarray, metric: np.nda
             "weight": float(np.clip(weight, 0.0, 1.0)), "reject": reject}
 
 
+class StarkCrossingInSweep(RabiFitError):
+    """The ridge changed transition part-way up the drive sweep.
+
+    A `RabiFitError` subclass so every existing handler keeps working, but a
+    DISTINCT one: the other failures say the fit is bad, this one says the
+    measurement is of two different things. It is also a result worth keeping --
+    `crossing_eta` is the drive at which the transitions swapped, which locates the
+    collision without a separate sweep.
+    """
+
+    def __init__(self, message, table=None, crossing_eta=None):
+        super().__init__(message, table)
+        self.crossing_eta = crossing_eta
+
+
+#: Weight given to a ridge row HELD across a contrast/leakage drop, relative to the
+#: median weight of the rows that did survive. Small enough that a held tail cannot
+#: set k2/k4 on its own, large enough that the unweighted r2 in `fit_shift_curve`
+#: does not reject the column over rows the fit was told to ignore.
+HELD_ROW_WEIGHT = 0.25
+
+#: A ridge step this many times the median adjacent step -- and the typical step on
+#: either side of it -- is read as the centre-finder CHANGING TRANSITION rather than
+#: as curvature. The Stark shift is a small, continuous function of drive: it cannot
+#: step, so a step that then settles means a different peak is being tracked.
+CONTINUITY_STEPS = 4.0
+
+
 def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                      eta_lo: float = 0.3, eta_hi: float = 1.0,
                      amp_points: int = 9, wp_span_MHz: Optional[float] = None,
@@ -846,6 +874,7 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                      stability_cutoffs: Sequence[float] = (1.0, 0.9, 0.8, 0.7),
                      window_tg: float = 2.0, n_time: int = 161, jobs: int = 0,
                      zero_chirp_frac: float = 0.0,
+                     max_span_growths: int = 3, max_wp_points: int = 121,
                      probe_shape: str = "constant",
                      moment_weighting: str = "rabi",
                      solver: Optional[Dict[str, Any]] = None,
@@ -965,6 +994,7 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     leakage = np.full(eta.size, np.nan)
     windows = np.full(eta.size, np.nan)
     spans = np.full(eta.size, np.nan)
+    n_offsets = np.full(eta.size, float(wp_points))
     chevrons = []
     shaped = str(probe_shape) != "constant"
     for i, e in enumerate(eta):
@@ -980,8 +1010,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
         span = (float(wp_span_MHz) if wp_span_MHz is not None
                 else 2.0 * float(span_linewidths) * linewidth_MHz(e))
 
-        for attempt in range(3):
-            offsets_GHz = (np.linspace(-span / 2.0, span / 2.0, int(wp_points)) * 1e-3
+        n_off = int(wp_points)
+        for attempt in range(int(max_span_growths) + 1):
+            offsets_GHz = (np.linspace(-span / 2.0, span / 2.0, n_off) * 1e-3
                            + float(wp_offset_GHz))
             chev = FSR.scan(config,
                             t_g_rung if shaped else t_g0, 1.0,
@@ -993,20 +1024,44 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                             keep_full_channels=True)
             m = np.asarray(chev["resonance_metric"], dtype=float)
             cen = fit_chevron_center(chev["offsets_GHz"], m)
-            # Widen only when the width itself is unconstrained (wings never sampled).
-            # A bad-rmse rejection instead means leakage broke the two-level chevron
-            # -- the contrast floor below catches that -- so widening won't help.
-            if (cen["hwhm_GHz"] * 1e3 <= 0.4 * span or wp_span_MHz is not None
-                    or attempt == 2):
+            # Two reasons to widen, and they are different failures.
+            #
+            # (a) the WIDTH is unconstrained -- the wings were never sampled. A
+            #     bad-rmse rejection instead means leakage broke the two-level
+            #     chevron, which the contrast floor below catches, so widening
+            #     would not help.
+            # (b) the CENTER rails against the edge of the window. The ridge then
+            #     is not a measurement at all, and the post-loop rail check used to
+            #     abort the whole column over it -- 6 columns of the 2026-09-22 grid
+            #     (-35/-30/-25 at both drives) died exactly here, with the remedy
+            #     ("raise --span-linewidths") printed in the message nobody acted on.
+            #     Acting on it here is strictly better: the row is remeasured on a
+            #     window that contains it instead of the column being discarded.
+            #
+            # The grid GROWS WITH THE SPAN. Widening at fixed wp_points coarsens the
+            # step, which both degrades the center fit and slackens the rail test
+            # (whose tolerance IS the step) -- trading a railed ridge for a badly
+            # resolved one that no longer reports itself.
+            _step = span / max(n_off - 1, 1)
+            _railed_row = (abs((cen["center_GHz"] - float(wp_offset_GHz)) * 1e3)
+                           >= 0.5 * span - _step)
+            _too_wide = cen["hwhm_GHz"] * 1e3 > 0.4 * span
+            if (not (_too_wide or _railed_row) or wp_span_MHz is not None
+                    or attempt == int(max_span_growths)):
                 break
-            span *= 3.0
+            why = "ridge railed at the window edge" if _railed_row else (
+                f"hwhm {cen['hwhm_GHz'] * 1e3:.2f} MHz too wide")
+            grow = 3.0 if _too_wide else 2.0
+            span *= grow
+            n_off = min(int(round((n_off - 1) * grow)) + 1, int(max_wp_points))
             if logger:
-                logger.info(f"    row {i + 1}: hwhm {cen['hwhm_GHz'] * 1e3:.2f} MHz too "
-                            f"wide for +/-{span / 6:.1f} MHz -- retrying at "
-                            f"+/-{span / 2:.1f} MHz")
+                logger.info(f"    row {i + 1}: {why} for +/-{span / (2 * grow):.1f} "
+                            f"MHz -- retrying at +/-{span / 2:.1f} MHz over "
+                            f"{n_off} offsets")
 
         windows[i] = window_ns
         spans[i] = span
+        n_offsets[i] = n_off
         contrast[i] = float(np.nanmax(m) - np.nanmin(m))
         leakage[i] = float(chev["leak_on_resonance"])
         j_res = int(np.argmin(np.abs(np.asarray(chev["offsets_GHz"], dtype=float)
@@ -1064,15 +1119,138 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                "quality": quality, "leakage": leakage,
                "windows_ns": windows, "spans_MHz": spans, "chevrons": chevrons}
 
-    # a ridge sitting on the scan edge is not a measurement
-    step = spans / max(int(wp_points) - 1, 1)
+    # A ridge sitting on the scan edge is not a measurement. The per-row loop above
+    # already grew the window up to --max-span-growths times trying to contain it, so
+    # anything still railing here has outrun that budget (or sits on a --wp-span-MHz
+    # the caller pinned by hand, which is honoured rather than overridden).
+    step = spans / np.maximum(n_offsets - 1.0, 1.0)
     railed = np.isfinite(ridge) & (np.abs(np.abs(ridge) - spans / 2.0) <= step)
     if railed.any():
         raise RabiFitError(
-            f"{int(railed.sum())}/{ridge.size} ridge rows rail against their scan "
-            f"window (spans {np.nanmin(spans) / 2:.1f}-{np.nanmax(spans) / 2:.1f} MHz "
-            f"half-width) -- raise --span-linewidths. A railed ridge produces a "
-            f"confident, wrong chirp.", partial)
+            f"{int(railed.sum())}/{ridge.size} ridge rows still rail against their "
+            f"scan window after growing it "
+            f"{'(pinned by --wp-span-MHz)' if wp_span_MHz is not None else
+               f'up to {max_span_growths}x'} "
+            f"(spans {np.nanmin(spans) / 2:.1f}-{np.nanmax(spans) / 2:.1f} MHz "
+            f"half-width) -- raise --span-linewidths or --max-span-growths. A railed "
+            f"ridge produces a confident, wrong chirp.", partial)
+
+    # The Stark shift is a small, CONTINUOUS function of drive strength. It cannot
+    # step. So a ridge that holds one level, jumps, and then holds another is not a
+    # shift that jumped -- it is the centre-finder having locked onto a DIFFERENT
+    # TRANSITION from some drive upwards, because the correct one has left the scan
+    # window or been buried under a competing peak.
+    #
+    # Which side is right is not a judgement call. At low drive the shift goes to
+    # zero and there is nothing to mis-track, so the branch continuous with the
+    # BOTTOM of the sweep is the real one and everything past the step is suspect.
+    #
+    # Measured at delta = +85 MHz, eta* = 1.3 on the 2026-09-22 grid:
+    #
+    #     |eta| = 0.910   -0.771 MHz   hwhm 5.72
+    #     |eta| = 0.936   -1.128       hwhm 5.64
+    #     |eta| = 0.962   -0.765       hwhm 9.48   <- chevron distorts
+    #     |eta| = 0.988   +0.661       hwhm 7.36   <- +1.43 MHz in one row
+    #     |eta| >= 1.014  +0.39 ... +1.81          smooth on a NEW level
+    #
+    # The step is ~50x the median adjacent step and lands where the half-width
+    # spikes: two resonances overlapping, with the fitted centre handed to the
+    # stronger. Every one of the 25 columns that failed r2 on that grid looks like
+    # this, which is why raising the polynomial degree bought ~0.01 in r2.
+    #
+    # A chirp must NOT be built through it. eta* sits above the step, so the rows
+    # that would set the chirp are the mis-tracked ones, and the law fitted below
+    # would have to be extrapolated across a crossing to reach the operating point --
+    # "a confident, wrong chirp", the exact failure the rail check exists to stop.
+    # The column is reported as a CROSSING instead: a physics result naming a drive
+    # and a detuning, not a fit that quietly came out flat.
+    _fin = np.flatnonzero(np.isfinite(ridge))
+    partial["stark_crossing_eta"] = None
+    if _fin.size >= 8:
+        _d = np.abs(np.diff(ridge[_fin]))
+        _med = float(np.median(_d))
+        _j = int(np.argmax(_d))
+        # A step is only a step if what follows SETTLES: a single wild row is noise,
+        # and a monotone steepening (k4 taking over at the top) is physics. Compare
+        # the jump against the typical step on each side of it.
+        _lo, _hi = _d[:_j], _d[_j + 1:]
+        _local = max(float(np.median(_lo)) if _lo.size else 0.0,
+                     float(np.median(_hi)) if _hi.size else 0.0)
+        if (_med > 0 and _lo.size >= 3 and _hi.size >= 3
+                and _d[_j] > CONTINUITY_STEPS * max(_med, _local)):
+            _eta_c = float(eta[_fin[_j]])
+            if logger:
+                logger.info(
+                    f"  rabi: the ridge STEPS {_d[_j]:.3f} MHz between |eta| = "
+                    f"{_eta_c:.4f} and {eta[_fin[_j + 1]]:.4f}, against a "
+                    f"{_med:.3f} MHz median step, and then settles on the new level. "
+                    f"A Stark shift is continuous in drive, so this is the "
+                    f"centre-finder tracking a DIFFERENT transition above "
+                    f"|eta| = {_eta_c:.3f} -- an avoided crossing inside the sweep.")
+            partial["stark_crossing_eta"] = _eta_c
+            partial["fit"] = partial.get("fit")
+            raise StarkCrossingInSweep(
+                f"the measured ridge steps {_d[_j]:.3f} MHz at |eta| = {_eta_c:.4f} "
+                f"({_d[_j] / max(_med, 1e-12):.0f}x the median step) and then holds "
+                f"the new level. The Stark shift is continuous in drive, so above "
+                f"that drive the chevron centre is a DIFFERENT transition -- the "
+                f"correct one has left the window or is buried under a competing "
+                f"peak. eta* = {target_eta:g} sits above the crossing, so a chirp "
+                f"here would be built from mis-tracked rows, and the law fitted "
+                f"below would have to be extrapolated across the crossing to reach "
+                f"the operating point. Widen --span-linewidths so the correct peak "
+                f"is inside the window, or lower --eta-hi / the target drive to stay "
+                f"below |eta| = {_eta_c:.3f}.", partial, crossing_eta=_eta_c)
+
+    # Rows dropped for LEAKAGE or LOW CONTRAST are not missing data in the ordinary
+    # sense. They drop at the top of the drive range, where leakage outpaces the
+    # exchange and the chevron never completes a swap, so the survivors are always a
+    # PREFIX in |eta| and what is lost is the far end of the law. Discarding the
+    # column for that throws away a ridge that was measured cleanly everywhere it
+    # could be measured.
+    #
+    # The assumption that costs least is that the shift STOPS MOVING beyond the last
+    # row that still swapped: hold the last good value across the dropped tail. It is
+    # a floor, not an extrapolation -- the true |eta|^2 + |eta|^4 law is monotone in
+    # |eta| over this range, so holding UNDER-states the shift and the resulting chirp
+    # is conservative, where a polynomial run past its last constraint would overshoot
+    # by whatever k4 happened to fit. Held rows carry zero weight in the fit, so they
+    # cannot pull k2/k4 themselves; they exist to keep the fit determined.
+    #
+    # Held rows are DOWNWEIGHTED, not zero-weighted. fit_shift_curve solves the
+    # lstsq with the weights but computes r2 UNWEIGHTED, so a zero-weight row still
+    # enters the residual and the total sum of squares: a flat held tail the fit was
+    # told to ignore would then push r2 below r2_min and fail the column through the
+    # very check this rescue exists to get past. A real but reduced weight instead
+    # states the assumption as data, and if the assumption is wrong r2 says so.
+    #
+    # Only ever a rescue: if the surviving rows already support a fit, nothing here
+    # changes. Recorded in `n_held` either way, because a law resting on held rows is
+    # weaker evidence than one that did not need them.
+    held = np.zeros(eta.size, dtype=bool)
+    if int(np.isfinite(ridge).sum()) < 4 and np.isfinite(ridge).any():
+        _good = np.flatnonzero(np.isfinite(ridge))
+        _w = float(np.nanmedian(quality[_good])) if np.isfinite(
+            quality[_good]).any() else 1.0
+        _w = HELD_ROW_WEIGHT * (_w if np.isfinite(_w) else 1.0)
+        _last = float(ridge[_good[-1]])
+        for _i in range(_good[-1] + 1, eta.size):
+            if not np.isfinite(ridge[_i]):
+                ridge[_i], held[_i], quality[_i] = _last, True, _w
+        _first = float(ridge[_good[0]])
+        for _i in range(_good[0] - 1, -1, -1):
+            if not np.isfinite(ridge[_i]):
+                ridge[_i], held[_i], quality[_i] = _first, True, _w
+        if held.any() and logger:
+            logger.info(
+                f"  rabi: only {_good.size} row(s) survived the contrast/leakage "
+                f"floor -- HOLDING the ridge at {_last:+.4f} MHz across "
+                f"{int(held.sum())} dropped row(s) so the law stays determined. The "
+                f"held rows carry {HELD_ROW_WEIGHT:g}x the surviving rows' weight "
+                f"and the shift is assumed flat beyond the last row that swapped, "
+                f"which under-states it.")
+    partial["held"] = held
+    partial["n_held"] = int(held.sum())
 
     # Too few surviving rows is a RabiFitError like every other one here: the
     # measurement ran, only the interpretation failed. Re-raised with the table
@@ -1134,19 +1312,35 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     fit["chirp_excursion_MHz"] = float(_exc)
     fit["chirp_excursion_frac_linewidth"] = float(_frac)
     fit["chirp_zeroed"] = False
+    fit["stark_absorbed_MHz"] = 0.0
     if (not (fit["r2"] >= r2_min)) and zero_chirp_frac > 0.0 \
             and _frac <= zero_chirp_frac:
+        # Zeroing the chirp must not throw the shift away. The law still says the
+        # resonance sits k2 eta*^2 + k4 eta*^4 off the bare carrier AT THE OPERATING
+        # DRIVE; what the excursion test established is only that this offset barely
+        # MOVES across the pulse, i.e. that it is static, not that it is absent.
+        # A static offset is exactly what the carrier is for, so it is absorbed into
+        # delta0 rather than discarded -- the same shift, paid for with a retuned
+        # carrier instead of a chirp.
+        #
+        # Signs: delta0 and the law are both the offset OF THE RESONANCE measured in
+        # the same frame (see the ridge assignment above), so they add.
+        _stark = float(fit["k2"]) * target_eta ** 2 + float(fit["k4"]) * target_eta ** 4
         fit["k2"], fit["k4"] = 0.0, 0.0
         fit["chirp_zeroed"] = True
+        fit["stark_absorbed_MHz"] = float(_stark)
+        fit["delta0_before_absorb_MHz"] = float(fit["delta0"])
+        fit["delta0"] = float(fit["delta0"]) + _stark
         fit["stark_span_MHz"] = 0.0
         if logger:
             logger.info(
                 f"  rabi: r2 = {fit['r2']:.3f} < {r2_min}, but the chirp would sweep "
                 f"only {_exc:.3f} MHz = {_frac:.0%} of the {_half_lw:.2f} MHz "
                 f"half-linewidth (<= --zero-chirp-frac {zero_chirp_frac:g}). The "
-                f"shift is not measurable AND not worth chirping: proceeding with "
-                f"ZERO chirp. The static offset delta0 = {fit['delta0']:+.4f} MHz is "
-                f"unaffected and still calibrated.")
+                f"shift is static rather than absent, so it is ABSORBED INTO THE "
+                f"CARRIER: delta0 {fit['delta0_before_absorb_MHz']:+.4f} "
+                f"-> {fit['delta0']:+.4f} MHz ({_stark:+.4f} MHz of Stark shift at "
+                f"eta* = {target_eta:g}), and the chirp is ZERO.")
     if not (fit["r2"] >= r2_min) and not fit["chirp_zeroed"]:
         raise RabiFitError(
             f"the ridge is not well described by delta0 + k2|eta|^2 + k4|eta|^4 "
@@ -2666,6 +2860,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
                 chirp_free_max_frac: float = 0.10,
+                max_span_growths: int = 3, max_wp_points: int = 121,
                 couple_drag: bool = True,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
@@ -2715,6 +2910,15 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                   window_tg=window_tg, n_time=n_time, jobs=jobs, solver=solver,
                   span_linewidths=span_linewidths, contrast_min=contrast_min,
                   probe_shape=probe_shape, moment_weighting=moment_weighting,
+                  max_span_growths=int(max_span_growths),
+                  max_wp_points=int(max_wp_points),
+                  # A chirp that does not MOVE is a static detuning, and the carrier
+                  # already has a knob for that. Defaulting the zeroing threshold to
+                  # chirp_free_max_frac means such a column is retuned and solved
+                  # rather than routed into the chirp-free fallback, which is the
+                  # same physics reported as a missing series.
+                  zero_chirp_frac=(float(zero_chirp_frac) if zero_chirp_frac > 0.0
+                                   else float(chirp_free_max_frac)),
                   logger=log, **map_kw)
 
     # -- 1: the Rabi sweep, measured once ------------------------------------
@@ -2749,8 +2953,27 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     # absorbed. A railed ridge carries no fit at all, so its excursion is unknown
     # and it can never qualify -- the error text already names its own remedy.
     chirp_free = False
+    chirp_free_reason = None
+    stark_crossing_eta = None
     try:
         table = rabi_shift_table(config, target_eta, **common)
+    except StarkCrossingInSweep as exc:
+        # A crossing is not a failed fit, it is a measurement of two different
+        # transitions, and the two want opposite treatment. The chirp is genuinely
+        # UNAVAILABLE here -- there is no trustworthy ridge at eta* to build one
+        # from -- so the column still calibrates bare (and DRAG, which needs no shift
+        # law), and the chirp series records an EXCLUSION. The one thing it must not
+        # do is report a chirp worth 1.00x, which is what conflating this with "no
+        # measurable shift" produced for 14 columns of the 2026-09-22 grid.
+        if not chirp_free_fallback:
+            raise
+        table = exc.table
+        chirp_free = True
+        chirp_free_reason = "stark_crossing"
+        stark_crossing_eta = exc.crossing_eta
+        log.info(f"step 1: {exc} Calibrating the column WITHOUT a chirp so the bare "
+                 f"and DRAG series survive; the chirp series is EXCLUDED here, not "
+                 f"reported as no-gain.")
     except RabiFitError as exc:
         if not chirp_free_fallback:
             raise
@@ -2771,6 +2994,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 f"the chirp.", exc.table) from exc
         table = exc.table
         chirp_free = True
+        chirp_free_reason = "no_measurable_shift"
         log.info(f"step 1: no usable shift law ({exc}). The chirp would sweep only "
                  f"{float(_frac):.1%} of a half-linewidth, so there is nothing to "
                  f"chirp: falling back to a CHIRP-FREE calibration -- delta0 sets "
@@ -3063,6 +3287,12 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         # flag a chirp-free fallback is indistinguishable from a chirp that
         # happened to fit to zero.
         "chirp_free": bool(chirp_free),
+        # WHY it is chirp-free decides how the plot must treat it. "no_measurable
+        # shift" is a real 1.00x: there was nothing to chirp. "stark_crossing" is an
+        # EXCLUSION: a chirp could not be measured, and averaging it in at 1.00x
+        # biases the chirp's benefit downwards exactly where the device is hardest.
+        "chirp_free_reason": chirp_free_reason,
+        "stark_crossing_eta": stark_crossing_eta,
         # Non-empty when the coupled fixed point diverged and this column fell
         # back to decoupled DRAG; the values are min|Delta| at each fallback.
         "drag_decoupled": bool(drag_decoupled),

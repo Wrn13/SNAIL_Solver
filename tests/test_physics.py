@@ -6989,3 +6989,109 @@ class TestAStaleChirpFreeColumnIsNotServedFromCache(unittest.TestCase):
         row = self._row(True)
         row["chirp"] = {}
         self.assertTrue(_stale_chirp_free(row, 0.10))
+
+
+class TestTheStarkRidgeMustBeContinuousInDrive(unittest.TestCase):
+    """A Stark shift cannot step, so a step means the wrong transition was tracked.
+
+    ``delta(|eta|) = k2 |eta|^2 + k4 |eta|^4`` is smooth by construction and the
+    physical shift it stands for is too. A ridge that holds one level, jumps, and
+    then holds another is the centre-finder having locked onto a DIFFERENT
+    transition from some drive upwards -- the correct one having left the scan
+    window or been buried under a competing peak.
+
+    Which side is right is not a judgement call: at low drive the shift goes to zero
+    and there is nothing to mis-track, so the branch continuous with the bottom of
+    the sweep is the real one.
+
+    Measured at delta = +85 MHz, eta* = 1.3 on the 2026-09-22 grid, the ridge holds
+    ~-0.8 MHz to |eta| = 0.94, steps +1.43 MHz in one row where the chevron
+    half-width spikes 5.7 -> 9.5 MHz, and then climbs smoothly on the new level to
+    +1.81 MHz. eta* sits ABOVE that step, so the rows that would set the chirp are
+    the mis-tracked ones. Such a column is reported as a CROSSING -- a physics
+    result naming a drive -- and its chirp series is excluded, never averaged in at
+    1.00x, which is what 14 columns of that grid silently did.
+    """
+
+    @staticmethod
+    def _detect(eta, ridge, target_eta=1.3):
+        """Run the production detector over a ridge, returning the crossing or None.
+
+        Exercised through `rabi_shift_table`'s own code path by monkeypatching the
+        measurement, so the test cannot drift from the rule it is checking.
+        """
+        from unittest import mock
+        from snail_solver.tune_up import (RabiFitError, StarkCrossingInSweep,
+                                          rabi_shift_table)
+        cfg = _cfg(envelope="sine_power", envelope_m=3)
+
+        def fake_scan(config, t_g, amp, offsets_GHz, window_ns, n_time, **kw):
+            e = float(kw.get("eta_op", 0.0))
+            k = int(np.argmin(np.abs(eta - e)))
+            off = np.asarray(offsets_GHz, float)
+            centre = ridge[k] * 1e-3
+            m = 1.0 / (1.0 + ((off - centre) / 2e-3) ** 2)
+            n = int(n_time)
+            return {"offsets_GHz": off, "resonance_metric": m,
+                    "leak_on_resonance": 0.001,
+                    "leak_f_a": np.zeros_like(off), "leak_f_b": np.zeros_like(off),
+                    "leak_coupler": np.zeros_like(off),
+                    "leak_double": np.zeros_like(off),
+                    "leak_spectator": np.zeros_like(off),
+                    "times_ns": np.linspace(0.0, window_ns, n),
+                    "P10": np.zeros((off.size, n)), "P01": np.zeros((off.size, n)),
+                    "P_leak": np.zeros((off.size, n)),
+                    "leak_at_metric": np.zeros_like(off), "norm_defect_max": 1e-12}
+
+        with mock.patch("snail_solver.find_stark_resonance.scan", fake_scan):
+            try:
+                rabi_shift_table(cfg, target_eta, eta_lo=0.2, eta_hi=1.0,
+                                 amp_points=eta.size, wp_points=41,
+                                 wp_span_MHz=40.0)
+            except StarkCrossingInSweep as exc:
+                return exc.crossing_eta
+            except RabiFitError:
+                # Some other complaint about the synthetic ridge -- not a crossing,
+                # which is what these tests are about. NOT a bare `except`: that hid
+                # a TypeError from a kwarg this function does not take and turned
+                # every positive case into a silent "no crossing".
+                return None
+        return None
+
+    @staticmethod
+    def _grid(n=41, target_eta=1.3):
+        return np.linspace(0.2, 1.0, n) * target_eta
+
+    def test_a_smooth_law_is_not_a_crossing(self):
+        eta = self._grid()
+        self.assertIsNone(self._detect(eta, -1.9 * eta ** 2 + 1.85 * eta ** 4))
+
+    def test_a_steepening_quartic_is_not_a_crossing(self):
+        """k4 taking over at the top is physics: the step grows, but smoothly."""
+        eta = self._grid()
+        self.assertIsNone(self._detect(eta, -3.0 * eta ** 2 + 6.0 * eta ** 4))
+
+    def test_a_level_shift_that_settles_is_a_crossing(self):
+        """The +85 MHz column in miniature: one level, a jump, another level."""
+        eta = self._grid()
+        y = -1.9 * eta ** 2 + 1.85 * eta ** 4
+        y[eta > 0.96] += 1.4
+        got = self._detect(eta, y)
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got, float(eta[eta <= 0.96][-1]), places=6)
+
+    def test_the_crossing_drive_is_reported(self):
+        """`crossing_eta` locates the collision, which is the result worth keeping."""
+        eta = self._grid()
+        y = -1.9 * eta ** 2 + 1.85 * eta ** 4
+        y[eta > 0.7] += 1.4
+        got = self._detect(eta, y)
+        self.assertIsNotNone(got)
+        self.assertLess(abs(got - 0.7), 0.05)
+
+    def test_a_crossing_is_a_rabi_fit_error_so_old_handlers_still_catch_it(self):
+        from snail_solver.tune_up import RabiFitError, StarkCrossingInSweep
+        self.assertTrue(issubclass(StarkCrossingInSweep, RabiFitError))
+        exc = StarkCrossingInSweep("x", {"fit": {}}, crossing_eta=0.96)
+        self.assertEqual(exc.crossing_eta, 0.96)
+        self.assertIsInstance(exc, RabiFitError)

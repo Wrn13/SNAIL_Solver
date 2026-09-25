@@ -538,6 +538,8 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             zero_chirp_frac=float(settings.get("zero_chirp_frac", 0.0)),
             chirp_free_fallback=bool(settings.get("chirp_free_fallback", False)),
             chirp_free_max_frac=float(settings.get("chirp_free_max_frac", 0.10)),
+            max_span_growths=int(settings.get("max_span_growths", 3)),
+            max_wp_points=int(settings.get("max_wp_points", 121)),
             couple_drag=bool(settings.get("couple_drag", True)),
             drag_decouple_fallback=bool(
                 settings.get("drag_decouple_fallback", False)),
@@ -745,6 +747,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 zero_chirp_frac: float = 0.0,
                 chirp_free_fallback: bool = False,
                 chirp_free_max_frac: float = 0.10,
+                max_span_growths: int = 3, max_wp_points: int = 121,
                 couple_drag: bool = True,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
@@ -817,6 +820,8 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "zero_chirp_frac": float(zero_chirp_frac),
         "chirp_free_fallback": bool(chirp_free_fallback),
         "chirp_free_max_frac": float(chirp_free_max_frac),
+        "max_span_growths": int(max_span_growths),
+        "max_wp_points": int(max_wp_points),
         "couple_drag": bool(couple_drag),
         "drag_decouple_fallback": bool(drag_decouple_fallback),
         "probe_shape": str(probe_shape),
@@ -1634,6 +1639,19 @@ def main() -> None:
                          "fixed -- wider --span-linewidths for a railed ridge, finer "
                          "--wp-points/--amp-points for a noisy one -- rather than "
                          "being absorbed as chirp-free.")
+    ap.add_argument("--max-span-growths", type=int, default=3,
+                    help="how many times a Rabi row may GROW its pump-offset window "
+                         "when the ridge rails against the edge (x2 each, with the "
+                         "offset count grown to match so the step stays put). A "
+                         "railed ridge is not a measurement, and the old behaviour "
+                         "was to abort the column with 'raise --span-linewidths' in "
+                         "the message -- which is the same remedy, applied by hand, "
+                         "a run later. 0 restores that. Ignored under an explicit "
+                         "--wp-span-MHz, which is taken as deliberate.")
+    ap.add_argument("--max-wp-points", type=int, default=121,
+                    help="ceiling on the grown offset count per Rabi row, since each "
+                         "offset is a solve. Only reached by rows that rail several "
+                         "times.")
     ap.add_argument("--zero-chirp-frac", type=float, default=0.0,
                     help="when the shift-law fit fails r2 BUT the chirp would sweep "
                          "less than this fraction of the resonance half-width "
@@ -1642,7 +1660,13 @@ def main() -> None:
                          "is near zero fails it on a small denominator even with "
                          "pristine chevrons. Keep it small: at 48%% of a half-width "
                          "the chirp was measured to be worth 2.8x, so 0.15 is "
-                         "already generous. 0 disables.")
+                         "already generous. 0 means DEFAULT TO --chirp-free-max-frac, "
+                         "not disabled: a chirp that does not move is a static "
+                         "detuning and the carrier already has a knob for it, so the "
+                         "shift is absorbed into delta0 and the column is solved "
+                         "rather than routed into the chirp-free fallback. (Until "
+                         "2026-09-25 this flag reached no code at all -- run_tune_up "
+                         "accepted it and never passed it to rabi_shift_table.)")
     ap.add_argument("--drag-decouple-fallback", action="store_true",
                     help="keep the coupled chirp<->DRAG fixed point, but when it "
                          "DIVERGES at a column, fall back to decoupled DRAG there "
@@ -1817,6 +1841,8 @@ def main() -> None:
         zero_chirp_frac=args.zero_chirp_frac,
         chirp_free_fallback=args.chirp_free_fallback,
         chirp_free_max_frac=args.chirp_free_max_frac,
+        max_span_growths=args.max_span_growths,
+        max_wp_points=args.max_wp_points,
         couple_drag=not args.decouple_drag,
         drag_decouple_fallback=args.drag_decouple_fallback,
         column_workers=args.column_workers,
