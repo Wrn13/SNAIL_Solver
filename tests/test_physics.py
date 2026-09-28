@@ -7095,3 +7095,335 @@ class TestTheStarkRidgeMustBeContinuousInDrive(unittest.TestCase):
         exc = StarkCrossingInSweep("x", {"fit": {}}, crossing_eta=0.96)
         self.assertEqual(exc.crossing_eta, 0.96)
         self.assertIsInstance(exc, RabiFitError)
+
+
+class TestTheStoredChevronsAreEnoughToRefitTheLaw(unittest.TestCase):
+    """A fit-policy question must cost seconds, not a three-day re-measurement.
+
+    A column's price is its Rabi sweep -- measured at 91% of a pass-A column's
+    wall time and 69% of a pass-B column's on the 2026-09-25 grid. Everything
+    after it is numpy over arrays the run already wrote under
+    ``columns/<tag>/stages/rabi``. `ridge_refit` exists so that asymmetry is
+    exploited rather than rediscovered: 189 real columns re-fitted in a minute,
+    against ~64 h to re-solve them.
+
+    The invariant that makes it trustworthy is the identity re-fit: gating the
+    stored chevrons under the stored thresholds must return the ridge the run
+    recorded. If it does not, its verdict on a NEW policy is worthless, because
+    the difference could be the harness rather than the policy.
+    """
+
+    @staticmethod
+    def _chevrons(k2=-1.9, k4=1.85, n=9, eta_star=1.3, n_off=15, span_MHz=13.0):
+        """A synthetic ridge with each row stored the way a run stores it."""
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        etas = np.linspace(0.3, 1.0, n) * eta_star
+        rows = []
+        for e in etas:
+            centre = k2 * e ** 2 + k4 * e ** 4
+            off, m = TestChevronCentreFit._chevron(centre, n_off=n_off,
+                                                   span_MHz=span_MHz)
+            cen = fit_chevron_center(off, m)
+            q = chevron_quality(cen, off, m, span_MHz, leak=0.0)
+            rows.append({"eta": float(e), "offsets_GHz": off, "metric": m,
+                         "span_MHz": span_MHz, "fit": cen, "quality": q})
+        return etas, rows
+
+    def test_gating_stored_chevrons_returns_the_stored_ridge(self):
+        """The identity re-fit. Nothing else in the module means anything without it."""
+        from snail_solver.ridge_refit import gate_rows
+        _, rows = self._chevrons()
+        ridge, weights, rejects = gate_rows(rows)
+        for i, ch in enumerate(rows):
+            self.assertIsNone(rejects[i])
+            self.assertAlmostEqual(ridge[i], ch["fit"]["center_GHz"] * 1e3, places=12)
+            self.assertAlmostEqual(weights[i], ch["quality"]["weight"], places=12)
+
+    def test_refitting_a_row_reproduces_its_stored_centre_exactly(self):
+        """`refit_centers` must be a no-op on a row that was never widened.
+
+        Verified against the real grid too: over the 40 un-widened rows of
+        ``d0p17_eta1p3`` the largest |re-fit - stored| centre difference is
+        0.000e+00 GHz. A harness that perturbed clean rows would attribute its
+        own noise to whatever policy it was testing.
+        """
+        from snail_solver.ridge_refit import gate_rows
+        _, rows = self._chevrons()
+        a, _, _ = gate_rows(rows)
+        b, _, _ = gate_rows(rows, refit_centers=True)
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-12)
+
+    def test_a_rejected_row_leaves_a_nan_not_a_gap(self):
+        """`rabi_shift_table` pre-fills NaN (:991) and a reject is a no-op write."""
+        from snail_solver.ridge_refit import gate_rows
+        _, rows = self._chevrons()
+        ridge, _, rejects = gate_rows(rows, contrast_min=2.0)   # nothing can pass
+        self.assertTrue(np.all(np.isnan(ridge)))
+        self.assertEqual(set(rejects), {"low_contrast"})
+
+    def test_the_ridge_is_reported_relative_to_the_probe_offset(self):
+        """`ridge[i] = (center - wp_offset) * 1e3` (tune_up.py:1103)."""
+        from snail_solver.ridge_refit import gate_rows
+        _, rows = self._chevrons()
+        base, _, _ = gate_rows(rows, wp_offset_GHz=0.0)
+        moved, _, _ = gate_rows(rows, wp_offset_GHz=1e-3)
+        np.testing.assert_allclose(moved, base - 1.0, rtol=0, atol=1e-9)
+
+
+class TestANarrowSliceIsTheRowBeforeItWasWidened(unittest.TestCase):
+    """The "what if this row had not been widened" counterfactual is exact.
+
+    A span growth re-samples at the SAME step -- `rabi_shift_table` grows
+    ``n_off`` by the same factor as the span (tune_up.py:1056-1059) -- so a
+    3x-widened 43-point row is the original 15-point grid with 14 points added
+    on each side, at identical offsets. That is why the widening policy could
+    be settled from stored data instead of re-solved: over the 2026-09-25 grid,
+    cropping the 834 ``_too_wide`` rows KEEPS MORE of them (62.1% vs 54.0%),
+    so the growth was losing the rows it was meant to save.
+
+    An off-by-one here would silently compare two different measurements, so
+    the arithmetic raises rather than guesses.
+    """
+
+    def test_the_central_points_are_the_original_offsets(self):
+        from snail_solver.ridge_refit import narrow_slice
+        wide = np.linspace(-3.0, 3.0, 43)          # a 3x growth of 15 points
+        narrow = np.linspace(-1.0, 1.0, 15)
+        np.testing.assert_allclose(wide[narrow_slice(wide, 15)], narrow,
+                                   rtol=0, atol=1e-12)
+
+    def test_a_two_times_growth_also_lines_up(self):
+        from snail_solver.ridge_refit import narrow_slice
+        wide = np.linspace(-2.0, 2.0, 29)          # the railed trigger, 2x
+        np.testing.assert_allclose(wide[narrow_slice(wide, 15)],
+                                   np.linspace(-1.0, 1.0, 15), rtol=0, atol=1e-12)
+
+    def test_an_asymmetric_count_is_refused_rather_than_rounded(self):
+        from snail_solver.ridge_refit import narrow_slice
+        with self.assertRaises(ValueError):
+            narrow_slice(np.zeros(20), 15)
+        with self.assertRaises(ValueError):
+            narrow_slice(np.zeros(9), 15)
+
+
+class TestTheShiftLawCanCarryMoreThanTwoTerms(unittest.TestCase):
+    """`fit_shift_curve` hardwires (0, 2, 4); the physics does not.
+
+    Measured over the 2026-09-25 grid, 91% of the 121 SUCCESSFUL columns have
+    ``|k4 eta*^4 / k2 eta*^2|`` above the 0.25 warn threshold (median 0.62, max
+    19.9), and all 64 fittable failures sit below r2 = 0.9. The ridge is smooth
+    and two-term-describable at low drive and stops being so at high drive:
+    a truncation, not a bad measurement.
+
+    `fit_law` generalizes the powers so that claim can be tested rather than
+    asserted. It must reduce to the production fit exactly when handed (0,2,4),
+    or a comparison between them measures the harness.
+    """
+
+    @staticmethod
+    def _ridge(k2=-1.9, k4=1.85, k6=0.0, n=13, eta_star=1.3):
+        eta = np.linspace(0.3, 1.0, n) * eta_star
+        return eta, k2 * eta ** 2 + k4 * eta ** 4 + k6 * eta ** 6
+
+    def test_the_two_term_law_matches_the_production_fit(self):
+        from snail_solver.ridge_refit import fit_law
+        from snail_solver.tune_up import fit_shift_curve
+        eta, y = self._ridge()
+        w = np.linspace(0.4, 0.9, eta.size)
+        ref = fit_shift_curve(eta, y, w)
+        got = fit_law(eta, y, w)
+        self.assertAlmostEqual(got["coeffs"]["k2"], ref["k2"], places=9)
+        self.assertAlmostEqual(got["coeffs"]["k4"], ref["k4"], places=9)
+        self.assertAlmostEqual(got["coeffs"]["k0"], ref["delta0"], places=9)
+        self.assertEqual(got["n_used"], ref["n_used"])
+        # `fit_shift_curve` solves WEIGHTED and scores r2 UNWEIGHTED
+        # (tune_up.py:572). That inconsistency is the pipeline's; the harness
+        # reports both so the two can be compared without inheriting it.
+        self.assertAlmostEqual(got["r2_unweighted"], ref["r2"], places=9)
+
+    def test_a_sixth_order_ridge_needs_a_sixth_order_law(self):
+        from snail_solver.ridge_refit import fit_law
+        eta, y = self._ridge(k6=3.0)
+        self.assertLess(fit_law(eta, y)["r2_unweighted"], 0.9999)
+        got = fit_law(eta, y, powers=(0, 2, 4, 6))
+        self.assertGreater(got["r2_unweighted"], 1.0 - 1e-9)
+        self.assertAlmostEqual(got["coeffs"]["k6"], 3.0, places=6)
+
+    def test_capping_the_fit_range_records_what_it_cost(self):
+        """r2 rises by fitting fewer rows; `eta_max_fitted` is what pays for it."""
+        from snail_solver.ridge_refit import fit_law
+        eta, y = self._ridge()
+        got = fit_law(eta, y, eta_max=0.8 * 1.3)
+        self.assertLess(got["n_used"], eta.size)
+        self.assertLessEqual(got["eta_max_fitted"], 0.8 * 1.3 + 1e-12)
+
+    def test_too_few_rows_for_the_requested_law_is_an_error_not_a_fit(self):
+        from snail_solver.ridge_refit import fit_law
+        eta, y = self._ridge(n=13)
+        y = y.copy()
+        y[3:] = np.nan                               # 3 usable rows
+        with self.assertRaises(ValueError):
+            fit_law(eta, y)
+
+    def test_the_static_term_is_not_part_of_the_excursion(self):
+        """delta0 survives at zero drive, so a chirp must not track it (:522)."""
+        from snail_solver.ridge_refit import evaluate_law, fit_law
+        eta, y = self._ridge()
+        got = fit_law(eta, y + 40.0)                 # a big static offset
+        self.assertAlmostEqual(got["coeffs"]["k0"], 40.0, places=6)
+        self.assertAlmostEqual(evaluate_law(got, 1.3),
+                               -1.9 * 1.3 ** 2 + 1.85 * 1.3 ** 4, places=6)
+
+
+class TestALawMustReportItsOwnTruncation(unittest.TestCase):
+    """r2 cannot see a series that has not converged, or one read off its end.
+
+    Two failures r2 is blind to, and both are common here. A law fitted over
+    every row can have r2 = 0.99 with its last term twice the size of its
+    first -- that is a truncation that has not settled, and the chirp built
+    from it is an extrapolation in disguise. A law fitted to eta <= 0.6 eta*
+    and evaluated at eta* has r2 = 0.999 by construction and is reading
+    outside its own data.
+    """
+
+    @staticmethod
+    def _fit(k2=-1.9, k4=1.85, powers=(0, 2, 4), eta_max_fitted=1.3):
+        coeffs = {"k0": 0.0, "k2": k2, "k4": k4}
+        return {"powers": powers,
+                "coeffs": {k: coeffs.get(k, 0.0) for k in
+                           (f"k{p}" for p in powers)},
+                "eta_max_fitted": eta_max_fitted}
+
+    def test_the_last_term_fraction_is_the_production_quartic_fraction(self):
+        """For (0, 2, 4) it must BE `quartic_fraction` (tune_up.py:1808).
+
+        Checked against the real grid as well as here: over the 87 columns of
+        the 2026-09-25 pass A that stored both, the largest relative difference
+        against the run's own recorded value is 0.00e+00.
+        """
+        from snail_solver.ridge_refit import law_diagnostics
+        d = law_diagnostics(self._fit(), 1.3, 106.838)
+        expected = abs(1.85 * 1.3 ** 4) / abs(-1.9 * 1.3 ** 2)
+        self.assertAlmostEqual(d["last_term_fraction"], expected, places=12)
+
+    def test_a_converged_series_sits_under_the_warn_threshold(self):
+        from snail_solver.ridge_refit import law_diagnostics
+        d = law_diagnostics(self._fit(k2=-10.0, k4=0.1), 1.3, 106.838)
+        self.assertLess(d["last_term_fraction"], 0.25)
+
+    def test_extrapolation_is_flagged_even_when_the_fit_is_perfect(self):
+        from snail_solver.ridge_refit import law_diagnostics
+        d = law_diagnostics(self._fit(eta_max_fitted=0.78), 1.3, 106.838)
+        self.assertAlmostEqual(d["extrapolation_ratio"], 1.3 / 0.78, places=9)
+        inside = law_diagnostics(self._fit(eta_max_fitted=1.3), 1.3, 106.838)
+        self.assertAlmostEqual(inside["extrapolation_ratio"], 1.0, places=9)
+
+    def test_the_excursion_is_measured_against_the_resonance_half_width(self):
+        """The discriminator between "no shift to chirp" and "we missed it"."""
+        from snail_solver.ridge_refit import law_diagnostics
+        t_g = 106.838
+        d = law_diagnostics(self._fit(), 1.3, t_g)
+        self.assertAlmostEqual(
+            d["excursion_frac_linewidth"],
+            d["excursion_MHz"] / (1e3 / (2.0 * t_g)), places=12)
+
+
+class TestTheProbeMomentsGeneralizeToAnyEvenOrder(unittest.TestCase):
+    """Extending the law needs M6, and `stark_moments` returns exactly (M2, M4).
+
+    Its derivation is not limited to two orders: a shaped probe of peak eta*
+    reports ``sum_n k_2n M_2n eta*^2n`` with ``M_2n = <f^n>_w``, diagonal in the
+    even powers because the law is an even polynomial. So M6 = <f^3>_w.
+
+    `ridge_refit.probe_moments_general` is a second implementation of that
+    integral, and a second implementation is a liability unless it is pinned to
+    the first. On the real device config it agrees to 0.00e+00 on both shared
+    orders; this test is what keeps it that way.
+    """
+
+    @staticmethod
+    def _cfg_shaped():
+        return _cfg(envelope="sine_power", envelope_m=3)
+
+    def test_it_reproduces_the_production_pair_exactly(self):
+        from snail_solver.ridge_refit import probe_moments_general
+        from snail_solver.tune_up import probe_moments
+        cfg = self._cfg_shaped()
+        M2, M4 = probe_moments(cfg, "rabi")
+        got = probe_moments_general(cfg, (0, 2, 4, 6))
+        self.assertAlmostEqual(got[2], M2, places=12)
+        self.assertAlmostEqual(got[4], M4, places=12)
+
+    def test_the_static_term_has_no_moment(self):
+        """delta0 is drive-independent, so no envelope averages it away."""
+        from snail_solver.ridge_refit import probe_moments_general
+        self.assertEqual(probe_moments_general(self._cfg_shaped(), (0, 2))[0], 1.0)
+
+    def test_the_moments_decrease_with_order(self):
+        """``<f^n>`` falls with n for 0 <= f <= 1, and each stays in (0, 1]."""
+        from snail_solver.ridge_refit import probe_moments_general
+        M = probe_moments_general(self._cfg_shaped(), (2, 4, 6))
+        self.assertTrue(1.0 >= M[2] > M[4] > M[6] > 0.0)
+
+    def test_every_alternative_weighting_generalizes_too(self):
+        from snail_solver.ridge_refit import probe_moments_general
+        from snail_solver.tune_up import probe_moments
+        cfg = self._cfg_shaped()
+        for w in ("uniform", "coupling"):
+            M2, M4 = probe_moments(cfg, w)
+            got = probe_moments_general(cfg, (2, 4, 6), weighting=w)
+            self.assertAlmostEqual(got[2], M2, places=12, msg=w)
+            self.assertAlmostEqual(got[4], M4, places=12, msg=w)
+
+    def test_an_odd_power_is_refused_rather_than_divided(self):
+        """An odd term mixes orders under a shaped probe -- no moment undoes it."""
+        from snail_solver.ridge_refit import probe_moments_general
+        with self.assertRaises(ValueError):
+            probe_moments_general(self._cfg_shaped(), (0, 2, 3))
+
+
+class TestAStoredLawIsNeverRefinedOnlyReplaced(unittest.TestCase):
+    """The stored ``k2`` is already ``K2_measured / M2``; dividing again is a bug.
+
+    The shaped-probe de-convolution at tune_up.py:1272-1283 runs ONCE, on the
+    way out. A re-fit that took the stored ``fit`` as its starting point would
+    apply the envelope moments a second time and report a law inflated by
+    ``1/M2`` -- about 20% on this device at second order, more at fourth. So
+    the loader drops the stored fit outright rather than offering it as an
+    input.
+    """
+
+    def test_the_loader_refuses_to_hand_back_a_post_processed_fit(self):
+        import inspect
+
+        from snail_solver import ridge_refit
+        src = inspect.getsource(ridge_refit.load_column_rabi)
+        for key in ('"fit"', '"delta_MHz"', '"quality"'):
+            self.assertIn(key, src)
+        self.assertIn("pop", src)
+
+    def test_deconvolving_twice_changes_the_answer(self):
+        """If it were idempotent the guard above would be unnecessary."""
+        from snail_solver.ridge_refit import deconvolve_moments
+        fit = {"powers": (0, 2, 4), "coeffs": {"k0": 1.0, "k2": -2.0, "k4": 0.5}}
+        M = {0: 1.0, 2: 0.83, 4: 0.75}
+        once = deconvolve_moments(fit, M)
+        twice = deconvolve_moments(once, M)
+        self.assertNotAlmostEqual(once["coeffs"]["k2"], twice["coeffs"]["k2"])
+        self.assertAlmostEqual(once["coeffs"]["k2"], -2.0 / 0.83, places=12)
+        # delta0 is drive-independent and its moment is 1, so it must not move.
+        self.assertAlmostEqual(once["coeffs"]["k0"], 1.0, places=12)
+
+    def test_it_keeps_the_measured_coefficients_alongside(self):
+        """`K2_measured` is what the shaped probe saw; both belong in the record."""
+        from snail_solver.ridge_refit import deconvolve_moments
+        fit = {"powers": (0, 2), "coeffs": {"k0": 0.0, "k2": -2.0}}
+        out = deconvolve_moments(fit, {0: 1.0, 2: 0.5})
+        self.assertAlmostEqual(out["coeffs_measured"]["k2"], -2.0, places=12)
+        self.assertAlmostEqual(out["coeffs"]["k2"], -4.0, places=12)
+        self.assertAlmostEqual(out["moments"]["M2"], 0.5, places=12)
+
+    def test_a_zero_moment_is_an_error_not_an_infinity(self):
+        from snail_solver.ridge_refit import deconvolve_moments
+        with self.assertRaises(ValueError):
+            deconvolve_moments({"powers": (2,), "coeffs": {"k2": 1.0}}, {2: 0.0})
