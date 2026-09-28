@@ -166,6 +166,26 @@ def figure_for(eta, rows, outdir):
             seen_stages[st] = col
             ax.axvspan(i - 0.5, i + 0.5, color=col, alpha=0.13, lw=0, zorder=0)
 
+    # Columns that calibrated, but whose CHIRP is not a measurement. Distinct from
+    # the failure shading above: the gate here is real and its bare number stands;
+    # it is only the chirp comparison that is unavailable.
+    n_excluded = 0
+    for i, r in enumerate(rows):
+        if r.get("chirp_excluded"):
+            n_excluded += 1
+            ax.axvspan(i - 0.5, i + 0.5, facecolor="none", edgecolor=MUTED,
+                       hatch="///", lw=0.0, alpha=0.5, zorder=0)
+
+    # Columns whose COUPLER is loaded past what 9 levels can represent. Both bars
+    # there read too GOOD -- leakage out of the truncated ladder is uncharged -- so
+    # they are marked rather than quoted. Different failure from the hatch above:
+    # the chirp comparison is fine, the absolute number is not.
+    n_trunc = sum(1 for r in rows if r.get("coupler_truncated"))
+    if n_trunc:
+        xt = [i for i, r in enumerate(rows) if r.get("coupler_truncated")]
+        ax.plot(xt, [ax.get_ylim()[1] * 0.72] * len(xt), marker="v", ls="none",
+                ms=6.0, color="#e34948", zorder=5, clip_on=False)
+
     # Series to draw: the run's own two, plus the independent baseline if given.
     if BASE_ROWS:
         # baseline bare + this run's chirp+DRAG; this run's own bare is superseded.
@@ -188,6 +208,15 @@ def figure_for(eta, rows, outdir):
             y = np.array([(1.0 - t["F_avg"])
                           if (t := (r.get("traces") or {}).get(name)) else np.nan
                           for r in rows])
+            if name == "chirp+DRAG":
+                # Where no chirp could be MEASURED, the calibration fell back to a
+                # chirp-free pulse, so this trace is the bare gate replayed. Drawing
+                # it would show two equal bars and read as "chirping does nothing
+                # here" -- the opposite of the truth at columns whose law still swept
+                # 20-64% of a half-linewidth. The slot is hatched instead, so the
+                # absence is visible and cannot be mistaken for a null result.
+                excl = np.array([bool(r.get("chirp_excluded")) for r in rows])
+                y = np.where(excl, np.nan, y)
         ax.bar(x + (k - (nser - 1) / 2.0) * w, y, w, label=lab, color=col,
                edgecolor=col, linewidth=0.8,
                alpha=1.0 if filled else 0.45, zorder=3)
@@ -275,6 +304,7 @@ def figure_for(eta, rows, outdir):
                  f"$\\omega_s$ = 4.7 GHz, 9 coupler levels",
                  color=INK, fontsize=12, pad=12)
 
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     h, l = ax.get_legend_handles_labels()
     band = {"audit": "refused: channel audit",
@@ -284,6 +314,12 @@ def figure_for(eta, rows, outdir):
     for st in [s for s in ("audit", "rabi", "chirp", "other") if s in seen_stages]:
         h.append(Patch(facecolor=seen_stages[st], alpha=0.13))
         l.append(band[st])
+    if n_excluded:
+        h.append(Patch(facecolor="none", edgecolor=MUTED, hatch="///", alpha=0.5))
+        l.append("chirp not measurable (bare still valid)")
+    if n_trunc:
+        h.append(Line2D([], [], marker="v", ls="none", color="#e34948", ms=6.0))
+        l.append("coupler past 9 levels: 1-F too good")
     ax.legend(h, l, frameon=False, fontsize=8.5, labelcolor=INK, ncol=4,
               loc="upper center", bbox_to_anchor=(0.5, -0.17))
 
@@ -299,10 +335,29 @@ def figure_for(eta, rows, outdir):
                  "than the locally calibrated one -- so the trend averages across "
                  "real features, including a resonance that moves with drive.",
                  ha="left", va="bottom", fontsize=7.0, color=MUTED)
+    # The two caveats that survive the exclusions, stated ON the figure. Both are
+    # computed from the rows rather than written in, so they cannot go stale.
+    n_nonconv = sum(1 for r in rows if r["ok"] and r.get("perturbative_ok") is False)
+    caveats = []
+    if n_nonconv:
+        caveats.append(
+            f"shift law not converged (|k4 eta^4/k2 eta^2| > 0.25) at {n_nonconv}"
+            f"/{n_ok} calibrated columns: those chirps are candidates, not "
+            f"calibrations")
+    if n_trunc:
+        caveats.append(
+            f"coupler occupation exceeds what 9 levels can represent at {n_trunc} "
+            f"column(s) (red triangles): both bars there read too good")
+    if caveats:
+        fig.text(0.005, 0.021, "CAVEAT -- " + ";  ".join(caveats),
+                 ha="left", va="bottom", fontsize=7.0, color="#8a3a1a")
     fig.text(0.005, 0.005, f"outside the window -- {outside}",
              ha="left", va="bottom", fontsize=7.5, color=MUTED)
-    fig.text(0.995, 0.005, f"{n_ok}/{len(rows)} columns calibrated; gate lengths in "
-             f"table.txt", ha="right", va="bottom", fontsize=8, color=MUTED)
+    fig.text(0.995, 0.005,
+             f"{n_ok}/{len(rows)} columns calibrated"
+             + (f"; chirp unmeasurable at {n_excluded} of them" if n_excluded else "")
+             + "; gate lengths in table.txt",
+             ha="right", va="bottom", fontsize=8, color=MUTED)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     out = (f"{outdir}/curve_eta{('%g' % eta).replace('.', 'p')}"
            f"{'_bars' if BARS_ONLY else ''}.png")

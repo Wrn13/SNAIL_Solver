@@ -58,14 +58,54 @@ def load(path, variant, drop_excluded=False):
     return out
 
 
+#: reason code -> how to say it. The reason MATTERS: these are three different
+#: failures to measure a chirp, and a reader deciding whether to trust the figure
+#: needs to know which one hit their detuning.
+_WHY = {
+    "stark_crossing": "the ridge changed transition inside the drive sweep",
+    "unmeasurable_chirp": "the fit failed while the law still swept a real shift",
+    "railed_ridge": "the ridge railed; no shift law was fitted at all",
+}
+
+
 def excluded_columns(path):
-    """{eta: [(delta_mhz, crossing_eta)]} for columns whose chirp is unmeasurable."""
+    """{eta: [(delta_mhz, reason, detail)]} for columns whose chirp is unmeasurable."""
     out = {}
     for r in json.load(open(path)):
         if not r.get("chirp_excluded"):
             continue
+        ce = r.get("stark_crossing_eta")
+        frac = r.get("chirp_excursion_frac_linewidth")
+        detail = (f"crossing at |eta| = {float(ce):.3f}" if ce is not None else
+                  f"excursion {float(frac):.1%} of a half-linewidth"
+                  if frac is not None else "")
         out.setdefault(round(float(r["target_eta"]), 2), []).append(
-            (round(float(r["delta_GHz"]) * 1e3), r.get("stark_crossing_eta")))
+            (round(float(r["delta_GHz"]) * 1e3),
+             r.get("chirp_free_reason") or "unknown", detail))
+    return out
+
+
+def best_gate(path, variant):
+    """{eta: (delta_mhz, infidelity, chirp_excluded)} over EVERY scored column.
+
+    Deliberately not restricted to the ratio set. A column whose chirp could not be
+    measured is excluded from the GAIN because `chirp == bare` there is an artefact
+    -- but the pulse that was played is a real pulse with a real scored fidelity, and
+    dropping it from "best gate" would hide the best result the run actually found.
+    At eta = 1.3 that is exactly what happened: the best gate is delta = -100 at
+    2.382e-03, a DRAG-only gate whose chirp is unmeasurable.
+    """
+    out = {}
+    for r in json.load(open(path)):
+        tr = (r.get("traces") or {}).get(variant) or {}
+        v = tr.get("infidelity_coherent")
+        if v is None or v <= 0:
+            continue
+        eta = round(float(r["target_eta"]), 2)
+        d = round(float(r["delta_GHz"]) * 1e3)
+        cur = out.get(eta)
+        if cur is None or float(v) < cur[1]:
+            out[eta] = (d, float(v), bool(r.get("chirp_excluded")))
     return out
 
 
@@ -109,6 +149,10 @@ def main(argv):
     excl = {k: v for d in (excluded_columns(nodrag_path),
                            excluded_columns(drag_path))
             for k, v in d.items()}
+    # Best gate over every scored column, not over the ratio set -- see best_gate.
+    best = {"bare": best_gate(nodrag_path, "bare"),
+            "chirp": best_gate(nodrag_path, "chirp+DRAG"),
+            "chirp+DRAG": best_gate(drag_path, "chirp+DRAG")}
 
     etas = sorted({e for e, _ in set(bare) | set(chirp) | set(cd)})
     if not etas:
@@ -142,12 +186,15 @@ def main(argv):
             for (name, num, den), (_, ks) in zip(wider, extra):
                 print(block(name, ratios(num, den, ks)))
 
-        for label, series in (("bare", b), ("chirp", c), ("chirp+DRAG", x)):
-            if series:
-                d = min(series, key=series.get)
-                print(f"\n  best {label:<11} delta={d:+5d} MHz  1-F={series[d]:.3e}",
-                      end="")
-        print()
+        print("\n  Best gate found, over EVERY scored column (a column dropped from "
+              "the\n  ratios above still played a real pulse):")
+        for label in ("bare", "chirp", "chirp+DRAG"):
+            hit = best[label].get(eta)
+            if hit is None:
+                continue
+            d, v, was_excl = hit
+            note = "   [chirp unmeasurable here -- DRAG-only gate]" if was_excl else ""
+            print(f"    {label:<11} delta={d:+5d} MHz  1-F={v:.3e}{note}")
 
         # A chirp built on a law that did not converge is not evidence either
         # way. Report those columns rather than averaging them into the gain.
@@ -166,14 +213,16 @@ def main(argv):
         print()
         if excl.get(eta):
             rows_e = sorted(excl[eta])
-            print(f"\n  chirp EXCLUDED (the ridge changed transition inside the "
-                  f"drive sweep, so no chirp could be measured) at "
-                  f"{len(rows_e)} column(s):")
-            for d, ce in rows_e:
-                at = f" at |eta| = {float(ce):.3f}" if ce is not None else ""
-                print(f"    delta={d:+5d}  crossing{at}")
-            print("    These are NOT counted as 1.00x above. Their bare and DRAG "
-                  "numbers are still measured and still in the bare column count.")
+            print(f"\n  chirp EXCLUDED at {len(rows_e)} column(s) -- no chirp could "
+                  f"be measured, so `chirp == bare` there is an artefact of the\n"
+                  f"  calibration rather than a measurement, and is NOT counted as "
+                  f"1.00x above:")
+            for d, reason, detail in rows_e:
+                why = _WHY.get(reason, reason)
+                print(f"    delta={d:+5d}  {why}"
+                      + (f" ({detail})" if detail else ""))
+            print("    Their bare and DRAG numbers ARE measured and are kept, which "
+                  "is why the\n    bare column count above exceeds the chirp one.")
 
         for label, errs in (("chirp pass", nd_err), ("DRAG pass", d_err)):
             for kind, ds in sorted((errs.get(eta) or {}).items()):
