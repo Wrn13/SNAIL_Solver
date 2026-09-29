@@ -56,7 +56,7 @@ COMMON=(--device "$DEVICE" --branch above --probe-shape gate
         --wp-points 15 --tg-points 9
         --chirp-max-passes 200 --max-drag-iters 12
         --t1-us 50 --t2-us 50
-        --chirp-free-fallback
+        --chirp-free-fallback --drag-decouple-fallback
         --column-workers "$WORKERS" --jobs "$JOBS")
 
 # pass name -> extra flags. Pass A carries --envelope-m 3 (see header).

@@ -49,8 +49,10 @@ BASE=""
 [[ $A -eq 0 ]] && BASE="$OUT/curves_nodrag.json"
 
 echo "[$(date +%H:%M:%S)] Phase C"
-"$PY" scripts/plot_drag_curves.py "$OUT/curves_drag.json" "$OUT" "$DEVICE" $BASE
-"$PY" scripts/plot_drag_curves.py --bars-only "$OUT/curves_drag.json" "$OUT/bars_only" \
+# --bars-only: the trend curves were fits over columns whose structure is PHYSICS
+# (two A poles about -30, plus a monotone SNAIL background), so a smooth line
+# through them implies a continuity the data does not have.
+"$PY" scripts/plot_drag_curves.py --bars-only "$OUT/curves_drag.json" "$OUT/figs" \
     "$DEVICE" $BASE
 "$PY" scripts/plot_drag_gain.py "$OUT/curves_drag.json" "$OUT/gain_vs_detuning.png"
 
