@@ -105,6 +105,50 @@ def load_column_rabi(path: str, tag: str) -> Dict[str, Any]:
     return table
 
 
+def load_npz_rabi(path: str) -> Dict[str, Any]:
+    """A Rabi table from the ``*_rabi.npz`` a column worker writes beside its cache.
+
+    The counterpart of :func:`subharmonic_gate_scan.save_column_rabi`, which
+    flattens the table to keys like ``chevrons/00037/metric``. Rebuilt here into
+    the same nested shape :func:`load_column_rabi` returns, so a re-fit does not
+    care which of the two it was handed.
+
+    Prefer this over the HDF5 when it exists: it is written by the worker before
+    the row is returned, so it survives a run that is killed, and it is present
+    for a column served from cache, whose stages the parent never writes at all.
+    """
+    import numpy as _np
+
+    with _np.load(path, allow_pickle=False) as z:
+        keys = list(z.keys())
+        table: Dict[str, Any] = {}
+        rows: Dict[int, Dict[str, Any]] = {}
+        for k in keys:
+            v = z[k]
+            val = v.item() if v.ndim == 0 else v
+            if isinstance(val, bytes):
+                val = val.decode()
+            parts = k.split("/")
+            if parts[0] == "chevrons" and len(parts) >= 3:
+                row = rows.setdefault(int(parts[1]), {})
+                node = row
+                for seg in parts[2:-1]:
+                    node = node.setdefault(seg, {})
+                node[parts[-1]] = val
+            elif len(parts) == 1:
+                table[k] = val
+            else:
+                node = table
+                for seg in parts[:-1]:
+                    node = node.setdefault(seg, {})
+                node[parts[-1]] = val
+    table["chevrons"] = [rows[i] for i in sorted(rows)]
+    for key in ("fit", "stability", "held", "n_held", "stark_crossing_eta",
+                "delta_MHz", "quality"):
+        table.pop(key, None)
+    return table
+
+
 def load_column_stored_fit(path: str, tag: str) -> Dict[str, Any]:
     """The ``fit`` dict the run itself recorded, for before/after comparison.
 

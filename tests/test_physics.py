@@ -7581,3 +7581,249 @@ class TestTheRidgeFigureSurvivesAnAdaptiveSpan(unittest.TestCase):
                 plot_chirp_ridge({"eta": np.array([]), "chevrons": []},
                                  {"target_eta": 1.0, "coeffs_GHz": []},
                                  0.0, 106.838, os.path.join(tmp, "r.png"))
+
+
+class TestABroadLineIsNotAnUnmeasuredLine(unittest.TestCase):
+    """Widening a Rabi row's window because the LINE is broad loses the row.
+
+    Two triggers grew a row's pump-offset window, and only one survived contact
+    with a real grid. Because a 3x growth re-samples at the SAME step, the
+    central third of a widened row IS the row it would have been, so the
+    counterfactual is an exact re-read rather than a model. Over all 200 pass-A
+    columns of the 2026-09-25 grid:
+
+        trigger        rows   kept widened   kept narrow   narrow railed
+        2x railed       175       28.6%          40.6%        99.4%
+        3x too-wide     834       54.0%          62.1%        22.9%
+        >=4x compound   121        4.1%           9.9%        47.9%
+
+    The too-wide trigger LOSES rows -- 505 kept with it against 601 without,
+    rejection 55.3% against 15.2% elsewhere, multi_peak 9x enriched, centres
+    moved by p99 11.4 MHz against a ridge whose own steps are 0.03-0.5 MHz --
+    and spends 28.8% of every offset-solve in the run doing it. It is also
+    nearly self-perpetuating: hwhm/span sits at 0.17-0.28 AFTER each growth
+    against 0.227 for a normal row, so the 0.4 threshold is barely above the
+    normal p90 of 0.30. A broad line is not an unmeasured line; widening cannot
+    narrow it, only admit the neighbour.
+
+    The railed trigger stays: there the peak really is outside the window, and
+    without the retry 99.4% of those rows rail and take the column with them.
+    """
+
+    @staticmethod
+    def _counting_scan(centre_MHz, hwhm_GHz):
+        """A chevron generator that records the span it was asked for."""
+        calls = []
+
+        def fake_scan(config, t_g, amp, offsets_GHz, window_ns, n_time, **kw):
+            off = np.asarray(offsets_GHz, float)
+            calls.append(float((off.max() - off.min()) * 1e3))
+            d = off - centre_MHz * 1e-3
+            m = 1.0 / (1.0 + (d / hwhm_GHz) ** 2)
+            n = int(n_time)
+            z = np.zeros_like(off)
+            return {"offsets_GHz": off, "resonance_metric": m,
+                    "leak_on_resonance": 0.001, "leak_f_a": z, "leak_f_b": z,
+                    "leak_coupler": z, "leak_double": z, "leak_spectator": z,
+                    "times_ns": np.linspace(0.0, window_ns, n),
+                    "P10": np.zeros((off.size, n)), "P01": np.zeros((off.size, n)),
+                    "P_leak": np.zeros((off.size, n)),
+                    "leak_at_metric": z, "norm_defect_max": 1e-12}
+        return fake_scan, calls
+
+    def _run(self, centre_MHz, hwhm_GHz, **kw):
+        from unittest import mock
+        from snail_solver.tune_up import RabiFitError, rabi_shift_table
+        fake, calls = self._counting_scan(centre_MHz, hwhm_GHz)
+        cfg = _cfg(envelope="sine_power", envelope_m=3)
+        with mock.patch("snail_solver.find_stark_resonance.scan", fake):
+            try:
+                rabi_shift_table(cfg, 1.3, amp_points=4, wp_points=15, **kw)
+            except RabiFitError:
+                pass                       # the LAW is not what these tests check
+        return calls
+
+    #: A centred line broad enough to trip `hwhm > 0.4*span` on the first rows,
+    #: whose base spans here are 74.9 / 133.1 / 191.4 / 249.6 MHz.
+    _BROAD_HWHM_GHz = 40e-3
+
+    def test_a_broad_line_is_measured_once_by_default(self):
+        """The line width alone never buys a second solve any more."""
+        calls = self._run(0.0, self._BROAD_HWHM_GHz)
+        self.assertEqual(len(calls), 4, f"one scan per row, got spans {calls}")
+
+    def test_the_old_trigger_is_still_reachable_for_reproducibility(self):
+        """`--span-growth both` must still be able to reproduce the old runs.
+
+        Same broad, centred line: the default leaves it alone, the old policy
+        re-measures it on a window 3x wider.
+        """
+        narrow = self._run(0.0, self._BROAD_HWHM_GHz)
+        wide = self._run(0.0, self._BROAD_HWHM_GHz, span_growth="both")
+        self.assertGreater(len(wide), len(narrow))
+        # The re-measure is 3x THAT ROW's span, which need not be the widest in
+        # the table: the base span scales with each row's own linewidth, so a
+        # tripled low-drive row can still be narrower than an untouched high one.
+        self.assertAlmostEqual(wide[1] / wide[0], 3.0, places=6)
+
+    def test_a_railed_row_is_still_re_measured(self):
+        """Here the peak really is outside the window, and the row is lost
+        without the retry -- 99.4% of those rows rail on the real grid."""
+        calls = self._run(60.0, 1.5e-3)
+        self.assertGreater(len(calls), 4)
+        self.assertGreater(max(calls), min(calls))
+
+    def test_one_row_does_not_compound_its_growth(self):
+        """Rows that grew twice kept 4.1% of themselves; the second growth only
+        coarsens the grid and slackens the rail test that would report it."""
+        calls = self._run(600.0, 1.5e-3)            # rails no matter how wide
+        # 4 rows, each measured once and re-measured at most once. Distinct span
+        # VALUES would be 8, because each row's base span scales with its own
+        # linewidth -- the count of solves is what the cap actually bounds.
+        self.assertEqual(len(calls), 8, f"one growth per row, then stop: {calls}")
+        self.assertEqual(
+            len(self._run(600.0, 1.5e-3, max_compound_growths=3)) > 8, True)
+
+    def test_span_growth_off_never_re_measures(self):
+        self.assertEqual(len(self._run(600.0, 1.5e-3, span_growth="off")), 4)
+
+    def test_the_policy_is_a_cache_key_because_it_changes_the_measurement(self):
+        """A row widened under 'both' was fitted over a different window, and
+        for rows kept either way the centre moves by p99 11.4 MHz. It cannot be
+        re-derived from the stored record, so unlike --chirp-free-max-frac it
+        has to invalidate rather than be re-checked.
+        """
+        from snail_solver.subharmonic_gate_scan import _column_expect
+        base = {"branch": "above", "coupler_levels": 9, "amp_points": 41,
+                "eta_lo": 0.2, "eta_hi": 1.0, "max_drag_channels": 0,
+                "min_ratio": 0.1, "max_ratio": 10.0, "contrast_min": 0.35,
+                "leak_max": None, "probe_shape": "gate",
+                "moment_weighting": "rabi", "envelope_m": 3}
+        col = {"w_p_GHz": 1.76, "target_eta": 1.3}
+        self.assertIn("span_growth", _column_expect(col, base))
+        # a record from before the key existed was measured under the old policy
+        self.assertEqual(_column_expect(col, base)["span_growth"], "both")
+        self.assertEqual(_column_expect(col, base)["max_compound_growths"], 3)
+        self.assertNotEqual(
+            _column_expect(col, dict(base, span_growth="railed"))["span_growth"],
+            _column_expect(col, base)["span_growth"])
+
+
+class TestAKilledOrResumedRunKeepsItsMeasurements(unittest.TestCase):
+    """The chevrons must reach disk from the WORKER, not from the parent.
+
+    They are the column: `amp_points x wp_points` exact propagations, 91% of a
+    pass-A column's wall time. Every later question about the fit policy is
+    answerable from them in seconds and unanswerable without them short of
+    re-solving. Routing them only through the parent's `_write_run` lost them
+    twice on real runs:
+
+    * `_run_pool` is `list(ex.map(...))`, consumed in SUBMISSION order, so the
+      parent writes nothing until the first-submitted column returns. The 2 GHz
+      pass B submitted its expensive tail first and its HDF5 sat at 6144 bytes
+      for 43 hours with 116 columns finished.
+    * `_write_run` is skipped for a column served from CACHE, and a resumed run
+      rewrites its output file. The 5 MHz eta=1.3 grid resumed with 55 of 61
+      columns cached, and its file now holds 6 of them -- so the grid carrying
+      that comparison's headline numbers cannot be re-fitted at all, while
+      eta=1.5, never resumed, is intact.
+    """
+
+    @staticmethod
+    def _rabi_stage():
+        from snail_solver.tune_up import chevron_quality, fit_chevron_center
+        chevrons, eta = [], np.linspace(0.3, 1.3, 5)
+        for i, e in enumerate(eta):
+            n_off = 15 if i < 3 else 43        # a widened row, as the real ones are
+            off, m = TestChevronCentreFit._chevron(-0.4 * e ** 2, n_off=n_off,
+                                                   span_MHz=13.0 * n_off / 15.0)
+            cen = fit_chevron_center(off, m)
+            row = {"eta": float(e), "offsets_GHz": off, "metric": m,
+                   "span_MHz": 13.0 * n_off / 15.0, "fit": cen,
+                   "quality": chevron_quality(cen, off, m, 13.0, leak=0.0),
+                   "leak_breakdown": {"f_a": 0.0, "coupler": 0.01}}
+            if i == 4:
+                row["dropped"] = "multi_peak"
+            chevrons.append(row)
+        return {"eta": eta, "chevrons": chevrons, "t_g_ref_ns": 106.838,
+                "target_eta": 1.3, "spans_MHz": np.full(5, 13.0),
+                "windows_ns": np.full(5, 300.0),
+                "fit": {"delta0": 0.0, "k2": -0.4, "k4": 0.0, "r2": 0.99}}
+
+    def test_a_failed_column_saves_its_chevrons_too(self):
+        """A failed column's chevrons are the only way to see why it failed,
+        and 68 of the 189 columns of the 2026-09-25 grid are failures."""
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        row = {"ok": False, "run_doc": {"stages": {"rabi": self._rabi_stage()}}}
+        with tempfile.TemporaryDirectory() as d:
+            p = save_column_rabi(os.path.join(d, "col_x.json"), row)
+            self.assertTrue(p and os.path.getsize(p) > 0)
+            self.assertFalse(os.path.exists(os.path.join(d, "col_x.json")))
+
+    def test_the_arrays_round_trip_bit_for_bit(self):
+        """A re-fit of the saved copy must equal a re-fit of the original, or
+        the saved copy is a different measurement wearing the same name."""
+        from snail_solver.ridge_refit import load_npz_rabi, refit_column
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        stage = self._rabi_stage()
+        with tempfile.TemporaryDirectory() as d:
+            p = save_column_rabi(os.path.join(d, "c.json"),
+                                 {"run_doc": {"stages": {"rabi": stage}}})
+            back = load_npz_rabi(p)
+        self.assertEqual(len(back["chevrons"]), len(stage["chevrons"]))
+        for i, ch in enumerate(stage["chevrons"]):
+            for key in ("offsets_GHz", "metric"):
+                np.testing.assert_array_equal(
+                    np.asarray(back["chevrons"][i][key]), np.asarray(ch[key]))
+        a = refit_column(stage, 1.3)["fit"]["r2_unweighted"]
+        b = refit_column(back, 1.3)["fit"]["r2_unweighted"]
+        self.assertEqual(a, b)
+
+    def test_the_reject_reason_survives_so_a_gap_stays_explicable(self):
+        from snail_solver.ridge_refit import load_npz_rabi
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        with tempfile.TemporaryDirectory() as d:
+            p = save_column_rabi(os.path.join(d, "c.json"),
+                                 {"run_doc": {"stages": {"rabi": self._rabi_stage()}}})
+            back = load_npz_rabi(p)
+        self.assertEqual(back["chevrons"][4].get("dropped"), "multi_peak")
+        self.assertIsNone(back["chevrons"][0].get("dropped"))
+
+    def test_rows_on_different_grids_survive_the_round_trip(self):
+        """Ragged rows are the normal case under an adaptive span, and a flat
+        rectangular container would silently pad or truncate them."""
+        from snail_solver.ridge_refit import load_npz_rabi
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        with tempfile.TemporaryDirectory() as d:
+            p = save_column_rabi(os.path.join(d, "c.json"),
+                                 {"run_doc": {"stages": {"rabi": self._rabi_stage()}}})
+            back = load_npz_rabi(p)
+        self.assertEqual([len(c["offsets_GHz"]) for c in back["chevrons"]],
+                         [15, 15, 15, 43, 43])
+
+    def test_a_post_processed_array_is_dropped_on_the_way_back_in(self):
+        """`delta_MHz` and `fit` are post-hold and post-moment; feeding them
+        back would hold a held tail twice and divide the moments twice."""
+        from snail_solver.ridge_refit import load_npz_rabi
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        with tempfile.TemporaryDirectory() as d:
+            p = save_column_rabi(os.path.join(d, "c.json"),
+                                 {"run_doc": {"stages": {"rabi": self._rabi_stage()}}})
+            back = load_npz_rabi(p)
+        for key in ("fit", "delta_MHz", "quality", "held", "stability"):
+            self.assertNotIn(key, back)
+
+    def test_a_column_with_no_rabi_stage_is_not_an_error(self):
+        """A column blocked at the channel audit never measured anything."""
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(save_column_rabi(os.path.join(d, "c.json"), {}))
+            self.assertIsNone(save_column_rabi(
+                os.path.join(d, "c.json"), {"run_doc": {"stages": {}}}))
+
+    def test_saving_never_fails_a_column_that_solved(self):
+        """A column that cost an hour is worth keeping even if its arrays
+        cannot be written; the parent may still get them into the HDF5."""
+        from snail_solver.subharmonic_gate_scan import save_column_rabi
+        row = {"ok": True, "run_doc": {"stages": {"rabi": self._rabi_stage()}}}
+        self.assertIsNone(save_column_rabi("/proc/nonexistent/c.json", row))

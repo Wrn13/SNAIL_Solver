@@ -875,6 +875,7 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                      window_tg: float = 2.0, n_time: int = 161, jobs: int = 0,
                      zero_chirp_frac: float = 0.0,
                      max_span_growths: int = 3, max_wp_points: int = 121,
+                     span_growth: str = "railed", max_compound_growths: int = 1,
                      probe_shape: str = "constant",
                      moment_weighting: str = "rabi",
                      solver: Optional[Dict[str, Any]] = None,
@@ -1024,7 +1025,38 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
                             keep_full_channels=True)
             m = np.asarray(chev["resonance_metric"], dtype=float)
             cen = fit_chevron_center(chev["offsets_GHz"], m)
-            # Two reasons to widen, and they are different failures.
+            # Two reasons to widen, and they are different failures. Only one
+            # of them survived contact with a real grid.
+            #
+            # `span_growth` selects which fire. Measured over all 200 pass-A
+            # columns of the 2026-09-25 grid, where a 3x growth re-samples at the
+            # SAME step so the central third of a widened row IS the row it would
+            # have been -- an exact counterfactual, not a model:
+            #
+            #   trigger        rows   kept widened   kept narrow   narrow railed
+            #   2x railed       175       28.6%          40.6%        99.4%
+            #   3x too-wide     834       54.0%          62.1%        22.9%
+            #   >=4x compound   121        4.1%           9.9%        47.9%
+            #
+            # So (a) LOSES rows: 505 kept with it against 601 without, rejection
+            # 55.3% on widened rows against 15.2% elsewhere, and for rows kept
+            # both ways the fitted centre moves by p99 11.4 MHz -- against a ridge
+            # whose own row-to-row steps are 0.03-0.5 MHz. It is also nearly
+            # self-perpetuating: hwhm/span sits at 0.17-0.28 AFTER each growth
+            # against 0.227 for normal rows, so the 0.4 threshold is only ~1.3x
+            # the normal p90. And it costs 28.8% of every Rabi offset-solve in the
+            # run (177245 -> 126144). The premise is wrong: a broad line is not an
+            # unmeasured line, widening cannot narrow it, and all it reliably does
+            # is admit the neighbouring transition -- multi_peak is 9x enriched in
+            # widened rows. Default OFF.
+            #
+            # (b) stays on: without it 99.4% of those 175 rows rail, and 71 would
+            # be kept-but-railed, tripping the post-loop check and killing whole
+            # columns. There the peak really is outside the window.
+            #
+            # Compounding is capped at one growth. A second one keeps 4.1% of its
+            # rows; it buys a coarser grid and a slacker rail test, which is the
+            # trade the comment below warns about, taken twice.
             #
             # (a) the WIDTH is unconstrained -- the wings were never sampled. A
             #     bad-rmse rejection instead means leakage broke the two-level
@@ -1045,9 +1077,13 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
             _step = span / max(n_off - 1, 1)
             _railed_row = (abs((cen["center_GHz"] - float(wp_offset_GHz)) * 1e3)
                            >= 0.5 * span - _step)
-            _too_wide = cen["hwhm_GHz"] * 1e3 > 0.4 * span
+            _too_wide = (cen["hwhm_GHz"] * 1e3 > 0.4 * span
+                         and str(span_growth) == "both")
+            if str(span_growth) == "off":
+                _railed_row = False
             if (not (_too_wide or _railed_row) or wp_span_MHz is not None
-                    or attempt == int(max_span_growths)):
+                    or attempt == int(max_span_growths)
+                    or attempt >= int(max_compound_growths)):
                 break
             why = "ridge railed at the window edge" if _railed_row else (
                 f"hwhm {cen['hwhm_GHz'] * 1e3:.2f} MHz too wide")
@@ -2924,6 +2960,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 chirp_free_fallback: bool = False,
                 chirp_free_max_frac: float = 0.10,
                 max_span_growths: int = 3, max_wp_points: int = 121,
+                span_growth: str = "railed", max_compound_growths: int = 1,
                 couple_drag: bool = True,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
@@ -2974,6 +3011,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                   span_linewidths=span_linewidths, contrast_min=contrast_min,
                   probe_shape=probe_shape, moment_weighting=moment_weighting,
                   max_span_growths=int(max_span_growths),
+                  span_growth=str(span_growth),
+                  max_compound_growths=int(max_compound_growths),
                   max_wp_points=int(max_wp_points),
                   # A chirp that does not MOVE is a static detuning, and the carrier
                   # already has a knob for that. Defaulting the zeroing threshold to

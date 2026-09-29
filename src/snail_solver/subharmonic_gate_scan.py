@@ -405,6 +405,22 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             # it replaces each row's adaptive span with one shared axis, which is a
             # different measurement of the same column.
             "ridge_grid": bool(settings.get("ridge_grid")),
+            # Same category as `ridge_grid` above: which rows are allowed to
+            # re-measure on a wider window is not grid RESOLUTION, it is a
+            # different measurement of the same column. A row widened under
+            # "both" was fitted over a window up to 3x wider, and for rows kept
+            # either way the fitted centre moves by p99 11.4 MHz -- 20x the
+            # ridge's own row-to-row step. Serving one into a run that asked for
+            # "railed" would mix two measurements inside one dataset.
+            #
+            # Unlike `chirp_free_max_frac` (see `_stale_chirp_free`), this cannot
+            # be re-derived from the stored record: nothing in a column says
+            # which rows were widened or why. So it goes here, and the cost is
+            # real -- every column cached before this key existed is now stale.
+            # That is the correct answer rather than a regrettable one, and it is
+            # affordable only because no grid is being re-run over it.
+            "span_growth": str(settings.get("span_growth", "both")),
+            "max_compound_growths": int(settings.get("max_compound_growths", 3)),
             # A bigger pass budget turns a column that "diverged" into a solved one,
             # so a cached failure must not be reused under a larger one. BOTH
             # relaxations count: the inner fixed point (chirp_max_passes) and the
@@ -555,6 +571,8 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             chirp_free_max_frac=float(settings.get("chirp_free_max_frac", 0.10)),
             max_span_growths=int(settings.get("max_span_growths", 3)),
             max_wp_points=int(settings.get("max_wp_points", 121)),
+            span_growth=str(settings.get("span_growth", "railed")),
+            max_compound_growths=int(settings.get("max_compound_growths", 1)),
             couple_drag=bool(settings.get("couple_drag", True)),
             drag_decouple_fallback=bool(
                 settings.get("drag_decouple_fallback", False)),
@@ -705,12 +723,82 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
     return row
 
 
+def save_column_rabi(cache_path: str, row: Dict[str, Any],
+                     logger: Optional[logging.Logger] = None) -> Optional[str]:
+    """Write this column's Rabi stage beside its JSON cache, from the WORKER.
+
+    The chevrons are the column: `amp_points x wp_points` exact propagations,
+    91% of a pass-A column's wall time and 69% of a pass-B column's on the
+    2026-09-25 grid. Every question about the FIT policy -- which rows to keep,
+    which law to fit, whether a chirp is measurable -- is answerable from them
+    in seconds, and unanswerable without them at any price short of re-solving.
+
+    Until this existed they reached disk only through the parent's `_write_run`,
+    and that has two holes, both of which fired on real runs:
+
+    * `_run_pool` is `list(ex.map(...))`, consumed IN SUBMISSION ORDER, so the
+      parent writes nothing until the first-submitted column returns. The 2 GHz
+      pass B submitted its expensive tail first and sat at 6144 bytes for 43
+      hours with 116 columns finished. A kill in that window would have cost
+      116 x 615 propagations with no way to get them back.
+    * `_write_run` is skipped entirely for a column served from CACHE, and a
+      resumed run rewrites its output file. The 5 MHz eta=1.3 grid was resumed
+      with 55 of 61 columns cached and its HDF5 now holds 6 of them -- so the
+      grid carrying that comparison's headline numbers cannot be re-fitted at
+      all, while eta=1.5, never resumed, is intact.
+
+    Writing from the worker closes both: the arrays are on disk before the row
+    is even returned, and a cache hit means the file is already there.
+
+    Compressed `.npz` beside the cache, a few MB a column. Never fatal -- a
+    column that solved is worth keeping even if its measurement cannot be
+    saved, and the parent may still write it.
+    """
+    stages = ((row.get("run_doc") or {}).get("stages") or {})
+    rabi = stages.get("rabi")
+    if not rabi:
+        return None
+    out = os.path.splitext(cache_path)[0] + "_rabi.npz"
+    try:
+        import numpy as _np
+        flat: Dict[str, Any] = {}
+
+        def _put(prefix: str, obj: Any) -> None:
+            # A chevron list becomes `chevrons/00007/metric` and so on. Flat keys
+            # rather than a pickled object graph, so the file stays readable by
+            # anything that speaks npz and does not need this module to load.
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    _put(f"{prefix}/{k}" if prefix else str(k), v)
+            elif isinstance(obj, (list, tuple)) and obj and isinstance(obj[0], dict):
+                for i, v in enumerate(obj):
+                    _put(f"{prefix}/{i:05d}", v)
+            elif obj is None:
+                flat[prefix] = _np.array(_np.nan)
+            else:
+                flat[prefix] = _np.asarray(obj)
+
+        _put("", rabi)
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        _np.savez_compressed(out, **flat)
+        return out
+    except Exception as exc:                          # never lose a solved column
+        if logger:
+            logger.warning(f"  could not save the Rabi arrays ({type(exc).__name__}: "
+                           f"{exc}); they will exist only if the parent writes them")
+        return None
+
+
 def _column_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     """One column, in a worker process. Module level so it is picklable.
 
     Returns the row, including its ``run_doc``; the PARENT does the HDF5 write, since
     several processes appending to one file would corrupt it. The per-column JSON
     cache is written here, so a pooled run is still resumable if it dies.
+
+    The MEASUREMENT is written here too, and that is not a duplicate of the HDF5
+    write -- it is the only copy that exists until the parent gets round to its
+    own. See :func:`save_column_rabi`.
     """
     col, settings = payload["col"], payload["settings"]
     # A log PER COLUMN. Without this a pooled run is silent for hours: the parent only
@@ -730,10 +818,16 @@ def _column_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
                        force=payload["force"], logger=logger)
     row.update(payload["expect"])
     row["cached"] = False
-    if row.get("ok") and payload.get("cache_path"):
-        keep = {k: v for k, v in row.items() if k != "run_doc"}
-        with open(payload["cache_path"], "w") as fh:
-            json.dump(keep, fh, default=float)
+    # The JSON cache is for RESUMING and so is written only for a column that
+    # produced a result. The Rabi arrays are written for BOTH, because a failed
+    # column's chevrons are the only way to see why it failed -- and because
+    # re-deriving them costs what the column cost.
+    if payload.get("cache_path"):
+        save_column_rabi(payload["cache_path"], row, logger=logger)
+        if row.get("ok"):
+            keep = {k: v for k, v in row.items() if k != "run_doc"}
+            with open(payload["cache_path"], "w") as fh:
+                json.dump(keep, fh, default=float)
     return row
 
 
@@ -763,6 +857,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 chirp_free_fallback: bool = False,
                 chirp_free_max_frac: float = 0.10,
                 max_span_growths: int = 3, max_wp_points: int = 121,
+                span_growth: str = "railed", max_compound_growths: int = 1,
                 couple_drag: bool = True,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
@@ -837,6 +932,8 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "chirp_free_max_frac": float(chirp_free_max_frac),
         "max_span_growths": int(max_span_growths),
         "max_wp_points": int(max_wp_points),
+        "span_growth": str(span_growth),
+        "max_compound_growths": int(max_compound_growths),
         "couple_drag": bool(couple_drag),
         "drag_decouple_fallback": bool(drag_decouple_fallback),
         "probe_shape": str(probe_shape),
@@ -1659,6 +1756,25 @@ def main() -> None:
                          "fixed -- wider --span-linewidths for a railed ridge, finer "
                          "--wp-points/--amp-points for a noisy one -- rather than "
                          "being absorbed as chirp-free.")
+    ap.add_argument("--span-growth", choices=("railed", "both", "off"),
+                    default="railed",
+                    help="WHICH Rabi rows may re-measure on a wider pump-offset "
+                         "window. 'railed' (default): only a row whose fitted "
+                         "centre sits at the window edge, where the peak really is "
+                         "outside and without the retry 99.4%% of those rows rail "
+                         "and take the column down with them. 'both' adds the old "
+                         "too-wide trigger (hwhm > 0.4*span, x3), which measurement "
+                         "over the 2026-09-25 grid shows LOSES rows -- 54.0%% kept "
+                         "against 62.1%% for the same rows un-widened, centres "
+                         "moved by up to 11 MHz, multi_peak 9x enriched, and 28.8%% "
+                         "of every offset-solve in the run spent on it. A broad "
+                         "line is not an unmeasured line. 'off' disables both and "
+                         "reproduces a fixed window.")
+    ap.add_argument("--max-compound-growths", type=int, default=1,
+                    help="how many times ONE row may grow in a row (default 1). "
+                         "Rows that grew twice or more kept 4.1%% of themselves on "
+                         "the 2026-09-25 grid; compounding buys a coarser grid and "
+                         "a rail test slack enough to stop reporting itself.")
     ap.add_argument("--max-span-growths", type=int, default=3,
                     help="how many times a Rabi row may GROW its pump-offset window "
                          "when the ridge rails against the edge (x2 each, with the "
@@ -1864,6 +1980,8 @@ def main() -> None:
         chirp_free_max_frac=args.chirp_free_max_frac,
         max_span_growths=args.max_span_growths,
         max_wp_points=args.max_wp_points,
+        span_growth=args.span_growth,
+        max_compound_growths=args.max_compound_growths,
         couple_drag=not args.decouple_drag,
         drag_decouple_fallback=args.drag_decouple_fallback,
         column_workers=args.column_workers,
