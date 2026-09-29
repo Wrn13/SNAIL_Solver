@@ -2032,6 +2032,49 @@ def plot_rabi_table(table: Dict[str, Any], out: str = "figs/rabi_chevrons.png",
     return out
 
 
+def _cell_edges(centers: np.ndarray) -> np.ndarray:
+    """Quad edges bracketing `centers`, for a `pcolormesh` with `shading="flat"`.
+
+    Midpoints inside, half a step beyond each end. Needed because the ridge map
+    stacks rows measured on DIFFERENT offset grids, one quad row at a time --
+    `shading="nearest"` derives its own edges but only for a single rectangular
+    mesh, which is precisely what a per-row adaptive span does not produce.
+
+    A single-point axis has no step to halve, so it is given an arbitrary unit
+    cell rather than a zero-width one that would render as nothing.
+    """
+    c = np.asarray(centers, dtype=float)
+    if c.size == 0:
+        return np.zeros(0, dtype=float)
+    if c.size == 1:
+        return np.array([c[0] - 0.5, c[0] + 0.5])
+    mid = 0.5 * (c[:-1] + c[1:])
+    return np.concatenate([[c[0] - (mid[0] - c[0])], mid,
+                           [c[-1] + (c[-1] - mid[-1])]])
+
+
+def _law_at(fit: Dict[str, Any], eta: np.ndarray) -> Optional[np.ndarray]:
+    """``delta(|eta|)`` from a stored fit, or None when there is no law.
+
+    Reads whatever even powers the fit carries -- ``k2``/``k4`` today, ``k6`` if
+    the law is ever extended -- so the overlay does not have to be revisited
+    alongside the fit. Returns None rather than raising: a FAILED column has no
+    law and is exactly the column whose ridge someone wants to look at.
+    """
+    if not fit:
+        return None
+    terms = [(int(k[1:]), float(v)) for k, v in fit.items()
+             if isinstance(k, str) and len(k) > 1 and k[0] == "k"
+             and k[1:].isdigit() and v is not None]
+    if not terms:
+        return None
+    out = np.full_like(np.asarray(eta, dtype=float),
+                       float(fit.get("delta0") or 0.0))
+    for power, coeff in terms:
+        out = out + coeff * np.asarray(eta, dtype=float) ** power
+    return out
+
+
 def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz: float,
                      t_g: float, out: str = "figs/chirp_ridge.png",
                      title: Optional[str] = None) -> str:
@@ -2052,12 +2095,26 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     chirp removes.
 
     NO INTERPOLATION: every row is stacked at its own real, measured offsets, with
-    no resampling in either direction. That means every chevron in `table` MUST
-    already share the identical offset axis -- which only happens when the sweep
-    was run with a FIXED ``wp_span_MHz`` (:func:`fixed_span_MHz` picks one wide
-    enough for the whole drive range), not the per-row adaptive default. A "high
-    definition" map is a resolution problem, solved by running the sweep with more
-    ``amp_points``/``wp_points`` on a fixed span, not by rendering trickery.
+    no resampling in either direction. Rows measured on DIFFERENT offset grids are
+    fine -- each is drawn as its own quad row, the way :func:`plot_rabi_table`
+    already draws its per-amplitude panels -- so a sweep with the per-row adaptive
+    span renders as readily as one on a fixed ``wp_span_MHz``. What is not done is
+    resampling a row onto a grid it was not measured on. A "high definition" map is
+    a resolution problem, solved by running the sweep with more
+    ``amp_points``/``wp_points``, not by rendering trickery.
+
+    Requiring one shared grid is what this function used to do, and it cost the
+    whole 2026-09-25 grid its ridge figures: 121 of 121 solved columns logged
+    ``ridge figure failed (ValueError: ... every row needs the SAME offsets)``
+    because the adaptive span had just been added. The chevron figures rendered
+    fine throughout, which is the tell -- `plot_rabi_table` never needed the shared
+    axis either.
+
+    A table with no fitted law still draws. A column that FAILED is the one whose
+    ridge someone most needs to look at, and it is exactly the column that has no
+    ``fit`` to overlay; indexing it unconditionally made this function unusable on
+    the 68 failures and the 31 crossings of that grid. Rejected rows are marked, so
+    a gap in the ridge reads as a rejection rather than as missing data.
 
     This is a DEFINITIONAL check, not an independent measurement -- it shows the
     calibration is self-consistent, not that the assembled gate actually achieves
@@ -2089,27 +2146,16 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     if not chevrons:
         raise ValueError("no chevrons to plot")
     eta = np.asarray(table["eta"], dtype=float)
-    ridge = np.asarray(table["delta_MHz"], dtype=float)
-    fit = table["fit"]
+    ridge = np.asarray(table.get("delta_MHz", np.full(eta.shape, np.nan)),
+                       dtype=float)
+    fit = table.get("fit") or {}
     target_eta = float(proj["target_eta"])
     measured_eta_max = float(proj.get("measured_eta_max", np.nanmax(eta)))
 
     row_eta = np.array([float(c["eta"]) for c in chevrons])
-    off_MHz = np.asarray(chevrons[0]["offsets_GHz"], dtype=float) * 1e3
-    for c in chevrons[1:]:
-        other = np.asarray(c["offsets_GHz"], dtype=float) * 1e3
-        if other.shape != off_MHz.shape or not np.allclose(other, off_MHz):
-            raise ValueError(
-                "plot_chirp_ridge does not interpolate, so every row needs the "
-                "SAME offsets -- this table was swept with a per-row adaptive "
-                "span. Rerun rabi_shift_table/run_tune_up with "
-                "wp_span_MHz, wp_points = ridge_span_MHz(config, target_eta, "
-                "eta_lo=..., eta_hi=...) so every row shares one grid, then "
-                "replot. The CLI does this for you: `--plot-ridge` sizes the span "
-                "automatically unless you pass --wp-span-MHz yourself. Use "
-                "ridge_span_MHz, not fixed_span_MHz -- the fixed span also needs "
-                "MORE wp_points, or the weakest row is undersampled.")
-    Z = np.stack([np.asarray(c["metric"], dtype=float) for c in chevrons], axis=0)
+    row_off = [np.asarray(c["offsets_GHz"], dtype=float) * 1e3 for c in chevrons]
+    row_met = [np.asarray(c["metric"], dtype=float) for c in chevrons]
+    dropped = [c.get("dropped") for c in chevrons]
 
     ts = np.linspace(0.0, float(t_g), 400)
     eta_t = np.asarray(RaisedCosine(target_eta, float(t_g)).value_at(ts))
@@ -2119,8 +2165,15 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     flat_MHz = np.full_like(ts, 1e3 * float(wp_offset_GHz))
 
     fig, ax = plt.subplots(figsize=(7.2, 5.2), layout="constrained")
-    mesh = ax.pcolormesh(off_MHz, row_eta, Z, shading="nearest", cmap="viridis",
-                        vmin=0.0, vmax=1.0)
+    # One quad row per measured row, each on its OWN offset axis. `pcolormesh`
+    # needs edges, not centres, or adjacent rows would leave gaps at the seams
+    # and the last column of every row would be dropped.
+    y_edges = _cell_edges(row_eta)
+    mesh = None
+    for i, (off, met) in enumerate(zip(row_off, row_met)):
+        mesh = ax.pcolormesh(_cell_edges(off), y_edges[i:i + 2],
+                            met[None, :], shading="flat", cmap="viridis",
+                            vmin=0.0, vmax=1.0)
     fig.colorbar(mesh, ax=ax, label=r"$P(|10\rangle)$ (max over time)", pad=0.02)
 
     ys = np.linspace(float(row_eta.min()), float(max(row_eta.max(), target_eta)) * 1.02,
@@ -2128,16 +2181,26 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     if target_eta > measured_eta_max:
         ax.axhline(measured_eta_max, color=_C_VERTEX, ls=":", lw=1.6,
                   label=f"measured up to |eta|={measured_eta_max:.2f}")
-    ax.plot(fit["delta0"] + fit["k2"] * ys ** 2 + fit["k4"] * ys ** 4, ys,
-           "-", lw=1.4, color="white", alpha=0.85, label="fitted ridge")
+    law = _law_at(fit, ys)
+    if law is not None:
+        ax.plot(law, ys, "-", lw=1.4, color="white", alpha=0.85,
+               label="fitted ridge")
     ax.plot(ridge, eta, "o", ms=6, color="white", mec=_C_INK, mew=1.0,
            label="measured ridge")
+    # A gap in the ridge is a REJECTED row, not a missing measurement, and which
+    # it is decides whether the column is worth re-measuring or re-fitting.
+    drop_eta = [e for e, d in zip(row_eta, dropped) if d]
+    if drop_eta:
+        ax.plot([0.0] * len(drop_eta), drop_eta, "x", ms=7, mew=1.6,
+               color=_C_VERTEX, transform=ax.get_yaxis_transform(),
+               clip_on=False,
+               label=f"dropped ({', '.join(sorted({str(d) for d in dropped if d}))})")
     ax.plot(chirp_MHz, eta_t, "-", lw=2.6, color=_C_LORENTZ,
            label="chirped pump (rides the ridge)")
     ax.plot(flat_MHz, eta_t, "--", lw=2.0, color=_C_VERTEX,
            label="flat carrier (same mean offset)")
-    ax.set_ylim(row_eta.min(), ys.max())
-    ax.set_xlim(off_MHz.min(), off_MHz.max())
+    ax.set_ylim(y_edges.min(), ys.max())
+    ax.set_xlim(min(o.min() for o in row_off), max(o.max() for o in row_off))
     ax.set_ylabel(r"drive strength $|\eta|$ (the amplitude/voltage axis)")
     ax.set_xlabel("pump frequency offset (MHz)")
     ax.set_title(title or (rf"Rabi map with the chirp riding the ridge, "
@@ -2979,27 +3042,51 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
             raise
         _fit = ((exc.table or {}).get("fit") or {})
         _frac = _fit.get("chirp_excursion_frac_linewidth")
-        if _frac is None or float(_frac) > float(chirp_free_max_frac):
+        table = exc.table
+        chirp_free = True
+        if _frac is not None and float(_frac) <= float(chirp_free_max_frac):
+            # Nothing to chirp. delta0 still sets the carrier, step 3 measures
+            # the rest, and the length scan never needed the law -- so this is a
+            # real 1.00x and belongs in the ratios.
+            chirp_free_reason = "no_measurable_shift"
+            log.info(
+                f"step 1: no usable shift law ({exc}). The chirp would sweep only "
+                f"{float(_frac):.1%} of a half-linewidth, so there is nothing to "
+                f"chirp: falling back to a CHIRP-FREE calibration -- delta0 sets "
+                f"the carrier, step 3 measures the rest, and the length scan never "
+                f"needed the law.")
+        else:
+            # A shift the law DOES measure, that the law does not describe. The two
+            # failures are different and the split above is the whole reason this
+            # branch exists -- but the response to the second one was to re-raise,
+            # and that threw away the bare and DRAG gates as well, neither of which
+            # needs a shift law at all. It cost the 2026-09-25 grid 68 of 189
+            # columns: no bare, no chirp, no DRAG, from a defect in the CHIRP.
+            #
+            # So do what a crossing does: calibrate the column chirp-free, keep bare
+            # and DRAG, and record the chirp as an EXCLUSION rather than as a 1.00x.
+            # `chirp_free_reason` is what tells the two apart downstream, and the
+            # ratios must drop this one instead of averaging it in.
+            #
+            # Re-fitting the ridge does not rescue these. Replayed offline over all
+            # 64 fittable failures of that grid, no law tried -- k6, k8, odd powers,
+            # a shortened fit range -- converges a single one of them, and 91% of
+            # the columns that DID succeed are themselves above the 0.25 quartic
+            # warn threshold. The law is truncated, which is a physics limit on the
+            # chirp, not a reason to lose the other two series.
+            chirp_free_reason = "chirp_not_converged"
             _why = ("the ridge railed, so no shift law was fitted and the excursion "
                     "is unknown" if _frac is None else
                     f"the chirp would sweep {float(_frac):.0%} of a half-linewidth "
-                    f"(> --chirp-free-max-frac {chirp_free_max_frac:g})")
-            raise RabiFitError(
-                f"{exc}\n\nThe chirp-free fallback did NOT fire: {_why}. A chirp-free "
-                f"calibration at this column would discard a shift the law does "
-                f"measure and report the chirp as worth exactly 1.00x, which is an "
-                f"artefact of the fit rather than a property of the device. Fix the "
-                f"MEASUREMENT (raise --span-linewidths for a railed ridge, or "
-                f"--wp-points / --amp-points for a noisy one) instead of zeroing "
-                f"the chirp.", exc.table) from exc
-        table = exc.table
-        chirp_free = True
-        chirp_free_reason = "no_measurable_shift"
-        log.info(f"step 1: no usable shift law ({exc}). The chirp would sweep only "
-                 f"{float(_frac):.1%} of a half-linewidth, so there is nothing to "
-                 f"chirp: falling back to a CHIRP-FREE calibration -- delta0 sets "
-                 f"the carrier, step 3 measures the rest, and the length scan never "
-                 f"needed the law.")
+                    f"(> --chirp-free-max-frac {chirp_free_max_frac:g}), so there "
+                    f"IS a shift here")
+            log.warning(
+                f"step 1: {exc} Not chirp-free: {_why}. Calibrating the column "
+                f"WITHOUT a chirp so the bare and DRAG series survive; the chirp "
+                f"series is EXCLUDED here, NOT reported as no-gain. To measure a "
+                f"chirp at this column the MEASUREMENT or the LAW has to change "
+                f"(--span-linewidths for a railed ridge, --wp-points/--amp-points "
+                f"for a noisy one, a shorter --eta-hi for a truncated series).")
 
     def project(t_g: float) -> Dict[str, Any]:
         """The chirp implied by the measured law at this gate length."""

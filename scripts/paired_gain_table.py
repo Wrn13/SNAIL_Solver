@@ -65,6 +65,14 @@ _WHY = {
     "stark_crossing": "the ridge changed transition inside the drive sweep",
     "unmeasurable_chirp": "the fit failed while the law still swept a real shift",
     "railed_ridge": "the ridge railed; no shift law was fitted at all",
+    # The pipeline's own name for the same thing, set by run_tune_up when the
+    # excursion says a shift is there but the law does not describe it. The two
+    # names above are the BACK-FILL classifier's (backfill_chirp_exclusions.py),
+    # applied to runs made before the reason was recorded; this one comes from
+    # the run itself. Both must resolve, or a re-analysed grid and a fresh one
+    # print different things about the same column.
+    "chirp_not_converged": "delta0 + k2|eta|^2 + k4|eta|^4 does not describe the "
+                           "measured ridge, though a real shift is there",
 }
 
 

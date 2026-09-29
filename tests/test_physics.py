@@ -6881,7 +6881,13 @@ class TestTheChirpFreeFallbackIsGatedOnTheExcursion(unittest.TestCase):
     number is an artefact of the fit, and it biases the chirp's measured benefit
     downwards in precisely the columns where the chirp does the most.
 
-    So the gate raises instead, and the message says to fix the MEASUREMENT.
+    The split is the point; what it DOES with the second group is not "raise". The
+    gate raised at first, and that lost the bare and DRAG gates too -- neither of
+    which needs a shift law -- for 68 of the 189 columns of the 2026-09-25 grid.
+    So the second group is now calibrated chirp-free and its chirp series is
+    EXCLUDED, carrying `chirp_free_reason = "chirp_not_converged"`. The original
+    objection still holds, because an exclusion is not a 1.00x: the ratios must
+    drop the column, not average it in.
     """
 
     @staticmethod
@@ -6892,7 +6898,19 @@ class TestTheChirpFreeFallbackIsGatedOnTheExcursion(unittest.TestCase):
                            else {"chirp_excursion_frac_linewidth": frac})},
                 "eta": np.linspace(0.26, 1.3, 9)}
 
+    #: (frac, max_frac) -> operating point. Each distinct case costs ~20 s: the
+    #: chirp-free path still runs steps 3-4 for real, and it is now the path
+    #: FIVE of these tests take rather than one. Memoized so the suite stays
+    #: usable as a pre-submission gate, which its module docstring promises.
+    _CACHE: dict = {}
+
     def _run(self, frac, max_frac=0.10):
+        key = (frac, max_frac)
+        if key not in self._CACHE:
+            self._CACHE[key] = self._solve(frac, max_frac)
+        return self._CACHE[key]
+
+    def _solve(self, frac, max_frac=0.10):
         from unittest import mock
         from snail_solver.tune_up import RabiFitError, run_tune_up
         cfg = _cfg(envelope="sine_power", envelope_m=3)
@@ -6918,39 +6936,54 @@ class TestTheChirpFreeFallbackIsGatedOnTheExcursion(unittest.TestCase):
         """delta = -105 at eta = 1.3: 0.3% of a half-width. Nothing to chirp."""
         self.assertTrue(self._run(0.003)["operating_point"]["chirp_free"])
 
-    def test_a_measurable_excursion_raises_instead_of_being_zeroed(self):
+    def test_a_measurable_excursion_is_excluded_not_zeroed(self):
         """delta = +85 at eta = 1.3: 64% of a half-width, residual 0.27x the signal.
 
-        The old behaviour reported this column as chirp-free and its chirp as worth
-        1.00x. It must fail loudly instead.
+        There IS a shift here, so calling the chirp worth 1.00x is an artefact.
+        But the bare and DRAG gates at this column are fine and must survive, so
+        the column calibrates chirp-free and the CHIRP is excluded -- and the two
+        outcomes must stay distinguishable downstream, or the ratios average in
+        the exclusion and we are back to the fake 1.00x.
         """
-        from snail_solver.tune_up import RabiFitError
-        with self.assertRaises(RabiFitError) as cm:
-            self._run(0.643)
-        msg = str(cm.exception)
-        self.assertIn("64%", msg)
-        self.assertIn("chirp-free-max-frac", msg)
-        # the remedy has to be in the message, or the next person zeroes it again
-        self.assertIn("span-linewidths", msg)
+        op = self._run(0.643)["operating_point"]
+        self.assertTrue(op["chirp_free"])
+        self.assertEqual(op["chirp_free_reason"], "chirp_not_converged")
+        self.assertNotEqual(op["chirp_free_reason"],
+                            self._run(0.003)["operating_point"]["chirp_free_reason"])
 
     def test_a_railed_ridge_carries_no_law_and_so_never_qualifies(self):
         """delta = -30: 4/41 ridge rows railed, so no fit exists at all.
 
-        An unknown excursion is not a small one. The underlying error already names
-        its own remedy (raise --span-linewidths); swallowing it hid that.
+        An unknown excursion is not a small one, so this is never the honest
+        1.00x -- but it is not a reason to lose the column either.
         """
-        from snail_solver.tune_up import RabiFitError
-        with self.assertRaises(RabiFitError) as cm:
-            self._run(None)
-        self.assertIn("excursion is unknown", str(cm.exception))
+        op = self._run(None)["operating_point"]
+        self.assertTrue(op["chirp_free"])
+        self.assertEqual(op["chirp_free_reason"], "chirp_not_converged")
 
     def test_the_threshold_is_what_decides_not_the_fit_quality(self):
         """Same r2, same residual, same column -- only the threshold moves."""
-        self.assertTrue(
-            self._run(0.35, max_frac=0.50)["operating_point"]["chirp_free"])
-        from snail_solver.tune_up import RabiFitError
-        with self.assertRaises(RabiFitError):
-            self._run(0.35, max_frac=0.20)
+        self.assertEqual(
+            self._run(0.35, max_frac=0.50)["operating_point"]["chirp_free_reason"],
+            "no_measurable_shift")
+        self.assertEqual(
+            self._run(0.35, max_frac=0.20)["operating_point"]["chirp_free_reason"],
+            "chirp_not_converged")
+
+    def test_an_unconverged_chirp_does_not_kill_the_bare_gate(self):
+        """The 68-column regression, stated as an invariant.
+
+        Built on the real d0p17_eta1p3 of the 2026-09-25 grid: r2 = 0.802 over
+        n_used = 38 rows, excursion 44.9% of a half-linewidth. A defect in the
+        CHIRP cost that column its bare and DRAG gates as well, 68 times over.
+        """
+        out = self._run(0.449)
+        self.assertTrue(out["operating_point"]["chirp_free"])
+        self.assertEqual(out["operating_point"]["chirp_free_reason"],
+                         "chirp_not_converged")
+        # the column still produced an operating point to score bare and DRAG at
+        self.assertTrue(out["operating_point"]["t_g_ns"] > 0.0)
+
 
 
 class TestAStaleChirpFreeColumnIsNotServedFromCache(unittest.TestCase):
@@ -7427,3 +7460,124 @@ class TestAStoredLawIsNeverRefinedOnlyReplaced(unittest.TestCase):
         from snail_solver.ridge_refit import deconvolve_moments
         with self.assertRaises(ValueError):
             deconvolve_moments({"powers": (2,), "coeffs": {"k2": 1.0}}, {2: 0.0})
+
+
+class TestTheRidgeFigureSurvivesAnAdaptiveSpan(unittest.TestCase):
+    """The columns worth looking at are the ones this figure used to refuse.
+
+    `plot_chirp_ridge` stacked every row into ONE `pcolormesh`, so it required
+    every row to share an offset axis and raised when they did not. The per-row
+    adaptive span broke that invariant the day it landed: all 121 solved columns
+    of the 2026-09-25 grid logged ``ridge figure failed (ValueError: ... every
+    row needs the SAME offsets)``. `plot_rabi_table` rendered all 189 through
+    the same run, because it draws each row on its own axes -- so the shared
+    grid was never a real requirement, only a consequence of stacking.
+
+    It also indexed ``table["fit"]`` unconditionally, which made it unusable on
+    precisely the columns whose ridge needs inspecting: the 68 that failed and
+    the 31 that changed transition mid-sweep have no law to overlay.
+    """
+
+    @staticmethod
+    def _rows(n_off_per_row, drop_at=()):
+        """A ridge whose rows were measured on different, widened grids.
+
+        The real grid reached [15, 29, 43, 57, 85, 121] points in one column.
+        """
+        from snail_solver.tune_up import fit_chevron_center
+        out = []
+        for i, n_off in enumerate(n_off_per_row):
+            eta = 0.3 + 0.7 * i / max(len(n_off_per_row) - 1, 1)
+            span = 13.0 * n_off / 15.0
+            off, m = TestChevronCentreFit._chevron(-0.4 * eta ** 2, n_off=n_off,
+                                                   span_MHz=span)
+            row = {"eta": eta, "offsets_GHz": off, "metric": m,
+                   "span_MHz": span, "fit": fit_chevron_center(off, m)}
+            if i in drop_at:
+                row["dropped"] = "multi_peak"
+            out.append(row)
+        return out
+
+    def _plot(self, chevrons, fit, tmp):
+        from snail_solver.tune_up import plot_chirp_ridge
+        eta = np.array([c["eta"] for c in chevrons])
+        table = {"eta": eta, "chevrons": chevrons,
+                 "delta_MHz": np.array([c["fit"]["center_GHz"] * 1e3
+                                        for c in chevrons])}
+        if fit is not None:
+            table["fit"] = fit
+        proj = {"target_eta": 1.0, "coeffs_GHz": [], "measured_eta_max": 1.0}
+        out = os.path.join(tmp, "ridge.png")
+        return plot_chirp_ridge(table, proj, 0.0, 106.838, out)
+
+    def test_rows_on_different_grids_render_instead_of_raising(self):
+        """The exact shape that killed 121 of 121 columns."""
+        chev = self._rows([15, 15, 29, 43, 15, 121])
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._plot(chev, {"delta0": 0.0, "k2": -0.4, "k4": 0.0}, tmp)
+            self.assertTrue(os.path.getsize(p) > 0)
+
+    def test_a_column_with_no_fitted_law_still_draws(self):
+        """A failed or crossing column is the one someone needs to see."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._plot(self._rows([15] * 6), None, tmp)
+            self.assertTrue(os.path.getsize(p) > 0)
+
+    def test_a_law_with_more_than_two_terms_is_overlaid_whole(self):
+        """The overlay reads whatever even powers the fit carries, not k2/k4."""
+        from snail_solver.tune_up import _law_at
+        ys = np.linspace(0.3, 1.3, 5)
+        got = _law_at({"delta0": 1.0, "k2": -2.0, "k4": 0.5, "k6": 0.25}, ys)
+        np.testing.assert_allclose(
+            got, 1.0 - 2.0 * ys ** 2 + 0.5 * ys ** 4 + 0.25 * ys ** 6,
+            rtol=0, atol=1e-12)
+        self.assertIsNone(_law_at({}, ys))
+        self.assertIsNone(_law_at({"r2": 0.9, "n_used": 12}, ys))
+
+    def test_the_quad_edges_bracket_the_measured_offsets(self):
+        """Centres, not edges, are what a row stores; a gap at every seam
+        would otherwise show as white stripes between rows."""
+        from snail_solver.tune_up import _cell_edges
+        c = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        e = _cell_edges(c)
+        self.assertEqual(e.size, c.size + 1)
+        self.assertTrue(np.all(np.diff(e) > 0))
+        self.assertLess(e[0], c[0])
+        self.assertGreater(e[-1], c[-1])
+        np.testing.assert_allclose(e, [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
+                                   rtol=0, atol=1e-12)
+
+    def test_an_irregular_axis_still_gets_monotone_edges(self):
+        from snail_solver.tune_up import _cell_edges
+        e = _cell_edges(np.array([0.0, 0.1, 0.5, 2.0]))
+        self.assertTrue(np.all(np.diff(e) > 0))
+
+    def test_a_single_point_row_gets_a_cell_not_a_zero_width_sliver(self):
+        from snail_solver.tune_up import _cell_edges
+        e = _cell_edges(np.array([3.0]))
+        self.assertEqual(e.size, 2)
+        self.assertGreater(e[1], e[0])
+        self.assertEqual(_cell_edges(np.zeros(0)).size, 0)
+
+    def test_a_rejected_row_is_marked_so_a_gap_is_not_read_as_missing_data(self):
+        chev = self._rows([15] * 6, drop_at=(2, 4))
+        with tempfile.TemporaryDirectory() as tmp:
+            from snail_solver.tune_up import plot_chirp_ridge
+            eta = np.array([c["eta"] for c in chev])
+            ridge = np.array([c["fit"]["center_GHz"] * 1e3 for c in chev])
+            ridge[[2, 4]] = np.nan
+            table = {"eta": eta, "chevrons": chev, "delta_MHz": ridge,
+                     "fit": {"delta0": 0.0, "k2": -0.4, "k4": 0.0}}
+            proj = {"target_eta": 1.0, "coeffs_GHz": [], "measured_eta_max": 1.0}
+            p = plot_chirp_ridge(table, proj, 0.0, 106.838,
+                                 os.path.join(tmp, "r.png"))
+            self.assertTrue(os.path.getsize(p) > 0)
+
+    def test_an_empty_table_is_still_refused(self):
+        """The one failure that IS a failure: nothing was measured."""
+        from snail_solver.tune_up import plot_chirp_ridge
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                plot_chirp_ridge({"eta": np.array([]), "chevrons": []},
+                                 {"target_eta": 1.0, "coeffs_GHz": []},
+                                 0.0, 106.838, os.path.join(tmp, "r.png"))

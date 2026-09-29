@@ -351,12 +351,27 @@ def _stale_chirp_free(got: Dict[str, Any], max_frac: float) -> bool:
 
     A railed ridge stores no k2/k4 at all. Its excursion is unknown, so it can
     never qualify as chirp-free and is always stale here.
+
+    The threshold governs exactly ONE of the reasons a column can be chirp-free:
+    `no_measurable_shift`, where it decides whether the shift was small enough to
+    zero. The others -- `stark_crossing`, `chirp_not_converged` -- are chirp-free
+    because no trustworthy law EXISTS at eta*, which no threshold can change, and
+    they store no k2/k4 to test. Applying it to them made every one of them stale
+    forever: all 31 crossings of the 2026-09-25 grid would re-solve on any resume,
+    hit the same crossing, store nothing again, and be stale again. `chirp_free`
+    alone is not the question; the reason is.
+
+    A row from before the reasons existed has none, and it could only have been
+    chirp-free for the one reason there was, so the default is that one.
     """
-    if not ((got.get("operating_point") or {}).get("chirp_free")):
+    op = got.get("operating_point") or {}
+    if not op.get("chirp_free"):
+        return False
+    if (op.get("chirp_free_reason") or "no_measurable_shift") != "no_measurable_shift":
         return False
     ch = got.get("chirp") or {}
     k2, k4 = ch.get("k2"), ch.get("k4")
-    t_g = (got.get("operating_point") or {}).get("t_g_ns")
+    t_g = op.get("t_g_ns")
     eta = got.get("target_eta")
     if k2 is None or k4 is None or not t_g or eta is None:
         return True
