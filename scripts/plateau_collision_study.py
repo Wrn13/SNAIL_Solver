@@ -23,13 +23,12 @@ Knobs (A, C, D at fixed iSWAP area; B deliberately releases it):
     C  static carrier offset    around the Stark-compensated value
     D  plateau phase modulation Phi = A sin(w_m t) (--phasemod), exploratory
 
-Every knob-A point first CALIBRATES its carrier on the flat top itself (max
-transfer, ``--cal-span-MHz``): at strong drive the pass-A law is quartic-dominated
-and misplaces the plateau resonance by several MHz, and comparing mistuned gates
-would measure the law's error, not the collisions. That error is reported
-(``law_error_MHz``). Knob B then scans the plateau length at fixed drive -- the
-length calibration and the collision-period synchronisation are the same scan --
-and C/D are centred on the calibrated carrier and the best B length.
+Every knob-A point first CALIBRATES its carrier on the flat top (max transfer,
+``--cal-span-MHz``): at strong drive the quartic-dominated pass-A law misplaces the
+plateau resonance by several MHz, and mistuned gates would measure the law's error
+(reported as ``law_error_MHz``), not the collisions. Knob B then scans the plateau
+length at fixed drive (length calibration and collision-period sync are one scan), and
+C/D are centred on the calibrated carrier and the best B length.
 
 The Stark law (``k2``, ``k4``, static ``wp_offset``) is READ from the pass-A column
 caches of the running 5 MHz scan; nothing there is written. Outputs go to ``--out``.
@@ -103,10 +102,7 @@ def calibrate_carrier(cfg, eta, t_r, carrier0_GHz, t_g_ns, solver, span_MHz: flo
                       points: int) -> Dict[str, Any]:
     """Park the carrier on the PLATEAU's own resonance: max transfer over a grid
     around the law's value, refined by one parabolic step on the top three points.
-
-    The law is a fit to deconvolved shaped-pulse chevrons; at strong drive it is
-    quartic-dominated and need not put a flat top on resonance, so this is measured,
-    not assumed. Returns the calibrated carrier and the scan.
+    (The law fits shaped-pulse chevrons and need not put a flat top on resonance.)
     """
     grid = carrier0_GHz + np.linspace(-span_MHz, span_MHz, int(points)) * 1e-3
     vals = [transfer(cfg, eta, t_r, c, t_g_ns, solver) for c in grid]
@@ -171,32 +167,30 @@ def study_point(job: Dict[str, Any]) -> Dict[str, Any]:
         v[cpl.fock_index(occ)] = 1.0
         return v
 
+    def fingerprint(trajectory):
+        try:
+            return pp.plateau_fingerprint(cpl, trajectory, pred, INIT, TGT,
+                                          tol_MHz=job["match_tol_MHz"])
+        except (np.linalg.LinAlgError, ValueError) as exc:
+            return {"error": str(exc)}
+
     # 1. |01>: dense plateau trajectory
     run = pp.evolve_piecewise(cpl, ket(INIT), bounds, dt_out={1: job["dt_flat_ns"]},
                               **solver)
     rec["budget_01"] = pp.segment_budget(cpl, run, INIT, TGT)
     if t_flat > 4 * job["dt_flat_ns"]:
-        try:
-            rec["fingerprint"] = pp.plateau_fingerprint(cpl, run, pred, INIT, TGT,
-                                                        tol_MHz=job["match_tol_MHz"])
-        except (np.linalg.LinAlgError, ValueError) as exc:
-            rec["fingerprint"] = {"error": str(exc)}
+        rec["fingerprint"] = fingerprint(run)
     # 2a. the plateau alone, switched on suddenly from bare |01>/|10>: its intrinsic
     #     collision fingerprint (no dressing), independent of ramp shape
-    flat_of = lambda r: pp.channel_populations(cpl, r["boundary"][-1], INIT, TGT)  # noqa: E731
     start = pp.channel_populations(cpl, run["boundary"][1], INIT, TGT)
     raw_end = pp.channel_populations(cpl, run["boundary"][2], INIT, TGT)
     sudden0 = pp.project_computational(cpl, run["boundary"][1], [INIT, TGT])
     run_s = pp.evolve_piecewise(cpl, sudden0, [bounds[1]], dt_out={0: job["dt_flat_ns"]},
                                 **solver)
     s_start = pp.channel_populations(cpl, sudden0, INIT, TGT)
-    s_end = flat_of(run_s)
-    try:
-        rec["fingerprint_sudden"] = pp.plateau_fingerprint(
-            cpl, {"times": [None, run_s["times"][0]], "states": [None, run_s["states"][0]]},
-            pred, INIT, TGT, tol_MHz=job["match_tol_MHz"])
-    except (np.linalg.LinAlgError, ValueError) as exc:
-        rec["fingerprint_sudden"] = {"error": str(exc)}
+    s_end = pp.channel_populations(cpl, run_s["boundary"][-1], INIT, TGT)
+    rec["fingerprint_sudden"] = fingerprint(
+        {"times": [None, run_s["times"][0]], "states": [None, run_s["states"][0]]})
     # 2b. ramp contamination: the same plateau (drive, carrier, length) reached by a
     #     `slow_factor`-times slower ramp -- the near-adiabatic reference
     t_r_slow = job["slow_factor"] * t_r

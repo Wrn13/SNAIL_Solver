@@ -1,9 +1,8 @@
 """Shared machinery for the Zhou SNAIL iSWAP sweeps.
 
-Constants, the DEFAULT_CONFIG, the Point grid record, grid IO, the analytic
-collision search (_nearest_collision), the calibration chevron (_stark_offset_GHz),
-result collection, and CLI helpers. Imported by sweep_spectator, sweep_target,
-and the run_sweep_zhou entry point.
+Constants, DEFAULT_CONFIG, the Point grid record, grid IO, the analytic collision
+search (_nearest_collision), the per-point Stark chevron (_stark_offset_GHz), result
+collection, and CLI helpers. Used by sweep_spectator, sweep_target and run_sweep_zhou.
 """
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ import glob
 import json
 import math
 import sys
-import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -24,18 +22,14 @@ TWO_PI = 2.0 * np.pi
 _DELTA_EPS_GHz = 5e-4
 
 def _drag_skip_GHz(config: Dict[str, Any]) -> float:
-    """|beat| (GHz) below which DRAG is skipped. The first-order quadrature ~ 1/beat
-    diverges toward the collision, so it must not be applied within ~a few x g_iswap
-    of it. Configurable via ``drag_skip_below_MHz`` (default 5 MHz)."""
+    """|beat| (GHz) below which DRAG is skipped: the first-order quadrature ~ 1/beat
+    diverges toward the collision (``drag_skip_below_MHz``, default 5 MHz)."""
     return max(float(config.get("drag_skip_below_MHz", 5.0)) / 1e3, _DELTA_EPS_GHz)
 
 
-#: Pump quanta carried by each collision channel, i.e. the k in this module's beat
-#: convention ``beat = separation - k w_p``. A CHIRP moves the pump during the pulse,
-#: so the beat DRAG divides by becomes ``Delta(t) = beat - k delta(t)`` -- see
-#: ``envelope.PumpTone.drag_detuning``. The "static" channel is pump-independent
-#: (k = 0) and a chirp must not move it; that distinction is the whole reason this
-#: map exists rather than a hardcoded 1.
+#: Pump quanta k per collision channel, in the convention ``beat = separation - k w_p``.
+#: A chirp moves the DRAG beat as ``Delta(t) = beat - k delta(t)``
+#: (``envelope.PumpTone.drag_detuning``); the pump-independent "static" channel has k=0.
 _PUMP_QUANTA = {"onepump": 1, "static": 0, "subharm": 2, "none": 1}
 
 
@@ -47,12 +41,11 @@ def _pump_quanta_of(kind: str) -> int:
 def _drag_ok_with_chirp(config: Dict[str, Any], beat_GHz: float, n_pump: int,
                         chirp_coeffs_GHz: Optional[Sequence[float]],
                         t_g: float) -> bool:
-    """Is DRAG safe for this (beat, k, chirp) combination over the whole pulse?
+    """Is DRAG safe for this (beat, k, chirp) over the whole pulse?
 
-    The static test ``|beat| >= skip`` is not sufficient once a chirp is present: the
-    beat is swept during the gate, so it can start comfortably large and pass through
-    zero mid-pulse. Sweeps call this and DISABLE DRAG when it fails (rather than
-    raising, as the single-point path does) so one bad point cannot kill a scan.
+    With a chirp the beat is swept during the gate and can cross zero mid-pulse, so
+    ``|beat| >= skip`` must hold at every time. Sweeps DISABLE DRAG when this fails
+    (rather than raising) so one bad point cannot kill a scan.
     """
     skip = _drag_skip_GHz(config)
     if abs(float(beat_GHz)) < skip:
@@ -68,20 +61,67 @@ def _drag_ok_with_chirp(config: Dict[str, Any], beat_GHz: float, n_pump: int,
 def _drag_channels_filtered(config: Dict[str, Any], channels: Sequence[Any],
                             chirp_coeffs_GHz: Optional[Sequence[float]],
                             t_g: float) -> tuple:
-    """The subset of `channels` that is safe for this (chirp, t_g); may be empty.
+    """The subset of `channels` that is DRAG-safe for this (chirp, t_g); may be empty.
 
-    Recursive DRAG makes the sweeps' disable-don't-raise policy finer-grained. With a
-    single beat there was nothing to do but turn DRAG off; with several, one channel
-    swept onto its collision is no reason to throw away the other two -- the
-    composition is still well defined on whatever survives. Dropping only the
-    offender keeps the suppression the remaining channels provide.
-
-    Companion to :func:`_drag_ok_with_chirp`, which keeps its exact one-channel
-    signature and semantics for every existing caller.
+    For recursive DRAG only the offending channel is dropped, keeping the suppression
+    the remaining channels provide.
     """
     return tuple(c for c in channels
                  if _drag_ok_with_chirp(config, float(c.beat_GHz), int(c.n_pump),
                                         chirp_coeffs_GHz, t_g))
+
+
+def _chirp_of(config: Dict[str, Any]) -> Optional[Sequence[float]]:
+    """The configured chirp, or None when unset/empty."""
+    return config.get("chirp_coeffs_GHz") or None
+
+
+def _drag_beat_if_ok(config: Dict[str, Any], want_drag: bool, beat_GHz: float,
+                     n_pump: int) -> Optional[float]:
+    """`beat_GHz` if DRAG is wanted and safe under the configured chirp, else None."""
+    ok = want_drag and _drag_ok_with_chirp(config, beat_GHz, n_pump, _chirp_of(config),
+                                           float(config["t_g_ns"]))
+    return beat_GHz if ok else None
+
+
+def _solver_opts(config: Dict[str, Any]) -> Dict[str, Any]:
+    """QuTiP tolerances from the config."""
+    return dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
+                nsteps=int(config.get("nsteps", 500000)))
+
+
+def _nonlinearities(config: Dict[str, Any]) -> Dict[int, float]:
+    """{3: g3} plus {4: g4} when g4 is nonzero."""
+    nonlin = {3: float(config["g3_GHz"])}
+    if float(config.get("g4_GHz", 0.0)) != 0.0:
+        nonlin[4] = float(config["g4_GHz"])
+    return nonlin
+
+
+def _calibrate_point(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
+                     spec_abs_GHz: Optional[float], drag_beat_GHz: Optional[float],
+                     drag_n_pump: int) -> Dict[str, Any]:
+    """Per-point amplitude + Stark tune-up (calibrate_gate); returns its "final" record."""
+    from snail_solver import calibrate_gate as CG
+    sub = dict(config); sub["qubit_freqs_GHz"] = [wa_GHz, wb_GHz]
+    return CG.run_calibration(
+        sub, float(config["t_g_ns"]),
+        iters=int(config.get("calibrate_iters", 1)),
+        amp_bounds=(float(config.get("cal_amp_lo", 0.6)),
+                    float(config.get("cal_amp_hi", 1.4))),
+        amp_points=int(config.get("cal_amp_points", 9)),
+        span_MHz=float(config.get("stark_span_MHz", 60.0)),
+        chevron_points=int(config.get("stark_points", 21)),
+        window_factor=float(config.get("stark_window_factor", 2.0)),
+        time_points=int(config.get("stark_time_points", 120)),
+        solver=_solver_opts(config), n_jobs=1,
+        spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz,
+        drag_n_pump=drag_n_pump)["final"]
+
+
+#: Result-row fields filled only by the GRAPE add-on (blank otherwise).
+_GRAPE_BLANKS = dict.fromkeys(("grape_baseline_F", "F_grape", "leak_grape", "dF_grape",
+                               "grape_nfev", "grape_warmstart_GHz"), "")
 
 DEFAULT_CONFIG = {
     # target qubits a, b
@@ -103,27 +143,15 @@ DEFAULT_CONFIG = {
     "min_detuning_GHz":  0.05,       # drop placements with |w_b-w_a| below this
     "drag_compare":         False,   # target sweep: also run DRAG-on in the near-collision window
     "drag_compare_below_MHz": 100.0, # |nearest beat| window (MHz) for the DRAG comparison
-    "drag_skip_below_MHz":    5.0,   # |beat| below this -> DRAG is SKIPPED: the first-order
-                                     #   quadrature ~ 1/beat diverges as beat -> 0, so applying
-                                     #   it inside ~a few x g_iswap of the collision blows the
-                                     #   gate up (population dumped into the coupler). Set to a
-                                     #   few x g_iswap for your device.
-    # GRAPE optimal-control add-on (--grape): per point, optimize the pump
-    # envelope (grape.optimize_pulse, reduced rotating-frame model) and record the
-    # optimized fidelity + headroom over the DRAG/raised-cosine baseline. Opt-in
-    # and costly (an L-BFGS-B run per point); validate the winning pulse in the
-    # full QuTiP iswap_fidelity separately. Scores use the SAME leakage-aware
-    # metric as the sweep, so grape_baseline_F tracks F_avg.
+    "drag_skip_below_MHz":    5.0,   # |beat| below this -> DRAG SKIPPED (quadrature ~ 1/beat
+                                     #   blows up near the collision); ~ a few x g_iswap
+    # GRAPE add-on (--grape): optimize the pump envelope per point and record the
+    # headroom over the DRAG/raised-cosine baseline, scored with the sweep's own
+    # leakage-aware metric (so grape_baseline_F tracks F_avg). Opt-in and costly.
     "grape":            False,       # run GRAPE at each integrated point
     "grape_backend":    "qutip",     # "qutip" (qutip-qoc optimal control) | "reduced"
-    "grape_alg":        "CRAB",      # qutip optimizer. "CRAB" (default): gradient-free
-                                     #   over a randomized basis, needs only qutip, and
-                                     #   optimizes the SAME leakage-aware virtual-Z-fitted
-                                     #   metric the sweeps report. "JOPT": JAX-autodiff
-                                     #   gradient method on that same metric -- correct
-                                     #   but currently far slower per point (see
-                                     #   grape._jax_pipeline_infidelity), so opt in
-                                     #   deliberately rather than inheriting it.
+    "grape_alg":        "CRAB",      # "CRAB": gradient-free, needs only qutip. "JOPT": JAX
+                                     #   autodiff on the same metric, far slower per point
     "grape_crab_restarts": 1,        # [CRAB] DCRAB super-iterations (monotone)
     "grape_crab_seed":  None,        # [CRAB] RNG seed for the random basis
     "grape_crab_score": "qutip",     # [CRAB] objective: "qutip" (exact) | "reduced"
@@ -132,51 +160,36 @@ DEFAULT_CONFIG = {
     "grape_nctrl":      24,          # piecewise-constant control points (reduced) / tlist
     "grape_cutoff_GHz": 1.0,         # reduced-model carrier cutoff for the optimizer
     "grape_maxiter":    200,         # L-BFGS-B iteration cap
-    "grape_warmstart_drag": False,   # on DRAG-off points, seed GRAPE from a DRAG
-                                     #   raised cosine at the nearest beat (better
-                                     #   L-BFGS-B start near a collision; baseline
-                                     #   unchanged). Skipped where |beat| is below
-                                     #   drag_skip_below_MHz (the 1/beat blow-up).
+    "grape_warmstart_drag": False,   # DRAG-off points: seed GRAPE from DRAG at the nearest
+                                     #   beat (baseline unchanged; skipped inside drag_skip)
     # pulse / solver
     "t_g_ns":   60.0,
     "envelope": "raised_cosine",
     "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_gate.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
-    # propagation engine. "qutip" is the exact per-point reference (4 sesolve calls
-    # per point). "jax" is the batched engine in jax_engine.py: one sparse operator
-    # stack shared across the grid, all 4 columns in one block, vmapped over points.
-    # It is a rotating-wave REDUCTION at any finite engine_cutoff_GHz -- run
-    # `validate_engines.py --cutoff-scan` on the device before trusting a number.
+    # propagation engine: "qutip" = exact per-point reference; "jax" = batched engine
+    # (jax_engine.py), a rotating-wave REDUCTION at any finite engine_cutoff_GHz --
+    # run `validate_engines.py --cutoff-scan` before trusting a number.
     "engine": "qutip",
-    "engine_cutoff_GHz": float("inf"),  # carrier cutoff for engine="jax". DEFAULT inf
-                                     #   (exact) ON PURPOSE: validate_engines shows a
-                                     #   finite cutoff is only safe at weak drive. At
-                                     #   |eta| ~ 9 (short gate) cutoff=3 GHz gave
-                                     #   max|dU| ~ 0.9 -- useless. The engine's speed
-                                     #   comes from the CF4 integrator + sparse ops +
-                                     #   batching, NOT from pruning, so inf costs
-                                     #   little: 0.56s vs 97s of QuTiP on that point.
-                                     #   Lower it only with a cutoff-scan to back it.
-    "engine_carrier_resolution": 0.1,  # max |Omega|*dt; the CF4 integrator is 4th
-                                     #   order, so halving this cuts the error ~16x
+    "engine_cutoff_GHz": float("inf"),  # [jax] inf (exact) ON PURPOSE: a finite cutoff is
+                                     #   only safe at weak drive (3 GHz at |eta|~9 gave
+                                     #   max|dU|~0.9); the speed comes from CF4 + sparse ops
+                                     #   + batching, not pruning. Lower only with a cutoff-scan.
+    "engine_carrier_resolution": 0.1,  # max |Omega|*dt; CF4 is 4th order (halve -> ~16x)
     "engine_batch": 64,              # grid points per vmapped call
     "engine_precision": "f64",       # f32 is MIXED (f64 phases, complex64 state)
-    "chirp_coeffs_GHz": [],          # time-dependent pump-frequency offset delta(t), as Legendre
-                                     #   coefficients in u = 2t/t_g - 1 (GHz). [] = no chirp.
-                                     #   [c0] is a CONSTANT offset and is exactly equivalent to
-                                     #   adding c0 to wp_offset_GHz; [c0, c1] is a linear chirp
-                                     #   sweeping c0-c1 -> c0+c1 across the gate. See envelope.Chirp.
+    "chirp_coeffs_GHz": [],          # pump-frequency offset delta(t) as Legendre coefficients
+                                     #   in u = 2t/t_g - 1 (GHz); [] = none, [c0] == adding c0
+                                     #   to wp_offset_GHz. See envelope.Chirp.
     "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
     "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
     "stark_points":   21,            # per-point chevron offset samples
     "stark_window_factor": 2.0,      # chevron time window = factor * t_g
     "stark_time_points":   120,      # chevron time samples
-    "stark_jobs":     1,             # processes for the per-point chevron's offset scan
-                                     #   (>1 only in mode=point, where one task = one point;
-                                     #    mode=local pools points and forces this to 1)
-    "stark_match_pulse": False,      # per-point chevron uses the ACTUAL pulse (raised-cosine,
-                                     #   + DRAG for DRAG-on points) instead of a constant probe,
-                                     #   so DRAG-on points land on the DRAG-on resonance
+    "stark_jobs":     1,             # processes for the chevron's offset scan (>1 only in
+                                     #   mode=point; mode=local forces 1)
+    "stark_match_pulse": False,      # chevron uses the ACTUAL pulse (+ DRAG on DRAG-on points)
+                                     #   instead of a constant probe
     "calibrate_points": False,       # per-point amplitude+Stark tune-up (calibrate_gate),
                                      #   spectator-present + DRAG-aware (hardware-style)
     "calibrate_iters":  1,           # amplitude/frequency rounds per point
@@ -184,22 +197,14 @@ DEFAULT_CONFIG = {
     "cal_amp_hi":       1.4,
     "cal_amp_points":   9,
     "drag_always":      False,       # force DRAG on for every allocation point
-    "drag_subharmonic": True,        # ON BY DEFAULT: mode subharmonics are always physically
-                                     #   present, so DRAG should always be allowed to target
-                                     #   them. The channel is the pump's 2nd harmonic (2 w_p,
-                                     #   generated by the SNAIL) driving mode i at w_i = 2 w_p,
-                                     #   for i in {a, b, spectator, coupler}. The detuning of
-                                     #   that two-pump drive is w_i - 2 w_p (NOT w_i/2 - w_p),
-                                     #   which is what DRAG must use. Set False (or pass
-                                     #   --no-drag-subharmonic) to reproduce a pre-default run.
-    "subharmonic_modes": ["a", "b", "spec", "s"],  # which modes' subharmonics to include
-                                     #   when drag_subharmonic is on; e.g. ["spec"] isolates the
-                                     #   swept spectator subharmonic, ["s"] the SNAIL/coupler one.
-                                     #   An EMPTY list means none -- it is honoured literally,
-                                     #   not treated as "unset" (see _collision_candidates)
-    "no_spectator": False,           # [target] sweep the BARE a-b-coupler gate (no spectator:
-                                     #   lam_spec=0), varying w_b so 2 w_p scans the SNAIL
-                                     #   subharmonic w_c = 2 w_p; nearest-collision reports w_c-2w_p
+    "drag_subharmonic": True,        # DRAG may target subharmonics: the pump's 2nd harmonic
+                                     #   (2 w_p, from the SNAIL) driving mode i, detuning
+                                     #   w_i - 2 w_p (NOT w_i/2 - w_p). False reproduces a
+                                     #   pre-default run (--no-drag-subharmonic).
+    "subharmonic_modes": ["a", "b", "spec", "s"],  # subharmonic channels to include; an
+                                     #   EMPTY list means none (see _collision_candidates)
+    "no_spectator": False,           # [target] BARE a-b-coupler gate (lam_spec=0); vary w_b so
+                                     #   2 w_p scans the SNAIL subharmonic w_c = 2 w_p
     "integrate": True,               # set False for the instant analytic map only
     "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
     "nsteps": 500000,                # max internal solver steps between outputs
@@ -214,24 +219,15 @@ DEFAULT_TARGET_DRAGS = [False]
 
 @dataclass
 class Point:
-    """One sweep point (a single coupler configuration to simulate).
+    """One sweep point.
 
-    Attributes
-    ----------
-    index : int
-        Position in the grid; also the output filename suffix.
-    spec_freq_GHz : float
-        Spectator transition frequency Delta = w_b - w_spec (GHz; spectator sweep).
-    drag : bool
-        Whether the first-order DRAG quadrature is requested for this point.
-    kind : str
-        "spectator" (default; move one spectator against a fixed pair) or "target"
-        (fixed w_a & w_s, scan w_b and the spectator -- frequency allocation).
-    wa_GHz, wb_GHz : float or None
-        Target-qubit frequencies for the allocation sweep (kind="target"); None for
-        the spectator sweep, which reads the pair from the config.
-    spec_abs_GHz : float or None
-        Spectator ABSOLUTE frequency (GHz) for the allocation sweep (kind="target").
+    index : grid position and output-filename suffix.
+    spec_freq_GHz : spectator detuning Delta = w_b - w_spec (spectator sweep).
+    drag : first-order DRAG requested.
+    kind : "spectator" (move one spectator against a fixed pair) or "target"
+        (fixed w_a & w_s; scan w_b and the spectator -- frequency allocation).
+    wa_GHz, wb_GHz, spec_abs_GHz : pair and ABSOLUTE spectator frequency for
+        kind="target"; None for the spectator sweep (pair read from the config).
     """
 
     index: int
@@ -243,22 +239,7 @@ class Point:
     spec_abs_GHz: Optional[float] = None
 
 def write_grid(outdir: str, config: Dict[str, Any], points: List[Point]) -> str:
-    """Write the grid and resolved config to ``<outdir>/grid.json``.
-
-    Parameters
-    ----------
-    outdir : str
-        Output directory; a ``points/`` subdirectory is created.
-    config : dict
-        The resolved device/simulation configuration to persist.
-    points : list of Point
-        The grid to serialise.
-
-    Returns
-    -------
-    str
-        Path to the written grid.json.
-    """
+    """Write config + points to ``<outdir>/grid.json`` (creating ``points/``); return its path."""
     os.makedirs(os.path.join(outdir, "points"), exist_ok=True)
     path = os.path.join(outdir, "grid.json")
     with open(path, "w") as f:
@@ -267,18 +248,7 @@ def write_grid(outdir: str, config: Dict[str, Any], points: List[Point]) -> str:
     return path
 
 def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
-    """Load the config and points from ``<outdir>/grid.json``.
-
-    Parameters
-    ----------
-    outdir : str
-        Directory containing grid.json.
-
-    Returns
-    -------
-    (dict, list of Point)
-        The persisted config and the reconstructed points.
-    """
+    """Load (config, points) from ``<outdir>/grid.json``."""
     with open(os.path.join(outdir, "grid.json")) as f:
         blob = json.load(f)
     return blob["config"], [Point(**p) for p in blob["points"]]
@@ -288,47 +258,18 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                       spec_abs_GHz: Optional[float] = None,
                       drag_beat_GHz: Optional[float] = None,
                       drag_n_pump: int = 1) -> Dict[str, Any]:
-    """Per-point AC-Stark-shifted iSWAP resonance offset (GHz) for the pump.
+    """Per-point AC-Stark-shifted iSWAP resonance (find_stark_resonance chevron).
 
-    Runs the chevron of find_stark_resonance.py at this point's (w_a, w_b) and
-    operating amplitude, returning the offset from |w_b - w_a| that maximises swap
-    contrast. With ``spec_abs_GHz`` given, the spectator is INCLUDED in the chevron
-    at that absolute frequency, so the located resonance carries the spectator's
-    (detuning-dependent) dispersive pull -- the offset then varies point to point.
-    With ``spec_abs_GHz=None`` it is the bare a<->b resonance. The offset scan
-    parallelizes over ``config['stark_jobs']`` processes: keep it at 1 when the
-    caller is itself in a pool (mode=local) and raise it to cpus-per-task in
-    mode=point, where one task runs a single point.
+    Runs the chevron at this point's (w_a, w_b) and amplitude; the located offset from
+    |w_b - w_a| maximises swap contrast. With ``spec_abs_GHz`` the spectator is in the
+    chevron, so the offset carries its dispersive pull; None -> bare pair. The offset
+    scan uses ``config['stark_jobs']`` processes (1 inside a pool; cpus-per-task in
+    mode=point). ``drag_beat_GHz`` matters only with ``config['stark_match_pulse']``:
+    the chevron then uses the ACTUAL raised-cosine pulse with DRAG at this beat, i.e.
+    it locates the DRAG-ON resonance.
 
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration (supplies g3, participations, levels,
-        anharmonicity, envelope, and the stark_* chevron resolution keys).
-    wa_GHz, wb_GHz : float
-        Qubit frequencies of this point (GHz).
-    t_g : float
-        Operating gate time (ns); sets the probe |eta| via the normalization.
-    amp_scale : float
-        Amplitude-scale correction from a prior amplitude calibration.
-    solver : dict
-        QuTiP tolerances (atol, rtol, nsteps).
-    spec_abs_GHz : float, optional
-        Spectator ABSOLUTE frequency (GHz) to include in the chevron. None -> bare
-        pair.
-    drag_beat_GHz : float, optional
-        DRAG beat detuning (GHz). Only used when ``config['stark_match_pulse']`` is
-        set: the chevron then uses the ACTUAL raised-cosine gate pulse with the DRAG
-        quadrature tuned to this beat, so the located resonance is the DRAG-ON
-        resonance (it carries the DRAG-quadrature Stark shift a constant probe
-        cannot see). None -> shaped pulse without DRAG.
-
-    Returns
-    -------
-    dict
-        The full find_stark_resonance.scan result (offsets_GHz, times_ns, P10,
-        max_transfer, resonance_offset_GHz, eta_op, shape, drag_beat_GHz, ...).
-        Callers take ``resonance_offset_GHz`` and may persist the rest.
+    Returns the full find_stark_resonance.scan result; callers take
+    ``resonance_offset_GHz`` and may persist the rest.
     """
     from snail_solver import find_stark_resonance as FS
     sub = dict(config)
@@ -339,13 +280,10 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     window = float(config.get("stark_window_factor", 2.0)) * float(t_g)
     n_time = int(config.get("stark_time_points", 120))
     shaped = bool(config.get("stark_match_pulse", False))
-    # Probe the chirp the GATE runs with, so what comes back is the RESIDUAL offset on
-    # top of it. Omitting it would measure the un-chirped resonance, which the caller
-    # then writes into wp_offset_GHz while the gate ALSO applies the chirp's mean
-    # component c0 -- i.e. c0 counted twice. Only the shaped probe can carry a chirp
-    # (a chirp is defined on the gate's normalized time), so warn rather than
-    # silently mis-locate when a chirped device is probed with the constant pulse.
-    chirp = config.get("chirp_coeffs_GHz") or None
+    # Probe WITH the gate's chirp so the result is the residual offset on top of it;
+    # otherwise the chirp's mean c0 is counted twice (once here, once by the gate). Only
+    # the shaped probe can carry a chirp.
+    chirp = _chirp_of(config)
     if chirp is not None and not shaped:
         print("WARNING: device carries a chirp but stark_match_pulse is off; the "
               "constant probe locates the UN-chirped resonance, so the chirp's mean "
@@ -361,46 +299,26 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
 
 def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                        ws_GHz: float, wspec_GHz: float, w_p_GHz: float):
-    """Nearest spectator/mode collision to the pump for a target point.
+    """Nearest spectator/mode collision to the pump (see :func:`_collision_candidates`).
 
-    Candidates: the per-qubit exchange channels -- one-pump swap (resonant at
-    ``|w_q - w_spec| = w_p``) and static exchange (``w_q = w_spec``) -- with
-    ``beat = |w_q - w_spec| - n*w_p`` (n in {1, 0}); and, when ``drag_subharmonic``
-    is set, the subharmonic drives (the pump's 2nd harmonic, 2 w_p, driving mode i
-    at w_i = 2 w_p) for i in ``subharmonic_modes`` (subset of {a, b, spectator,
-    coupler}), with ``beat = w_i - 2 w_p`` -- the true detuning of that two-pump
-    drive. The beat is the detuning from the channel's resonance (the DRAG detuning).
-    Uses target-sweep mode indices a=0, b=1, coupler=2, spectator=3.
-
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    wa_GHz, wb_GHz, ws_GHz, wspec_GHz : float
-        Absolute mode frequencies (GHz).
-    w_p_GHz : float
-        Pump frequency (GHz) to reference the beats against (nominal or calibrated).
-
-    Returns
-    -------
-    tuple
-        ``(|beat|, signed beat, kind, target_label, target_idx)`` for the nearest
-        channel; ``kind`` in {"onepump", "static", "subharm"}.
+    Returns ``(|beat|, signed beat, kind, target_label, target_idx)`` with kind in
+    {"onepump", "static", "subharm"}, or ``(0.0, 0.0, "none", "-", -1)`` if there are
+    no candidates. Ties keep the FIRST candidate in canonical order.
     """
     cands = _collision_candidates(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, w_p_GHz)
-    # strict `<` when scanning, so ties keep the FIRST candidate; a stable sort on
-    # |beat| over the same candidate order reproduces that exactly.
     return min(cands, key=lambda c: c[0]) if cands else (0.0, 0.0, "none", "-", -1)
 
 
 def _collision_candidates(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                           ws_GHz: float, wspec_GHz: float, w_p_GHz: float) -> list:
-    """Every spectator/mode collision channel, in the canonical scan order.
+    """Every spectator/mode collision channel, in canonical scan order.
 
-    Factored out of :func:`_nearest_collision` (which is now `min` over this) so that
-    RECURSIVE DRAG can suppress the N nearest processes rather than only the single
-    nearest -- see :func:`collision_drag_channels`. The candidate set, its ordering
-    and its beat conventions are unchanged.
+    Per target qubit q in {a, b} vs the spectator: one-pump swap (resonant at
+    ``|w_q - w_spec| = w_p``) and static exchange (``w_q = w_spec``), with
+    ``beat = |w_q - w_spec| - n w_p`` (n = 1, 0). With ``drag_subharmonic`` (or
+    ``no_spectator``), the subharmonic drives of mode i in ``subharmonic_modes`` by the
+    pump's 2nd harmonic, ``beat = w_i - 2 w_p``. The beat is the DRAG detuning.
+    Target-sweep mode indices: a=0, b=1, coupler=2, spectator=3.
     """
     a, b, coupler, spec = 0, 1, 2, 3
     out = []
@@ -412,12 +330,8 @@ def _collision_candidates(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                 beat = sep - harm
                 out.append((abs(beat), float(beat), kind, q_label, q_idx))
     if no_spec or bool(config.get("drag_subharmonic", True)):
-        # no_spectator: the only channels are the subharmonics; default to the SNAIL one.
-        #
-        # `is None` and NOT `or`: an EMPTY list is a deliberate "no subharmonics", and the
-        # old truthiness test silently restored the full set instead -- which made both
-        # single-channel isolation and opting out of the (now default-on) subharmonics
-        # impossible. Only a MISSING key falls back.
+        # `is None`, not `or`: an EMPTY list deliberately means "no subharmonics"; only
+        # a MISSING key falls back (to the SNAIL one alone when there is no spectator).
         sub_modes = config.get("subharmonic_modes")
         if sub_modes is None:
             sub_modes = ["s"] if no_spec else ["a", "b", "spec", "s"]
@@ -427,7 +341,7 @@ def _collision_candidates(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                 continue
             if lab == "spec" and no_spec:               # no spectator mode present
                 continue
-            beat = wi - 2.0 * w_p_GHz                    # detuning of the 2-pump drive: w_i - 2 w_p
+            beat = wi - 2.0 * w_p_GHz                    # detuning of the 2-pump drive
             out.append((abs(beat), float(beat), "subharm", lab, idx))
     return out
 
@@ -436,21 +350,12 @@ def collision_drag_channels(config: Dict[str, Any], wa_GHz: float, wb_GHz: float
                             ws_GHz: float, wspec_GHz: float, w_p_GHz: float, *,
                             n: int = 3, chirp_coeffs_GHz=None, t_g: float = 1.0,
                             quotient_rule: bool = True) -> tuple:
-    """The `n` nearest collisions as :class:`envelope.DragChannel` objects.
+    """The `n` nearest collisions as :class:`envelope.DragChannel` objects (recursive DRAG).
 
-    This is the auto-fill path for recursive DRAG: one derivative correction per
-    nearby process, which is exactly the situation Li/Calarco/Motzoi show a single
-    correction cannot handle (it can only trade one process's error against
-    another's).
-
-    Channels whose beat is too small -- or which a chirp would sweep through zero
-    mid-pulse -- are dropped rather than disabling DRAG wholesale, since the
-    composition is still well defined on the survivors
-    (:func:`_drag_channels_filtered`).
-
-    Distinct beats only: several candidate channels can coincide (e.g. the same
-    separation reached by two labels), and composing the same substitution twice
-    would double-count the correction rather than suppress a second process.
+    One derivative correction per nearby process -- a single correction can only trade
+    one process's error against another's (Li/Calarco/Motzoi). Unsafe channels are
+    dropped (:func:`_drag_channels_filtered`). Distinct beats only: composing the same
+    substitution twice would double-count rather than suppress a second process.
     """
     from snail_solver.envelope import DragChannel
     cands = sorted(_collision_candidates(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz,
@@ -470,26 +375,17 @@ def collision_drag_channels(config: Dict[str, Any], wa_GHz: float, wb_GHz: float
 def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
                    config: Dict[str, Any], drag_beat_GHz: Optional[float] = None,
                    nearest_beat_GHz: Optional[float] = None) -> None:
-    """Run GRAPE on the already-built point coupler and record the result in-place.
+    """Run GRAPE on the point's coupler and record the result in `out` in place.
 
-    Optimizes the pump envelope with ``grape.optimize_pulse`` (reduced rotating-
-    frame model, QuTiP-free) against the SAME leakage-aware iSWAP metric the sweep
-    uses, so ``grape_baseline_F`` is comparable to the QuTiP ``F_avg``. The
-    baseline is the DRAG/raised-cosine gate actually applied at this point
-    (``drag_beat_GHz`` = the applied beat, or None for the plain gate), so
-    ``dF_grape`` is the optimal-control headroom over that gate.
+    The baseline is the gate actually applied (``drag_beat_GHz`` = applied beat, None
+    for the plain gate), scored with the sweep's leakage-aware metric, so ``dF_grape``
+    is the optimal-control headroom over it. With ``grape_warmstart_drag`` a DRAG-off
+    point is seeded from DRAG at ``nearest_beat_GHz`` (outside the drag-skip window
+    only); the baseline is unchanged.
 
-    With ``config['grape_warmstart_drag']`` and a DRAG-off baseline, the optimizer
-    is seeded from a DRAG raised cosine at ``nearest_beat_GHz`` (a better L-BFGS-B
-    start for a near-collision point) -- but only when the beat is outside the
-    ``drag_skip_below_MHz`` window, since the DRAG quadrature ~ 1/beat blows up on
-    resonance. The baseline and ``dF_grape`` are unchanged; only the seed moves.
-
-    Writes ``F_grape``, ``leak_grape``, ``dF_grape`` (F_grape - grape_baseline_F),
-    ``grape_baseline_F``, ``grape_nfev``, ``grape_warmstart_GHz``; stashes the
-    optimized envelope under ``out["_grape"]`` for ``save_point`` to persist for
-    later QuTiP validation. The optimized pulse is a reduced-model result --
-    validate it in the full ``iswap_fidelity`` before trusting the absolute number.
+    Writes F_grape, leak_grape, dF_grape, grape_baseline_F, grape_nfev,
+    grape_warmstart_GHz, and stashes the optimized envelope in ``out["_grape"]`` for
+    ``save_point``. Reduced-model result: validate in ``iswap_fidelity``.
     """
     from snail_solver import grape
     warmstart = None
@@ -529,20 +425,10 @@ def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
 
 
 def save_point(result: Dict[str, Any], outdir: str) -> str:
-    """Persist one result row to ``<outdir>/points/point_XXXXX.npz``.
+    """Persist one `run_point` row to ``<outdir>/points/point_XXXXX.npz``; return the path.
 
-    Parameters
-    ----------
-    result : dict
-        A row from `run_point`; its ``U_proj`` (if any) is stored separately and
-        the remaining scalar metadata is JSON-encoded.
-    outdir : str
-        Output directory (its ``points/`` subdirectory must exist).
-
-    Returns
-    -------
-    str
-        Path to the written .npz file.
+    ``U_proj`` is stored as real/imag arrays, the GRAPE envelope / chevron as extra
+    arrays, and the remaining scalars as JSON ``meta``.
     """
     path = os.path.join(outdir, "points", f"point_{result['index']:05d}.npz")
     U = result.pop("U_proj", None)
@@ -563,6 +449,7 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
             extra.update(grape_crab_freqs=np.asarray(grp["crab_freqs"], dtype=float),
                          grape_crab_params=np.asarray(grp["crab_params"], dtype=float))
     if chev is not None:
+        # NB: replaces (does not merge with) any GRAPE arrays above.
         extra = {"chev_offsets_GHz": np.asarray(chev["offsets_GHz"], dtype=float),
                  "chev_times_ns": np.asarray(chev["times_ns"], dtype=float),
                  "chev_P10": np.asarray(chev["P10"], dtype=float),
@@ -580,20 +467,69 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
                         meta=json.dumps(result), **extra)
     return path
 
+
+_SPEC_COLS = ["index", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
+              "beat_GHz", "nearest_kind", "nearest_target",
+              "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
+              "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
+              "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
+              "grape_warmstart_GHz",
+              "w_p_GHz", "stark_offset_MHz", "amp_scale_used", "wp_offset_used_MHz",
+              "w_spec_GHz", "t_g_ns", "wall_s"]
+_TARGET_COLS = ["index", "kind", "wa_GHz", "wb_GHz", "w_snail_GHz",
+                "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz",
+                "amp_scale_used", "wp_offset_used_MHz", "lam_spec", "drag",
+                "drag_applied", "drag_compare_window", "eta_peak",
+                "g_iswap_eff_MHz", "nearest_beat_GHz", "nearest_kind",
+                "nearest_target", "g_collision_MHz", "status", "F_avg", "leakage",
+                "F_avg_drag", "leakage_drag", "dF_drag",
+                "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
+                "grape_warmstart_GHz",
+                "n_spec", "n_coupler",
+                "p_transfer", "t_g_ns", "wall_s"]
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float))
+
+
+def _as_float(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _print_target_summary(rows: List[Dict[str, Any]]) -> None:
+    """Best allocation (allowing DRAG where compared) and the DRAG gain in the window."""
+    def _best_F(r: Dict[str, Any]) -> float:
+        vals = [v for v in (r.get("F_avg"), r.get("F_avg_drag")) if _is_num(v)]
+        return max(vals) if vals else float("-inf")
+
+    scored = [r for r in rows if _best_F(r) > float("-inf")]
+    if scored:
+        best = max(scored, key=_best_F)
+        with_drag = (_is_num(best.get("F_avg_drag"))
+                     and best["F_avg_drag"] >= best.get("F_avg", -1))
+        _wb, _ws, _nb = (_as_float(best.get("wb_GHz")), _as_float(best.get("spec_GHz")),
+                         _as_float(best.get("nearest_beat_GHz")))
+        wb_str = f"{_wb:.4f}" if _wb is not None else str(best.get("wb_GHz"))
+        ws_str = f"{_ws:.4f} GHz" if _ws is not None else "bare (no spectator)"
+        nb_str = f"{_nb:+.3f}" if _nb is not None else str(best.get("nearest_beat_GHz"))
+        print(f"Best allocation: w_b={wb_str} GHz, w_spec={ws_str} "
+              f"({'with' if with_drag else 'no'} DRAG) -> F={_best_F(best):.5f}, "
+              f"nearest_beat={nb_str} GHz")
+    gains = [r["dF_drag"] for r in rows if _is_num(r.get("dF_drag"))]
+    if gains:
+        g = np.array(gains)
+        print(f"DRAG effect over {g.size} points with |beat|<threshold: "
+              f"mean dF={g.mean():+.4f}, best dF={g.max():+.4f}, "
+              f"helped {int((g > 0).sum())}/{g.size}")
+
+
 def collect(outdir: str) -> None:
-    """Gather all per-point .npz files into ``summary.csv`` and ``combined.npz``.
-
-    Parameters
-    ----------
-    outdir : str
-        Sweep directory containing ``points/point_*.npz``.
-
-    Returns
-    -------
-    None
-        Writes ``<outdir>/summary.csv`` (one row per point, sorted by index) and
-        ``<outdir>/combined.npz`` (stacked 4x4 propagators).
-    """
+    """Gather ``points/point_*.npz`` into ``summary.csv`` (sorted by index) and
+    ``combined.npz`` (stacked 4x4 propagators); warn about unfinished grid points."""
     files = sorted(glob.glob(os.path.join(outdir, "points", "point_*.npz")))
     if not files:
         print("No point_*.npz found; nothing to collect.", file=sys.stderr)
@@ -606,27 +542,8 @@ def collect(outdir: str) -> None:
         rows.append(meta); U_stack.append(U); idx_stack.append(meta["index"])
 
     rows.sort(key=lambda r: r["index"])
-    spec_cols = ["index", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
-                 "beat_GHz", "nearest_kind", "nearest_target",
-                 "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
-                 "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
-                 "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
-                 "grape_warmstart_GHz",
-                 "w_p_GHz", "stark_offset_MHz", "amp_scale_used", "wp_offset_used_MHz",
-                 "w_spec_GHz", "t_g_ns", "wall_s"]
-    target_cols = ["index", "kind", "wa_GHz", "wb_GHz", "w_snail_GHz",
-                   "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz",
-                   "amp_scale_used", "wp_offset_used_MHz", "lam_spec", "drag",
-                   "drag_applied", "drag_compare_window", "eta_peak",
-                   "g_iswap_eff_MHz", "nearest_beat_GHz", "nearest_kind",
-                   "nearest_target", "g_collision_MHz", "status", "F_avg", "leakage",
-                   "F_avg_drag", "leakage_drag", "dF_drag",
-                   "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
-                   "grape_warmstart_GHz",
-                   "n_spec", "n_coupler",
-                   "p_transfer", "t_g_ns", "wall_s"]
     is_target = bool(rows) and rows[0].get("kind") == "target"
-    cols = target_cols if is_target else spec_cols
+    cols = _TARGET_COLS if is_target else _SPEC_COLS
     csv_path = os.path.join(outdir, "summary.csv")
     with open(csv_path, "w") as f:
         f.write(",".join(cols) + "\n")
@@ -639,9 +556,7 @@ def collect(outdir: str) -> None:
                         U_proj=np.array(U_stack)[order])
     print(f"Collected {len(rows)} points -> {csv_path} and combined.npz")
 
-    # Flag gaps against the grid so a partial (timed-out) sweep is obvious here, not just
-    # in `missing`. Cheap: reads grid.json only if present.
-    try:
+    try:  # flag gaps so a partial (timed-out) sweep is obvious here
         _cfg, _pts = load_grid(outdir)
         got = {r["index"] for r in rows}
         gaps = sorted(set(range(len(_pts))) - got)
@@ -651,59 +566,12 @@ def collect(outdir: str) -> None:
     except Exception:
         pass  # no grid.json (e.g. collecting a hand-assembled points dir)
 
-    # For an integrated allocation sweep, report the best placement (allowing DRAG
-    # where it was compared) and, if present, the DRAG gain in the <threshold window.
     if is_target:
-        def _best_F(r: Dict[str, Any]) -> float:
-            vals = [v for v in (r.get("F_avg"), r.get("F_avg_drag"))
-                    if isinstance(v, (int, float))]
-            return max(vals) if vals else float("-inf")
-
-        scored = [r for r in rows if _best_F(r) > float("-inf")]
-        if scored:
-            best = max(scored, key=_best_F)
-            with_drag = (isinstance(best.get("F_avg_drag"), (int, float))
-                         and best["F_avg_drag"] >= best.get("F_avg", -1))
-
-            def _num(v):
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    return None
-            _wb, _ws, _nb = (_num(best.get("wb_GHz")), _num(best.get("spec_GHz")),
-                             _num(best.get("nearest_beat_GHz")))
-            wb_str = f"{_wb:.4f}" if _wb is not None else str(best.get("wb_GHz"))
-            ws_str = f"{_ws:.4f} GHz" if _ws is not None else "bare (no spectator)"
-            nb_str = f"{_nb:+.3f}" if _nb is not None else str(best.get("nearest_beat_GHz"))
-            print(f"Best allocation: w_b={wb_str} GHz, w_spec={ws_str} "
-                  f"({'with' if with_drag else 'no'} DRAG) -> F={_best_F(best):.5f}, "
-                  f"nearest_beat={nb_str} GHz")
-        gains = [r["dF_drag"] for r in rows if isinstance(r.get("dF_drag"), (int, float))]
-        if gains:
-            g = np.array(gains)
-            print(f"DRAG effect over {g.size} points with |beat|<threshold: "
-                  f"mean dF={g.mean():+.4f}, best dF={g.max():+.4f}, "
-                  f"helped {int((g > 0).sum())}/{g.size}")
+        _print_target_summary(rows)
 
 def plot_chevrons(outdir: str, indices: Optional[List[int]] = None) -> List[str]:
-    """Render the per-point Stark chevrons saved by --stark runs to
-    ``<outdir>/figs/chevrons/chevron_XXXXX.png`` (reuses find_stark_resonance's
-    renderer, so DRAG-matched chevrons are labelled with their beat).
-
-    Parameters
-    ----------
-    outdir : str
-        Sweep output directory (must contain ``points/point_*.npz``).
-    indices : list of int, optional
-        Restrict to these point indices; default renders every point that stored a
-        chevron.
-
-    Returns
-    -------
-    list of str
-        Paths of the written PNGs.
-    """
-    import glob
+    """Render the per-point Stark chevrons saved by --stark runs (optionally only
+    `indices`) to ``<outdir>/figs/chevrons/chevron_XXXXX.png``; return the PNG paths."""
     from snail_solver import find_stark_resonance as FS
     figs = os.path.join(outdir, "figs", "chevrons")
     os.makedirs(figs, exist_ok=True)
@@ -729,7 +597,7 @@ def plot_chevrons(outdir: str, indices: Optional[List[int]] = None) -> List[str]
         bits: List[str] = []
         if "spec_freq_GHz" in meta:
             bits.append(rf"$\Delta$={float(meta['spec_freq_GHz']):.3f} GHz")
-        if isinstance(meta.get("beat_GHz"), (int, float)):
+        if _is_num(meta.get("beat_GHz")):
             bits.append(f"beat={float(meta['beat_GHz'])*1e3:+.0f} MHz")
         bits.append("DRAG on" if meta.get("drag") else "DRAG off")
         png = os.path.join(figs, f"chevron_{idx:05d}.png")
@@ -738,35 +606,11 @@ def plot_chevrons(outdir: str, indices: Optional[List[int]] = None) -> List[str]
     return written
 
 def _parse_list(s: Optional[str], cast: Callable[[str], Any]) -> Optional[List[Any]]:
-    """Parse a comma-separated CLI string into a list via `cast`, or None if empty.
-
-    Parameters
-    ----------
-    s : str or None
-        Raw comma-separated argument (e.g. "0.2,0.25,0.3").
-    cast : callable
-        Element constructor (e.g. float, str).
-
-    Returns
-    -------
-    list or None
-        The parsed list, or None when `s` is falsy (use the caller's default).
-    """
+    """Comma-separated CLI string -> list via `cast`; None when `s` is empty."""
     return [cast(x) for x in s.split(",")] if s else None
 
 def _bool_list(s: Optional[str]) -> Optional[List[bool]]:
-    """Parse a comma-separated string of booleans (e.g. "false,true").
-
-    Parameters
-    ----------
-    s : str or None
-        Raw argument; tokens in {1,true,t,yes,on} (case-insensitive) are True.
-
-    Returns
-    -------
-    list of bool or None
-        The parsed flags, or None when `s` is falsy.
-    """
+    """Comma-separated booleans ({1,true,t,yes,on} -> True); None when `s` is empty."""
     if not s:
         return None
     return [tok.strip().lower() in ("1", "true", "t", "yes", "on")
@@ -776,46 +620,33 @@ def _log_line(res: Dict[str, Any]) -> str:
     """One-line human summary for a result row (both sweep kinds)."""
     f_str = res["F_avg"] if res.get("F_avg", "") != "" else "  --  "
     grape_tail = (f" F_grape={res['F_grape']:.4f}(dF={res['dF_grape']:+.4f})"
-                  if isinstance(res.get("F_grape"), (int, float)) else "")
+                  if _is_num(res.get("F_grape")) else "")
     if res.get("kind") == "target":
-        tail = ""
-        if isinstance(res.get("dF_drag"), (int, float)):
-            tail = f" dF_drag={res['dF_drag']:+.4f}"
+        tail = f" dF_drag={res['dF_drag']:+.4f}" if _is_num(res.get("dF_drag")) else ""
         tail += grape_tail
         _ws = res.get("spec_GHz", "")
-        wspec_str = f"{_ws:.3f}" if isinstance(_ws, (int, float)) else "bare"
+        wspec_str = f"{_ws:.3f}" if _is_num(_ws) else "bare"
         return (f"wb={res['wb_GHz']:.3f} wspec={wspec_str} wp={res['w_p_GHz']:.3f} "
                 f"nearest={res['nearest_beat_GHz']:+.3f}GHz({res['nearest_kind']}) "
                 f"g_coll={res['g_collision_MHz']}MHz F={f_str}{tail}")
     return (f"beat={res['beat_GHz']:+.3f}GHz drag={res['drag_applied']} "
             f"eta={res['eta_peak']:.3f} g_spec={res['g_spec_eff_MHz']:.3f}MHz F={f_str}{grape_tail}")
 
+
+def _chunking(m: int, max_array: int) -> Tuple[int, int]:
+    """(points per task, number of tasks) so the array stays within `max_array`."""
+    chunk = math.ceil(m / max_array)
+    return chunk, math.ceil(m / chunk)
+
+
 def _print_submit_hint(outdir: str, m: int, max_array: int = 1000) -> None:
-    """Print the sbatch submission line, chunking the array when the point count would
-    exceed a typical SLURM ``MaxArraySize``. One array task then runs CHUNK contiguous
-    points, so the array size is ceil(m / CHUNK).
-
-    Parameters
-    ----------
-    outdir : str
-        Sweep output directory.
-    m : int
-        Number of grid points.
-    max_array : int, default 1000
-        Conservative MaxArraySize assumption; the true value is site-specific
-        (``scontrol show config | grep MaxArraySize``).
-
-    Returns
-    -------
-    None
-    """
-    import math
+    """Print the sbatch line, chunking the array (CHUNK contiguous points per task) when
+    `m` exceeds a typical SLURM ``MaxArraySize`` (site-specific; conservative default)."""
     base = f"RUNNER=snail_solver.run_sweep_zhou OUTDIR={outdir}"
     if m <= max_array:
         print(f"Submit with:\n  {base} sbatch --array=0-{m - 1} slurm/snail_sweep.slurm")
         return
-    chunk = math.ceil(m / max_array)
-    ntasks = math.ceil(m / chunk)
+    chunk, ntasks = _chunking(m, max_array)
     print(f"Submit with (N={m} exceeds a typical MaxArraySize={max_array}, so CHUNK the array):")
     print(f"  {base} CHUNK={chunk} sbatch --array=0-{ntasks - 1} slurm/snail_sweep.slurm")
     print(f"  -> {ntasks} tasks x {chunk} points/task. Check your site limit with "
@@ -823,19 +654,7 @@ def _print_submit_hint(outdir: str, m: int, max_array: int = 1000) -> None:
     print(f"  (raise #SBATCH --time accordingly: each task now runs {chunk} points in series.)")
 
 def _compress_ranges(indices: List[int]) -> str:
-    """Collapse a sorted index list into a SLURM ``--array`` spec, e.g.
-    ``[3, 7, 8, 9, 20]`` -> ``"3,7-9,20"``.
-
-    Parameters
-    ----------
-    indices : list of int
-        Sorted, unique, non-negative indices.
-
-    Returns
-    -------
-    str
-        Comma-separated runs of contiguous indices.
-    """
+    """Sorted unique indices -> SLURM ``--array`` spec, e.g. [3, 7, 8, 9, 20] -> "3,7-9,20"."""
     if not indices:
         return ""
     parts: List[str] = []
@@ -850,22 +669,13 @@ def _compress_ranges(indices: List[int]) -> str:
     return ",".join(parts)
 
 def find_missing(outdir: str, max_array: int = 1000) -> None:
-    """Report grid points with no saved ``point_XXXXX.npz`` (i.e. they never finished),
-    write a resume list, and print ready-to-run resubmission commands.
+    """Report grid points with no saved ``point_XXXXX.npz``, write ``missing.txt``, and
+    print resubmission commands.
 
-    A point file is written only after :func:`run_point` returns, so a missing file means
-    the task timed out or died before saving. Points that finished but produced a bad
-    result (e.g. ``F_avg`` is nan) are *not* caught here -- those have a file; check the
-    ``status``/``F_avg`` columns of ``summary.csv`` after ``collect`` for those.
-
-    Parameters
-    ----------
-    outdir : str
-        Sweep directory containing ``grid.json`` and ``points/point_*.npz``.
-    max_array : int, optional
-        Assumed SLURM ``MaxArraySize`` for choosing between a direct index-list array and
-        a chunked resume array. Confirm your site's value with
-        ``scontrol show config | grep MaxArraySize``.
+    A point file is written only after :func:`run_point` returns, so a missing file
+    means the task died first. Finished-but-bad points (e.g. nan ``F_avg``) are NOT
+    caught here; check ``summary.csv`` after ``collect``. `max_array` is the assumed
+    SLURM ``MaxArraySize`` (``scontrol show config | grep MaxArraySize``).
     """
     _config, points = load_grid(outdir)
     n = len(points)
@@ -898,12 +708,11 @@ def find_missing(outdir: str, max_array: int = 1000) -> None:
         print(f"  RESUME={listpath} OUTDIR={outdir} sbatch "
               f"--array=0-{m - 1} slurm/snail_sweep.slurm")
     else:
-        chunk = math.ceil(m / max_array)
-        ntasks = math.ceil(m / chunk)
+        chunk, ntasks = _chunking(m, max_array)
         print(f"  RESUME={listpath} OUTDIR={outdir} CHUNK={chunk} sbatch "
               f"--array=0-{ntasks - 1} slurm/snail_sweep.slurm")
         print(f"  ({ntasks} tasks x {chunk} points/task; raise #SBATCH --time to match.)")
-    if missing and missing[-1] < max_array:
+    if missing[-1] < max_array:
         print("Or directly (only if the largest index is below MaxArraySize):")
         print(f"  OUTDIR={outdir} CHUNK=1 sbatch "
               f"--array={_compress_ranges(missing)} slurm/snail_sweep.slurm")

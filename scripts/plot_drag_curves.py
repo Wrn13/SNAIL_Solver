@@ -1,13 +1,10 @@
 """One figure per target eta: the bare pulse against the calibrated chirp+DRAG gate.
 
-Each figure is a single panel with the two traces overlaid, so the only thing the eye
-has to do is compare them. Colour and line style both carry the variant, and the
-in-window resonances are drawn as dashed lines.
+One panel, the two traces side by side; colour and style both carry the variant, and
+in-window resonances are dashed lines. Gate lengths (fitted per trace) are listed per
+column in `table.txt` instead.
 
-Gate lengths are not plotted -- they differ between the traces (each is fitted for its
-own pulse) and are listed per column in `table.txt` instead.
-
-Usage:  plot_drag_curves.py curves.json OUTDIR [DEVICE.json]
+Usage:  plot_drag_curves.py [--bars-only] curves.json OUTDIR [DEVICE.json] [BASELINE.json]
 """
 import json
 import sys
@@ -18,24 +15,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# --bars-only strips every overlay: the smoothed trend, the paired band and the
-# improvement wedge. Worth having as the default view now that the smoothing's
-# justification is gone -- it was added on the reading that the column-to-column
-# scatter was calibration noise, and replaying a fixed pulse across the axis
-# disproved that (the locally calibrated pulse wins everywhere, by 1.4-6x). The
-# structure is real physics, including a resonance that MOVES with drive, so a
-# 20 MHz kernel averages across genuine features rather than through noise.
+# --bars-only strips every overlay (trend, paired band, improvement wedge). The
+# column-to-column structure is physics, not calibration noise -- a replayed fixed
+# pulse loses to the locally calibrated one by 1.4-6x everywhere, and one resonance
+# MOVES with drive -- so a 20 MHz smoothing kernel averages across real features.
 _argv = [a for a in sys.argv if a != "--bars-only"]
 BARS_ONLY = len(_argv) != len(sys.argv)
 sys.argv = _argv
 
 CURVES, OUTDIR = sys.argv[1], sys.argv[2]
 DEVICE = sys.argv[3] if len(sys.argv) > 3 else "devices/6Gate4.7SNAIL.json"
-# Optional 4th arg: a curves.json from a run calibrated with --max-drag-channels 0.
-# That is the HONEST no-DRAG baseline. The `bare` trace of a DRAG run is not one:
-# its length and carrier come from a chirp<->DRAG fixed point that assumed the
-# correction would be played, so it is a DRAG-aware calibration with the correction
-# switched off at scoring time, not a pulse designed without DRAG.
+# Optional 4th arg: curves.json from a --max-drag-channels 0 run, the HONEST no-DRAG
+# baseline. A DRAG run's own `bare` is not one: its length and carrier come from a
+# chirp<->DRAG fixed point that assumed the correction would be played, and partly
+# compensate for the missing chirp (at delta = -130: 4.80e-3 against 1.155e-2 for an
+# honestly calibrated bare pulse, 2.4x too good). With a baseline, its bare replaces
+# this run's.
 BASELINE = sys.argv[4] if len(sys.argv) > 4 else None
 
 # name -> (colour, linestyle, marker, filled, label). Categorical slots 1 and 2 of the
@@ -45,12 +40,6 @@ STYLE = {
     "bare":       ("#eb6834", "--", "s", False, "no chirp, no DRAG"),
     "chirp+DRAG": ("#2a78d6", "-",  "o", True,  "chirp + DRAG"),
 }
-# With a baseline file, the BARE series is taken from it and this run's own bare is
-# dropped. They are not the same pulse: this run's bare takes its length and carrier
-# from a chirp<->DRAG fixed point that assumed the correction would be played, and
-# those partly compensate for the missing chirp -- at delta = -130 it reads 4.80e-3
-# against 1.155e-2 for an honestly calibrated bare pulse, a factor 2.4 too good.
-# Using the flattering one understates the correction's benefit by the same factor.
 BASE_STYLE = {
     "bare": ("#eb6834", "--", "s", False,
              "no chirp, no DRAG (independently calibrated)"),
@@ -59,10 +48,8 @@ INK, MUTED, GRID = "#1a1a19", "#5c5b55", "#d8d7d0"
 
 
 def resonances(device_path):
-    """In-window channel resonances (MHz), derived from the device.
-
-    Verified by scanning `interaction_channels` across +-400 MHz at 5 MHz: exactly two
-    channels cross zero there.
+    """In-window channel resonances (MHz), derived from the device (a 5 MHz scan of
+    `interaction_channels` over +-400 MHz finds exactly these two zero crossings):
 
       delta = 0        2 w_p = w_a          the qubit-A subharmonic the scan straddles
       delta = alpha/2  2 w_p = w_a + alpha  the A |1>->|2> ladder, from
@@ -90,16 +77,9 @@ RES_IN, RES_OUT = resonances(DEVICE)
 def _trend(d, y, sigma=20.0, gap=60.0):
     """Gaussian-kernel local mean and scatter of `y` over the detuning axis.
 
-    Smoothed in DELTA, not in column index: the grid is 10 MHz inside +-200 MHz and
-    then jumps to 50-100 MHz steps, so an index-space kernel would mix points that
-    are 100 MHz apart with points 10 MHz apart.
-
-    The band is the local weighted standard deviation, and it is CALIBRATION scatter,
-    not measurement noise. Replaying one fixed pulse across delta gives a curvature
-    roughness of 0.124 in log10(1-F) on this grid; recalibrating at every column gives
-    0.292, i.e. 2.4x rougher. The underlying physics is smooth -- each column is a
-    separately tuned pulse (its own shift-law fit, channel set and fitted length), and
-    that is what scatters.
+    Smoothed in DELTA, not column index: the grid is 10 MHz inside +-200 MHz and
+    50-100 MHz outside, so an index kernel would mix very different spacings. The
+    band is the local weighted sd.
 
     Returns (mean, sd, segments) where `segments` splits the axis at gaps wider than
     `gap` so the trend never bridges a region the calibration refused.
@@ -117,13 +97,16 @@ def _trend(d, y, sigma=20.0, gap=60.0):
     return m, s, segments
 
 
+def _bkey(r):
+    return (round(r["delta_GHz"] * 1e3), round(float(r["target_eta"]), 3))
+
+
 def load_baseline(path):
     """{(delta_rounded, eta): row} from an independently calibrated no-DRAG run."""
     if not path:
         return {}
     try:
-        return {(round(r["delta_GHz"] * 1e3), round(float(r["target_eta"]), 3)): r
-                for r in json.load(open(path))}
+        return {_bkey(r): r for r in json.load(open(path))}
     except Exception as exc:
         print(f"(ignoring baseline {path}: {exc})")
         return {}
@@ -135,10 +118,9 @@ BASE_ROWS = load_baseline(BASELINE)
 def figure_for(eta, rows, outdir):
     """One eta, one panel: grouped bars, bare against chirp+DRAG.
 
-    The ablation figure's form -- a categorical column axis with one bar per variant
-    and a log y -- because the quantity is a per-column comparison, not a continuous
-    function. Every scanned column gets a slot whether or not it calibrated, so the
-    detuning axis stays physical and a gap reads as a gap rather than closing up.
+    A categorical column axis with log y, because the quantity is a per-column
+    comparison, not a continuous function. Every scanned column gets a slot whether or
+    not it calibrated, so a gap reads as a gap.
     """
     rows = sorted(rows, key=lambda r: r["delta_GHz"])
     x = np.arange(len(rows), dtype=float)
@@ -154,9 +136,8 @@ def figure_for(eta, rows, outdir):
     ax.tick_params(colors=MUTED, labelsize=9)
     ax.set_axisbelow(True)
 
-    # Columns the calibration could not deliver: a shaded slot, coloured by the stage
-    # that gave up. An audit refusal, an unmeasurable shift law (coupler occupation)
-    # and a diverged chirp fixed point are different physics.
+    # Failed columns: a slot shaded by the stage that gave up (audit refusal,
+    # unmeasurable shift law, diverged chirp fixed point are different physics).
     stage_colour = {"audit": "#e34948", "rabi": "#eda100", "chirp": "#4a3aa7"}
     seen_stages = {}
     for i, r in enumerate(rows):
@@ -166,9 +147,7 @@ def figure_for(eta, rows, outdir):
             seen_stages[st] = col
             ax.axvspan(i - 0.5, i + 0.5, color=col, alpha=0.13, lw=0, zorder=0)
 
-    # Columns that calibrated, but whose CHIRP is not a measurement. Distinct from
-    # the failure shading above: the gate here is real and its bare number stands;
-    # it is only the chirp comparison that is unavailable.
+    # Hatched: calibrated, but the CHIRP is not a measurement (the bare number stands).
     n_excluded = 0
     for i, r in enumerate(rows):
         if r.get("chirp_excluded"):
@@ -176,13 +155,11 @@ def figure_for(eta, rows, outdir):
             ax.axvspan(i - 0.5, i + 0.5, facecolor="none", edgecolor=MUTED,
                        hatch="///", lw=0.0, alpha=0.5, zorder=0)
 
-    # Columns whose COUPLER is loaded past what 9 levels can represent. Both bars
-    # there read too GOOD -- leakage out of the truncated ladder is uncharged -- so
-    # they are marked rather than quoted. Different failure from the hatch above:
-    # the chirp comparison is fine, the absolute number is not.
-    n_trunc = sum(1 for r in rows if r.get("coupler_truncated"))
+    # Triangles: coupler loaded past what 9 levels represent; both bars read too GOOD
+    # (leakage off the ladder is uncharged). The comparison is fine, the absolute not.
+    xt = [i for i, r in enumerate(rows) if r.get("coupler_truncated")]
+    n_trunc = len(xt)
     if n_trunc:
-        xt = [i for i, r in enumerate(rows) if r.get("coupler_truncated")]
         ax.plot(xt, [ax.get_ylim()[1] * 0.72] * len(xt), marker="v", ls="none",
                 ms=6.0, color="#e34948", zorder=5, clip_on=False)
 
@@ -200,8 +177,7 @@ def figure_for(eta, rows, outdir):
         if src_tag == "baseline":
             y = np.array([
                 (1.0 - t["F_avg"])
-                if (br := BASE_ROWS.get((round(r["delta_GHz"] * 1e3),
-                                         round(float(r["target_eta"]), 3))))
+                if (br := BASE_ROWS.get(_bkey(r)))
                 and (t := (br.get("traces") or {}).get(name)) else np.nan
                 for r in rows])
         else:
@@ -209,12 +185,9 @@ def figure_for(eta, rows, outdir):
                           if (t := (r.get("traces") or {}).get(name)) else np.nan
                           for r in rows])
             if name == "chirp+DRAG":
-                # Where no chirp could be MEASURED, the calibration fell back to a
-                # chirp-free pulse, so this trace is the bare gate replayed. Drawing
-                # it would show two equal bars and read as "chirping does nothing
-                # here" -- the opposite of the truth at columns whose law still swept
-                # 20-64% of a half-linewidth. The slot is hatched instead, so the
-                # absence is visible and cannot be mistaken for a null result.
+                # No chirp MEASURED: this trace is the bare gate replayed, and two
+                # equal bars would read as "chirping does nothing" where the law still
+                # swept 20-64% of a half-linewidth. The slot is hatched instead.
                 excl = np.array([bool(r.get("chirp_excluded")) for r in rows])
                 y = np.where(excl, np.nan, y)
         ax.bar(x + (k - (nser - 1) / 2.0) * w, y, w, label=lab, color=col,
@@ -225,19 +198,11 @@ def figure_for(eta, rows, outdir):
             lm, _sd, segs = _trend(d[ok], np.log10(y[ok]))
             trend[(name, src_tag)] = (x[ok], lm, segs, col, lab)
 
-    # The band is the PAIRED scatter, not each trace's own.
-    #
-    # Both traces are scored at the same operating point from the same calibration, so
-    # their large column-to-column scatter is COMMON MODE -- they correlate at 0.999.
-    # Drawing two independent +-1 sd bands implies the difference is swamped when it is
-    # not: the paired scatter is 11-27x narrower, and the best columns sit 2.9-7.0
-    # paired sd above unity. The shaded wedge between the trends IS the improvement,
-    # and the hairline band around it is how well that improvement is determined.
-    # The wedge measures what DRAG buys over the BEST pulse available without it.
-    # With an independent baseline that is the chirp-only run calibrated with
-    # --max-drag-channels 0; without one it falls back to this run's bare trace,
-    # which is a weaker claim (that pulse's length and carrier came from a
-    # DRAG-aware fixed point).
+    # The wedge between the trends IS the improvement over the best pulse without
+    # DRAG (the independent baseline if given, else this run's weaker bare trace).
+    # Its band is the PAIRED scatter: both traces share one operating point, so their
+    # column-to-column scatter is common mode (correlation 0.999) and the paired sd is
+    # 11-27x narrower than either trace's own.
     ref_key = (("bare", "baseline") if ("bare", "baseline") in trend
                else ("bare", None))
     ref_lab = ("improvement over an independently calibrated bare pulse"
@@ -246,12 +211,8 @@ def figure_for(eta, rows, outdir):
         xr, lr, segs, _cr, _lr = trend[ref_key]
         xg, lg, _s2, gcol, _l2 = trend[("chirp+DRAG", None)]
         if xr.size == xg.size and np.allclose(xr, xg):
-            # Paired scatter: both traces are scored at the same operating point, so
-            # their common calibration wander cancels and the band is 11-27x narrower
-            # than either trace's own.
             pair_ok = np.array([
-                bool((BASE_ROWS.get((round(r["delta_GHz"] * 1e3),
-                                     round(float(r["target_eta"]), 3))) or r)
+                bool((BASE_ROWS.get(_bkey(r)) or r)
                      .get("traces", {}).get("bare")
                      and (r.get("traces") or {}).get("chirp+DRAG")) for r in rows])
             if pair_ok.sum() == xr.size:
@@ -290,10 +251,8 @@ def figure_for(eta, rows, outdir):
     step = 1 if len(rows) <= 24 else 2
     ax.set_xticks(x[::step])
     ax.set_xticklabels([f"{v:+.0f}" for v in d[::step]], fontsize=8, rotation=90)
-    # Categorical axis, as in the ablation figure: columns are equally spaced even
-    # though the grid is 10 MHz inside +-200 and 50-100 MHz outside it. Say so, or
-    # the wide columns read as though they were 10 MHz apart. (The resonance lines
-    # are placed by interpolating their true delta onto this axis, so they are right.)
+    # Columns are equally spaced though the grid is not; say so. (Resonance lines are
+    # interpolated onto this axis, so they are placed correctly.)
     ax.set_xlabel("pump detuning from the subharmonic   $\\delta$  (MHz)"
                   "        [columns equally spaced, not linear in $\\delta$]",
                   color=INK, fontsize=10)
@@ -324,8 +283,7 @@ def figure_for(eta, rows, outdir):
               loc="upper center", bbox_to_anchor=(0.5, -0.17))
 
     n_ok = sum(1 for r in rows if r["ok"])
-    # Out-of-window resonances belong in the footer: inside the axes they sit on top
-    # of the bars at either end.
+    # Out-of-window resonances go in the footer, not on top of the end bars.
     outside = ";  ".join(f"{lab} at {xr:+.0f} MHz" for xr, lab in RES_OUT)
     if not BARS_ONLY:
         fig.text(0.005, 0.021, "green wedge = the improvement;  narrow band = +-1 "
@@ -335,8 +293,7 @@ def figure_for(eta, rows, outdir):
                  "than the locally calibrated one -- so the trend averages across "
                  "real features, including a resonance that moves with drive.",
                  ha="left", va="bottom", fontsize=7.0, color=MUTED)
-    # The two caveats that survive the exclusions, stated ON the figure. Both are
-    # computed from the rows rather than written in, so they cannot go stale.
+    # The caveats that survive the exclusions, computed from the rows.
     n_nonconv = sum(1 for r in rows if r["ok"] and r.get("perturbative_ok") is False)
     caveats = []
     if n_nonconv:

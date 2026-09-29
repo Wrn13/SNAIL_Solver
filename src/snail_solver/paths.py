@@ -1,6 +1,6 @@
 """Repo-relative path resolution, so every tool can be called with bare names.
 
-The expected layout is::
+Expected layout::
 
     SNAIL_Solver/                   <- REPO_ROOT (holds pyproject.toml)
     |-- src/snail_solver/*.py       <- code (this module lives here)
@@ -8,25 +8,13 @@ The expected layout is::
     |-- results/                    <- sweep / calibration outputs
     +-- slurm/                      <- SLURM scripts
 
-``--device dev.json`` resolves to ``devices/dev.json`` and default outputs land
-under ``results/``.
-
-The root is found by walking up from this file to the first ancestor holding a
-``pyproject.toml``, so it works from any working directory. Two fallbacks cover
-the cases where that fails:
-
-* An ancestor holding ``devices/`` or ``slurm/`` -- for a source tree without
-  packaging metadata.
-* The current working directory -- for a non-editable install, where the code
-  sits in ``site-packages`` and has no repo above it.
-
-Set ``SNAIL_SOLVER_ROOT`` to override the search entirely. That is the usual way
-to put outputs on fast scratch storage in a batch job::
+``--device dev.json`` resolves to ``devices/dev.json``; default outputs land under
+``results/``. The root is the first ancestor of this file holding ``pyproject.toml``,
+else one holding ``devices/`` or ``slurm/``, else the current working directory (a
+non-editable install). ``SNAIL_SOLVER_ROOT`` overrides the search, e.g. to put
+outputs on scratch in a batch job (``devices/`` is then expected there too)::
 
     SNAIL_SOLVER_ROOT=/scratch/$USER/snail python -m snail_solver.run_sweep_zhou ...
-
-Note that ``devices/`` is then expected under that root too, so pass an explicit
-path to ``--device`` (or copy the JSONs across) when overriding.
 """
 
 from __future__ import annotations
@@ -41,19 +29,7 @@ _ROOT_ENV_VAR = "SNAIL_SOLVER_ROOT"
 
 
 def _find_root(start: Path) -> Path:
-    """Locate the repository root above `start`.
-
-    Parameters
-    ----------
-    start : Path
-        Directory to start the upward walk from (inclusive).
-
-    Returns
-    -------
-    Path
-        The repository root, or the current working directory if no marker is
-        found (which is the sane default for an installed-to-site-packages copy).
-    """
+    """Repository root at or above `start` (see the module docstring for the order)."""
     override = os.environ.get(_ROOT_ENV_VAR)
     if override:
         return Path(override).expanduser().resolve()
@@ -75,19 +51,8 @@ SLURM_DIR: Path = REPO_ROOT / "slurm"
 
 
 def resolve_device(name: str) -> str:
-    """Resolve a device path: use it if it exists, else look under devices/.
-
-    Parameters
-    ----------
-    name : str
-        A path or a bare filename.
-
-    Returns
-    -------
-    str
-        The resolved path (unchanged if already valid or if not found, so the
-        caller's own error surfaces).
-    """
+    """`name` if it exists, else ``devices/<name>`` if that exists, else `name`
+    unchanged (so the caller's own error surfaces)."""
     p = Path(name)
     if p.exists():
         return str(p)
@@ -96,20 +61,8 @@ def resolve_device(name: str) -> str:
 
 
 def in_results(name: str) -> str:
-    """Place a relative output name under results/ (absolute paths pass through).
-
-    Ensures the parent directory exists.
-
-    Parameters
-    ----------
-    name : str
-        Output path or bare name.
-
-    Returns
-    -------
-    str
-        The resolved output path.
-    """
+    """Place a relative output name under results/ (absolute paths pass through),
+    creating its parent directory."""
     p = Path(name)
     if p.is_absolute():
         out = p

@@ -15,25 +15,32 @@ import numpy as np
 R = sys.argv[1] if len(sys.argv) > 1 else "results/drag_curve_5MHz_2026-09-22"
 nod = json.load(open(f"{R}/curves_nodrag_flagged.json"))
 
-#: Coupler occupation above which `--coupler-levels 9` is doing real violence. The
-#: 7-level run came out 3x optimistic at ~0.85 photons, so this is not a rounding
-#: concern: at a full photon the top of the ladder is populated and the leakage out
-#: of the model is simply not charged.
+#: Coupler occupation above which `--coupler-levels 9` misrepresents the state (the
+#: 7-level run was 3x optimistic at ~0.85 photons: leakage off the ladder is uncharged).
 N_CPL_WARN = 0.05
 N_CPL_SEVERE = 0.5
 
 
-def grab(eta, var, skip_excl=False):
+def _eta(r):
+    return round(float(r["target_eta"]), 2)
+
+
+def _dmhz(r):
+    return round(float(r["delta_GHz"]) * 1e3)
+
+
+def grab(eta, var, skip_excl=False, rows=None):
+    """{delta_mhz: coherent infidelity} of one trace at one eta (default: nodrag rows)."""
     o = {}
-    for r in nod:
-        if round(float(r["target_eta"]), 2) != eta or not r.get("ok"):
+    for r in (nod if rows is None else rows):
+        if _eta(r) != eta or not r.get("ok"):
             continue
         if skip_excl and r.get("chirp_excluded"):
             continue
         t = (r.get("traces") or {}).get(var) or {}
         v = t.get("infidelity_coherent")
         if v and v > 0:
-            o[round(float(r["delta_GHz"]) * 1e3)] = float(v)
+            o[_dmhz(r)] = float(v)
     return o
 
 
@@ -43,7 +50,7 @@ for f in glob.glob(f"{R}/passA_nodrag/columns/*.json"):
     ncpl[(round(float(d["target_eta"]), 2),
           round(float(d["delta_GHz"]) * 1e3))] = d.get("n_coupler")
 
-etas = sorted({round(float(r["target_eta"]), 2) for r in nod})
+etas = sorted({_eta(r) for r in nod})
 P = print
 
 P("# What this dataset does and does not support")
@@ -112,12 +119,12 @@ P("the last kept term against the first. Above ~0.25 the unmeasured `eta^6` term
 P("plausibly as large again, so the series is not a series.")
 P()
 for eta in etas:
-    rows = [r for r in nod if round(float(r["target_eta"]), 2) == eta and r.get("ok")]
+    rows = [r for r in nod if _eta(r) == eta and r.get("ok")]
     bad = [r for r in rows if r.get("perturbative_ok") is False]
     b = grab(eta, "bare")
     c = grab(eta, "chirp+DRAG", skip_excl=True)
     ks = [d for d in sorted(set(b) & set(c)) if b[d] / c[d] > 1.01]
-    q = {round(float(r["delta_GHz"]) * 1e3): r.get("quartic_fraction") for r in rows}
+    q = {_dmhz(r): r.get("quartic_fraction") for r in rows}
     ok = [d for d in ks if (q.get(d) or 0) <= 0.25]
     verb = "rests" if len(ok) == 1 else "rest"
     P(f"- **eta={eta}**: not converged at {len(bad)}/{len(rows)} calibrated columns. "
@@ -170,23 +177,14 @@ P()
 P("- The chirp's **relative benefit** was understated; corrected in section 1.")
 P("- The **absolute infidelity** is still optimistic wherever the coupler is loaded.")
 dot = []
+drg = json.load(open(f"{R}/curves_drag_flagged.json")) if etas else []
 for eta in etas:
     c = grab(eta, "chirp+DRAG", skip_excl=True)
-    drg = json.load(open(f"{R}/curves_drag_flagged.json"))
-    x = {}
-    for r in drg:
-        if round(float(r["target_eta"]), 2) != eta or not r.get("ok"):
-            continue
-        if r.get("chirp_excluded"):
-            continue
-        t = (r.get("traces") or {}).get("chirp+DRAG") or {}
-        v = t.get("infidelity_coherent")
-        if v and v > 0:
-            x[round(float(r["delta_GHz"]) * 1e3)] = float(v)
+    x = grab(eta, "chirp+DRAG", skip_excl=True, rows=drg)
     ks = sorted(set(c) & set(x))
     if ks:
         dot.append(f"{geometric_mean([c[d] / x[d] for d in ks]):.3f}x (eta={eta})")
-P(f"- **DRAG on top of a working chirp is a wash**: geomean "
+P("- **DRAG on top of a working chirp is a wash**: geomean "
   + ", ".join(dot) + ". The superseded 1.00x median was mildly flattered by")
 P("  chirp-free columns, where that ratio is really DRAG-vs-bare.")
 P()
@@ -198,9 +196,9 @@ for eta in etas:
     c = grab(eta, "chirp+DRAG", skip_excl=True)
     ks = sorted(set(b) & set(c))
     claims.append(f"{geometric_mean([b[d] / c[d] for d in ks]):.2f}x (eta={eta})")
-P(f"1. A chirped pulse beats an independently calibrated bare pulse across this")
-P(f"   window by geomean " + " / ".join(claims) + ", over the columns where a chirp")
-P(f"   is measurable.")
+P("1. A chirped pulse beats an independently calibrated bare pulse across this")
+P("   window by geomean " + " / ".join(claims) + ", over the columns where a chirp")
+P("   is measurable.")
 P("2. Adding recursive DRAG on top of a working chirp buys nothing measurable.")
 bg = {}
 for r in json.load(open(f"{R}/curves_drag_flagged.json")):
@@ -208,8 +206,8 @@ for r in json.load(open(f"{R}/curves_drag_flagged.json")):
     v = t.get("infidelity_coherent")
     if not v or v <= 0:
         continue
-    eta = round(float(r["target_eta"]), 2)
-    d = round(float(r["delta_GHz"]) * 1e3)
+    eta = _eta(r)
+    d = _dmhz(r)
     if eta not in bg or v < bg[eta][1]:
         bg[eta] = (d, float(v), bool(r.get("chirp_excluded")))
 P("3. Best gates found (over every scored column, since a column dropped from the")

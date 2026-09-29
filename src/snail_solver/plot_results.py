@@ -3,26 +3,19 @@ r"""
 plot_results.py
 ===============
 
-Read a sweep result directory (``summary.csv`` + ``combined.npz`` produced by
-``run_sweep_zhou``) and render publication-style figures
-in the idiom of the parametric-gate / frequency-collision literature:
+Render publication-style figures from a sweep result directory (``summary.csv``
++ ``combined.npz`` from ``run_sweep_zhou``):
 
-  * Fig 1  infidelity 1 - F vs spectator frequency, log-y, DRAG off vs on
-           (the canonical DRAG / collision figure).
+  * Fig 1  infidelity 1 - F vs spectator frequency, log-y, DRAG off vs on.
   * Fig 2  leakage and spectator / coupler occupation vs spectator frequency.
-  * Fig 3  2D collision map: log10(1 - F) over (spectator frequency, participation)
-           -- the frequency-allocation heatmap (cf. McKinney et al.,
-           arXiv:2409.18262).
+  * Fig 3  2D collision map log10(1 - F) over (spectator frequency, participation)
+           (cf. McKinney et al., arXiv:2409.18262).
   * Fig 4  analytic collision predictor: the Eq.-62 exchange rate and the
-           "danger ratio" g_spec / |beat|, which is available even for an
-           analytic-only sweep (``--no-integrate``).
+           "danger ratio" g_spec / |beat| (works for ``--no-integrate`` sweeps).
 
-The module auto-detects what is present: a full sweep yields Figs 1-4, an
-analytic-only sweep yields Fig 4. It also adapts to either schema (the Zhou
-driver's ``lam_spec`` or the effective-model driver's ``eta`` as the series
-variable). Styling is self-contained (no external style files); math is set in
-Computer-Modern via mathtext, so no system LaTeX is required (pass ``--usetex``
-to switch to a real TeX install if you have one).
+A full sweep yields Figs 1-4, an analytic-only sweep Fig 4. The series variable
+is ``lam_spec`` (Zhou driver) or ``eta`` (effective-model driver). Math uses
+Computer-Modern mathtext; ``--usetex`` switches to a real TeX install.
 
 Usage
 -----
@@ -36,18 +29,18 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
-# Wong colorblind-safe palette (Nature Methods 8, 441 (2011)) -- common in
-# current superconducting-qubit papers.
+# Wong colorblind-safe palette (Nature Methods 8, 441 (2011)).
 WONG = ["#0072B2", "#D55E00", "#009E73", "#CC79A7",
         "#E69F00", "#56B4E9", "#F0E442", "#000000"]
 
-# columns that should be parsed as floats (others stay strings / bools)
+# columns parsed as floats / bools (others stay strings)
 _FLOAT_COLS = {
     "index", "spec_freq_GHz", "lam_spec", "eta", "beat_GHz", "eta_peak",
     "g_iswap_eff_MHz", "g_spec_eff_MHz", "F_avg", "leakage", "n_spec",
@@ -61,19 +54,9 @@ _BOOL_COLS = {"drag", "drag_applied"}
 # Style
 # ---------------------------------------------------------------------------
 def set_literature_style(usetex: bool = False) -> None:
-    """Apply tight, paper-style Matplotlib rcParams: inward minor ticks on all
-    spines, Computer-Modern math, hairline axes, constrained layout.
-
-    Parameters
-    ----------
-    usetex : bool, default False
-        If True, render text with a system LaTeX install (requires TeX +
-        amsmath); otherwise mathtext is used and no LaTeX is needed.
-
-    Returns
-    -------
-    None
-    """
+    """Apply paper-style rcParams: inward minor ticks on all spines, Computer-Modern
+    math, hairline axes, constrained layout. `usetex` renders text with a system
+    LaTeX install (needs TeX + amsmath)."""
     mpl.rcParams.update({
         "figure.dpi": 130, "savefig.dpi": 600, "savefig.bbox": "tight",
         "font.size": 9, "font.family": "sans-serif",
@@ -105,32 +88,36 @@ def _panel_label(ax, text: str) -> None:
             fontweight="bold", va="top", ha="left")
 
 
+def _label_panels(axes) -> None:
+    for ax, lab in zip(axes, "abcdef"):
+        _panel_label(ax, f"({lab})")
+
+
+def _drag_handles() -> list:
+    """Legend handles for the DRAG off (dashed/open) vs on (solid/filled) style."""
+    return [Line2D([], [], color="0.25", ls="--", marker="o", mfc="white",
+                   label="DRAG off"),
+            Line2D([], [], color="0.25", ls="-", marker="o", label="DRAG on")]
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 def load_summary(outdir: str) -> Dict[str, np.ndarray]:
     """Parse ``<outdir>/summary.csv`` into column arrays.
 
-    Parameters
-    ----------
-    outdir : str
-        Sweep directory containing summary.csv.
-
-    Returns
-    -------
-    dict[str, ndarray]
-        One array per column. Numeric columns are floats with empty cells -> NaN
-        (so analytic-only rows coexist with full rows), boolean columns are bool,
-        and the rest are object (string) arrays.
+    Numeric columns are floats with empty cells -> NaN (so analytic-only rows
+    coexist with full rows), boolean columns are bool, the rest object arrays.
+    A missing ``channel`` column is synthesized as a single value so per-channel
+    faceting collapses to one panel.
     """
     path = os.path.join(outdir, "summary.csv")
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
     if not rows:
         raise ValueError(f"{path} has no data rows.")
-    cols = rows[0].keys()
     data: Dict[str, np.ndarray] = {}
-    for c in cols:
+    for c in rows[0].keys():
         raw = [r[c] for r in rows]
         if c in _FLOAT_COLS:
             data[c] = np.array([float(x) if x not in ("", None) else np.nan
@@ -140,9 +127,6 @@ def load_summary(outdir: str) -> Dict[str, np.ndarray]:
                                 for x in raw], dtype=bool)
         else:
             data[c] = np.array([str(x) for x in raw], dtype=object)
-    # The Zhou sweep no longer varies a spectator "channel"; if that column is
-    # absent, synthesize a single-value stand-in so the per-channel faceting
-    # collapses to one panel instead of raising KeyError.
     if "channel" not in data:
         n = len(next(iter(data.values())))
         data["channel"] = np.array(["spectator"] * n, dtype=object)
@@ -150,18 +134,7 @@ def load_summary(outdir: str) -> Dict[str, np.ndarray]:
 
 
 def series_column(data: Dict[str, np.ndarray]) -> str:
-    """Return the name of the swept series variable.
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns.
-
-    Returns
-    -------
-    str
-        'lam_spec' (Zhou driver) or 'eta' (effective-model driver).
-    """
+    """The swept series variable: 'lam_spec' (Zhou driver) or 'eta'."""
     if "lam_spec" in data:
         return "lam_spec"
     if "eta" in data:
@@ -192,18 +165,7 @@ def _mark_collision(ax, xcol: str) -> None:
 
 
 def has_full_metrics(data: Dict[str, np.ndarray]) -> bool:
-    """Whether the sweep contains integrated results.
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns.
-
-    Returns
-    -------
-    bool
-        True if an ``F_avg`` column with at least one finite value is present.
-    """
+    """True if an ``F_avg`` column with at least one finite value is present."""
     return "F_avg" in data and np.isfinite(data["F_avg"]).any()
 
 
@@ -219,30 +181,12 @@ def _resonance_GHz(data: Dict[str, np.ndarray]) -> Optional[float]:
 
 def _resonance_xs(data: Dict[str, np.ndarray], xcol: str,
                   wres: Optional[float]) -> list:
-    """Delta locations of the one-pump collision on the spectator-frequency axis.
+    """Delta locations (GHz) of the one-pump collision on the spectator-frequency axis.
 
-    The b<->spec (or a<->spec) one-pump swap is resonant at |w_q - w_spec| = w_p,
-    i.e. Delta = w_b - w_spec = +/- w_p, so a spectator collides from below w_b
-    (Delta = +w_p) or above it (Delta = -w_p). Returns whichever of +/- w_p lies
-    within the swept Delta range, so a one-sided sweep marks the collision it
-    actually contains rather than drawing on the empty mirror side (which also
-    stretched the axis). Only meaningful on the ``spec_freq_GHz`` (Delta) axis;
-    the beat axis marks the collision at 0 via ``_mark_collision``.
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns.
-    xcol : str
-        Active x column (``spec_freq_GHz`` or ``beat_GHz``).
-    wres : float or None
-        Pump magnitude w_p (GHz); the collision half-separation on the Delta axis.
-
-    Returns
-    -------
-    list of float
-        Delta locations (GHz) at which to draw the resonance line; empty when
-        not applicable (no pump column, or a non-Delta axis).
+    The one-pump swap is resonant at Delta = w_b - w_spec = +/- w_p (spectator
+    below / above w_b). Returns whichever of +/- w_p lies in the swept range (or,
+    if neither, the side the sweep is on) so a one-sided sweep does not mark the
+    empty mirror side. Empty unless on the ``spec_freq_GHz`` axis with a pump.
     """
     if wres is None or xcol != "spec_freq_GHz" or xcol not in data:
         return []
@@ -254,8 +198,22 @@ def _resonance_xs(data: Dict[str, np.ndarray], xcol: str,
     xs = [w for w in (wres, -wres) if lo - 1e-9 <= w <= hi + 1e-9]
     if xs:
         return xs
-    # collision outside the swept window: mark the side the sweep is on
     return [-wres if (lo + hi) < 0.0 else wres]
+
+
+def _draw_resonance(ax, data, xc: str, wres: Optional[float]) -> list:
+    """Dotted grey line at each collision location; returns the locations."""
+    xs = _resonance_xs(data, xc, wres)
+    for xr in xs:
+        ax.axvline(xr, color="0.5", lw=0.8, ls=":", zorder=0)
+    return xs
+
+
+def _channel_axes(n: int, figsize):
+    """One row of `n` y-sharing panels."""
+    fig, axes = plt.subplots(1, n, figsize=figsize or (3.5 * n + 0.3, 3.0),
+                             sharey=True, squeeze=False)
+    return fig, axes[0]
 
 
 # ---------------------------------------------------------------------------
@@ -263,32 +221,16 @@ def _resonance_xs(data: Dict[str, np.ndarray], xcol: str,
 # ---------------------------------------------------------------------------
 def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
                                 figsize: Optional[Tuple[float, float]] = None) -> "plt.Figure":
-    """Figure 1: gate infidelity 1 - F vs spectator frequency (log-y), one panel
-    per channel, DRAG off (dashed/open) vs on (solid/filled), coloured by the
-    swept participation.
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns; must contain finite ``F_avg``.
-    figsize : tuple(float, float), optional
-        Figure size in inches; a channel-count-dependent default is used if None.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The assembled figure.
-    """
+    """Figure 1: infidelity 1 - F vs spectator frequency (log-y), one panel per
+    channel, DRAG off (dashed/open) vs on (solid/filled), coloured by the swept
+    participation. Requires finite ``F_avg``."""
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     lams = sorted(np.unique(data[scol]))
     colors = {lam: WONG[i % len(WONG)] for i, lam in enumerate(lams)}
     wres = _resonance_GHz(data)
 
-    n = len(chans)
-    fig, axes = plt.subplots(1, n, figsize=figsize or (3.5 * n + 0.3, 3.0),
-                             sharey=True, squeeze=False)
-    axes = axes[0]
+    fig, axes = _channel_axes(len(chans), figsize)
     floor = np.inf
     xc = _xcol(data)
     for ax, ch in zip(axes, chans):
@@ -308,11 +250,9 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
                         ls="-" if drag else "--",
                         marker="o", mfc=(colors[lam] if drag else "white"),
                         mec=colors[lam])
-        _xres = _resonance_xs(data, xc, wres)
-        for _xr in _xres:
-            ax.axvline(_xr, color="0.5", lw=0.8, ls=":", zorder=0)
-        if _xres:
-            ax.text(_xres[0], 1.0, "  spectator\n  resonance", transform=
+        xres = _draw_resonance(ax, data, xc, wres)
+        if xres:
+            ax.text(xres[0], 1.0, "  spectator\n  resonance", transform=
                     ax.get_xaxis_transform(), va="top", ha="left",
                     fontsize=6.8, color="0.4")
         _mark_collision(ax, xc)
@@ -320,23 +260,17 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
         ax.set_xlabel(_XLABELS[xc])
         ax.set_title(ch.replace("_", "$-$"))
     axes[0].set_ylabel(r"infidelity $1-F$")
-    for ax, lab in zip(axes, "abcdef"):
-        _panel_label(ax, f"({lab})")
+    _label_panels(axes)
     if np.isfinite(floor):
         axes[0].set_ylim(bottom=max(floor / 3, 1e-9))
 
     # two compact legends: colour = series value, linestyle = DRAG
-    from matplotlib.lines import Line2D
     lam_handles = [Line2D([], [], color=colors[l], marker="o", ls="-",
                           label=f"{l:g}") for l in lams]
-    drag_handles = [Line2D([], [], color="0.25", ls="--", marker="o",
-                           mfc="white", label="DRAG off"),
-                    Line2D([], [], color="0.25", ls="-", marker="o",
-                           label="DRAG on")]
     leg1 = axes[-1].legend(handles=lam_handles, title=_series_label(scol),
                            loc="upper right", ncol=1)
     axes[-1].add_artist(leg1)
-    axes[0].legend(handles=drag_handles, loc="lower right")
+    axes[0].legend(handles=_drag_handles(), loc="lower right")
     return fig
 
 
@@ -346,24 +280,10 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
 def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
                              figsize: Optional[Tuple[float, float]] = None) -> "plt.Figure":
     """Figure 2: leakage and spectator/coupler occupation vs spectator frequency
-    (log-y), for the largest swept participation, DRAG off vs on.
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns; uses whichever of leakage / n_spec / n_coupler
-        are present and finite.
-    figsize : tuple(float, float), optional
-        Figure size in inches; a channel-count-dependent default is used if None.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The assembled figure.
-    """
+    (log-y) at the largest swept participation, DRAG off vs on. Uses whichever
+    of leakage / n_spec / n_coupler are present and finite."""
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
-    # one representative participation (largest) keeps the panel readable
     lam = sorted(np.unique(data[scol]))[-1]
     wres = _resonance_GHz(data)
     metrics = [m for m in ("leakage", "n_spec", "n_coupler") if m in data
@@ -372,10 +292,7 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
               "n_coupler": r"$\langle n_\mathrm{coupler}\rangle$"}
     mcolor = {"leakage": WONG[1], "n_spec": WONG[0], "n_coupler": WONG[2]}
 
-    n = len(chans)
-    fig, axes = plt.subplots(1, n, figsize=figsize or (3.5 * n + 0.3, 3.0),
-                             sharey=True, squeeze=False)
-    axes = axes[0]
+    fig, axes = _channel_axes(len(chans), figsize)
     xc = _xcol(data)
     for ax, ch in zip(axes, chans):
         for met in metrics:
@@ -388,22 +305,16 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
                 ax.plot(x[o], np.clip(y[o], 1e-12, None), color=mcolor[met],
                         ls="-" if drag else "--", marker="o",
                         mfc=(mcolor[met] if drag else "white"), mec=mcolor[met])
-        for _xr in _resonance_xs(data, xc, wres):
-            ax.axvline(_xr, color="0.5", lw=0.8, ls=":", zorder=0)
+        _draw_resonance(ax, data, xc, wres)
         _mark_collision(ax, xc)
         ax.set_yscale("log")
         ax.set_xlabel(_XLABELS[xc])
         ax.set_title(ch.replace("_", "$-$") + rf"   ({_series_label(scol)}$={lam:g}$)")
     axes[0].set_ylabel("population")
-    for ax, lab in zip(axes, "abcdef"):
-        _panel_label(ax, f"({lab})")
-    from matplotlib.lines import Line2D
+    _label_panels(axes)
     handles = [Line2D([], [], color=mcolor[m], marker="o", label=mlabel[m])
                for m in metrics]
-    handles += [Line2D([], [], color="0.25", ls="--", marker="o", mfc="white",
-                       label="DRAG off"),
-                Line2D([], [], color="0.25", ls="-", marker="o", label="DRAG on")]
-    axes[-1].legend(handles=handles, loc="upper right")
+    axes[-1].legend(handles=handles + _drag_handles(), loc="upper right")
     return fig
 
 
@@ -411,7 +322,7 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
 # Figure 3: 2D collision heatmap
 # ---------------------------------------------------------------------------
 def _pivot(data, mask, xcol, ycol, vcol):
-    """Build a (ys, xs, Z) grid for pcolormesh from scattered rows."""
+    """Build a (xs, ys, Z) grid for pcolormesh from scattered rows."""
     xs = np.array(sorted(np.unique(data[xcol][mask])))
     ys = np.array(sorted(np.unique(data[ycol][mask])))
     Z = np.full((ys.size, xs.size), np.nan)
@@ -432,24 +343,9 @@ def _edges(c):
 
 def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
                           figsize: Optional[Tuple[float, float]] = None) -> "plt.Figure":
-    """Figure 3: 2D collision map of a metric over (spectator frequency,
-    participation), one panel per (channel, DRAG) with a shared colour scale.
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns.
-    metric : str, default "F_avg"
-        Column to map. "F_avg" is shown as log10(1 - F); any other column is shown
-        as log10(metric).
-    figsize : tuple(float, float), optional
-        Figure size in inches; a panel-count-dependent default is used if None.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The assembled figure.
-    """
+    """Figure 3: 2D map of `metric` over (spectator frequency, participation), one
+    panel per (channel, DRAG) on a shared colour scale. "F_avg" is shown as
+    log10(1 - F); any other column as log10(metric)."""
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     drags = [d for d in (False, True) if (data["drag"] == d).any()]
@@ -466,7 +362,6 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
     nr, nc = len(drags), len(chans)
     fig, axes = plt.subplots(nr, nc, figsize=figsize or (3.4 * nc + 0.6, 2.7 * nr),
                              squeeze=False, sharex=True, sharey=True)
-    # common color scale across panels
     allvals = transform(data[vcol][np.isfinite(data[vcol])])
     vmin, vmax = (np.nanpercentile(allvals, 2), np.nanpercentile(allvals, 98)) \
         if allvals.size else (-6, 0)
@@ -483,8 +378,8 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
                                    cmap=cmap, vmin=vmin, vmax=vmax,
                                    shading="auto", rasterized=True)
                 if xc == "spec_freq_GHz":
-                    for _xr in _resonance_xs(data, xc, wres):
-                        ax.axvline(_xr, color="w", lw=0.8, ls=":")
+                    for xr in _resonance_xs(data, xc, wres):
+                        ax.axvline(xr, color="w", lw=0.8, ls=":")
                 elif xc == "beat_GHz":
                     ax.axvline(0.0, color="w", lw=0.8, ls=":")
             if i == nr - 1:
@@ -503,22 +398,8 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
 # ---------------------------------------------------------------------------
 def fig_analytic_map(data: Dict[str, np.ndarray],
                      figsize: Optional[Tuple[float, float]] = None) -> Optional["plt.Figure"]:
-    """Figure 4: analytic collision predictor -- the Eq.-62 exchange rate
-    g_spec_eff and the "danger ratio" g_spec/|beat| vs spectator frequency.
-    Available even for an analytic-only sweep (``--no-integrate``).
-
-    Parameters
-    ----------
-    data : dict[str, ndarray]
-        Loaded summary columns; requires ``g_spec_eff_MHz``.
-    figsize : tuple(float, float), optional
-        Figure size in inches; default (7.2, 3.0) if None.
-
-    Returns
-    -------
-    matplotlib.figure.Figure or None
-        The figure, or None if the analytic rate column is absent.
-    """
+    """Figure 4: the Eq.-62 exchange rate g_spec_eff and the "danger ratio"
+    g_spec/|beat| vs spectator frequency. None if ``g_spec_eff_MHz`` is absent."""
     scol = series_column(data)
     if "g_spec_eff_MHz" not in data:
         return None
@@ -547,14 +428,13 @@ def fig_analytic_map(data: Dict[str, np.ndarray],
         axes[0].text(axes[0].get_xlim()[1], g_is, r" $g^\mathrm{eff}_\mathrm{iSWAP}$",
                      va="center", ha="right", fontsize=7.5, color="0.4")
     for ax in axes:
-        for _xr in _resonance_xs(data, xc, wres):
-            ax.axvline(_xr, color="0.5", lw=0.8, ls=":", zorder=0)
+        _draw_resonance(ax, data, xc, wres)
         _mark_collision(ax, xc)
         ax.set_xlabel(_XLABELS[xc])
     axes[0].set_ylabel(r"exchange rate $g^\mathrm{eff}_\mathrm{spec}/2\pi$ (MHz)")
     axes[1].set_ylabel(r"danger ratio $g^\mathrm{eff}_\mathrm{spec}/|\delta_s|$")
     axes[1].set_yscale("log")
-    _panel_label(axes[0], "(a)"); _panel_label(axes[1], "(b)")
+    _label_panels(axes)
     axes[0].legend(title=_series_label(scol), loc="best")
     return fig
 
@@ -573,11 +453,7 @@ def _save(fig, figdir, name, fmts):
 
 
 def main() -> None:
-    """Command-line entry point: load a sweep directory and render the applicable
-    figures. A full sweep yields Figs 1-4; an analytic-only sweep yields Fig 4.
-    Run ``--help`` for the option list (``--outdir``, ``--figdir``, ``--only``,
-    ``--metric``, ``--format``, ``--usetex``).
-    """
+    """CLI entry point: load a sweep directory and render the applicable figures."""
     ap = argparse.ArgumentParser(
         prog="python -m snail_solver.plot_results", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -613,7 +489,7 @@ def main() -> None:
         "heatmap": (lambda d: fig_collision_heatmap(d, metric=args.metric), full),
         "analytic": (fig_analytic_map, "g_spec_eff_MHz" in data),
     }
-    todo = [args.only] if args.only else ["infidelity", "leakage", "heatmap", "analytic"]
+    todo = [args.only] if args.only else list(builders)
 
     made = []
     for name in todo:

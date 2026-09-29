@@ -3,27 +3,17 @@
 calibration_plots.py
 ====================
 
-Make the calibration figure that shows the AC-Stark shift explicitly, as pump
-frequency versus pulse length.
+Two-panel figure showing the AC-Stark shift as pump frequency vs pulse length:
 
-Two panels:
+  (a) Chevron -- constant-pump P(|01>->|10>) over (pump-on time, pump offset) at one
+      operating point; the vertex sits at a NON-zero offset, the Stark shift.
+  (b) Stark dispersion -- located resonance offset vs full-iSWAP pulse length L.
+      Each L carries its constant-pump pi/2 drive, eta = (pi/2) / (6 (2pi g3) la lb L),
+      so shorter pulses mean larger |eta| and (shift ~ |eta|^2) a larger retune.
+      A |eta|^2 guide is overlaid.
 
-  (a) Chevron -- a constant-pump raster P(|01>->|10>) over (pump-on duration,
-      pump-frequency offset) at one operating point. The bright vertex sits at a
-      NON-zero offset: that offset is the Stark shift at this |eta|.
-
-  (b) Stark dispersion -- the located resonance offset versus the full-iSWAP pulse
-      length. Each length carries its own pump strength via the pi/2 normalization
-      (eta = (pi/2) / (6 (2pi g3) la lb * L), the constant-pump full iSWAP), so
-      shortening the pulse raises |eta| and,
-      because the shift scales as |eta|^2, moves the resonance further from the bare
-      |w_b - w_a|. This is the explicit "you must retune the pump frequency as you
-      shorten the gate" picture. A |eta|^2 guide is overlaid.
-
-This is a plotting/diagnostics tool, separate from the calibration itself
-(calibrate_gate.py). It runs its own constant-pump chevrons via
-find_stark_resonance and does not depend on a prior calibration, though
-`--amp-scale` lets you probe at a calibrated amplitude.
+A diagnostics tool, independent of calibrate_gate.py (``--amp-scale`` probes at a
+calibrated amplitude).
 
 Usage
 -----
@@ -31,14 +21,13 @@ Usage
         --lengths 90,120,160,220,320,500 --span-MHz 80 --out stark_dispersion.png
     python -m snail_solver.calibration_plots --device dev.json --eta-min 0.3 --eta-max 1.5 --n-lengths 8
 
-Requires QuTiP (constant-pump chevrons integrate the exact Hamiltonian); run on a
-compute node. The length<->eta bookkeeping is unit-tested without QuTiP.
+Requires QuTiP (run on a compute node).
 """
 
 from __future__ import annotations
 
 import argparse
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -75,37 +64,12 @@ def sweep_lengths(config: Dict[str, Any], lengths_ns: Sequence[float], amp_scale
                   solver: Optional[Dict[str, Any]] = None,
                   n_jobs: Optional[int] = None,
                   panel_a_index: Optional[int] = None) -> Dict[str, Any]:
-    """Locate the Stark-shifted resonance at each full-iSWAP pulse length, keeping
-    one full chevron map for panel (a).
+    """Locate the Stark-shifted resonance at each full-iSWAP pulse length
+    (chevron over +/- span/2, time window ``window_factor * L``), keeping the chevron
+    at ``panel_a_index`` (default: the middle length) for panel (a).
 
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    lengths_ns : sequence of float
-        Full-iSWAP pulse lengths to probe (ns); each maps to eta_of_length.
-    amp_scale : float
-        Amplitude-scale correction (probe at a calibrated amplitude).
-    span_MHz : float
-        Chevron scan is +/- span/2 about |w_b - w_a|.
-    points : int
-        Offset grid points per chevron.
-    window_factor : float
-        Chevron time window = window_factor * length.
-    time_points : int
-        Time samples per chevron.
-    solver : dict, optional
-        QuTiP integrator options.
-    n_jobs : int, optional
-        Worker processes per chevron (offset scan).
-    panel_a_index : int, optional
-        Which length's chevron to retain for panel (a); default the middle one.
-
-    Returns
-    -------
-    dict
-        lengths_ns, etas, resonance_offset_GHz [per length], and the panel-(a)
-        chevron arrays (offsets_GHz, times_ns, P10, resonance/eta).
+    Returns lengths_ns, etas, resonance_offset_GHz (per length) and ``panel_a``
+    (offsets_GHz, times_ns, P10, resonance_offset_GHz, eta_op, length_ns).
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     lengths = np.asarray(lengths_ns, dtype=float)
@@ -137,21 +101,8 @@ def sweep_lengths(config: Dict[str, Any], lengths_ns: Sequence[float], amp_scale
 # Plot
 # ---------------------------------------------------------------------------
 def plot(result: Dict[str, Any], png_path: str, config: Dict[str, Any]) -> None:
-    """Render the two-panel Stark figure.
-
-    Parameters
-    ----------
-    result : dict
-        Output of sweep_lengths.
-    png_path : str
-        Output PNG.
-    config : dict
-        Device configuration (for the |eta|^2 guide and titles).
-
-    Returns
-    -------
-    None
-    """
+    """Render the two-panel Stark figure from `sweep_lengths` output to `png_path`
+    (`config` supplies the |eta| axis)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

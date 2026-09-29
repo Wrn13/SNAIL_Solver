@@ -5,47 +5,26 @@ tune_up_sweep.py
 
 How far can the pump be driven before the chirped gate stops working?
 
-``tune_up`` calibrates at ONE drive strength: you pick ``target_eta``, and the
-length follows from the gate area as ``t_g0 = 2A/eta*``. That one number is the
-whole speed/leakage trade-off, and the tune-up cannot choose it for you. This
-module fans the tune-up out over a grid of ``target_eta``, re-calibrating from
-scratch at each one -- new Rabi sweep, new chirp, new offset, new length -- and
-then scores the REAL gate at every calibrated point.
+``tune_up`` calibrates at ONE drive strength (``t_g0 = 2A/eta*``). This module fans
+the tune-up out over a grid of ``target_eta``, re-calibrating from scratch at each
+(new Rabi sweep, chirp, offset and length), then scores the REAL gate at every point.
+Local counterpart of ``slurm/submit_tune_up.sh``.
 
-This is the local counterpart of ``slurm/submit_tune_up.sh``, which does the same
-fan-out as independent SLURM jobs. Use that on a cluster; use this on one box.
+Every point gets its own calibration because the AC-Stark shift grows as ``|eta|^2``:
+scoring many drives against one chirp would measure the calibration going stale.
 
-Why it re-calibrates rather than reusing one chirp
---------------------------------------------------
-The AC-Stark shift grows as ``|eta|^2``, so both the chirp coefficients and the
-carrier offset are functions of the drive. Scoring a range of drives against a
-single calibration would measure the calibration going stale, not the gate
-degrading. Every point here gets its own tune-up.
+Three series per eta
+--------------------
+* ``chirped``    -- the calibrated chirp at the calibrated length (the real gate).
+* ``flat``       -- chirp zeroed, all else held (``run_tune_up``'s ``chirp_ablation``).
+  Isolates what tracking the shift THROUGH the pulse buys, since ``wp_offset`` already
+  carries its mean -- but the length was fitted with the chirp on.
+* ``flat_refit`` -- chirp zeroed AND length re-fitted (``--flat-refit-length``).
 
-Three series, not two
----------------------
-At each eta the gate is scored three ways, because "does the chirp help" has two
-defensible readings and they disagree:
-
-* ``chirped``    -- the calibrated chirp at the calibrated length. The gate you
-  would actually run.
-* ``flat``       -- chirp zeroed, everything else held. This is
-  ``run_tune_up``'s own ``chirp_ablation`` comparison, and it isolates what
-  tracking the shift THROUGH the pulse buys, since ``wp_offset`` already carries
-  the chirp's mean. But the length was fitted with the chirp on, so the flat
-  carrier's rotation angle is slightly wrong by construction.
-* ``flat_refit`` -- chirp zeroed AND the length re-fitted for it (``--flat-refit-length``).
-  Costs another length scan per eta, and removes that last objection.
-
-Metrics
--------
-``F_avg`` and ``leakage`` come from :meth:`ZhouCoupler.iswap_fidelity` -- the
-leakage-aware average gate fidelity over the 4-column computational subspace,
-with virtual-Z phases fitted out. ``transfer`` is ``P(|01> -> |10>)``, the
-single-column quantity ``tune_up``'s length scan actually maximises. They are
-NOT the same: transfer is phase-blind and ``|11>``-blind, so a length that
-maximises it need not maximise ``F_avg``. Both are reported, and a divergence
-between them at high drive is itself the leakage story.
+Metrics: ``F_avg``/``leakage`` from :meth:`ZhouCoupler.iswap_fidelity` (4-column
+subspace, virtual-Z fitted out); ``transfer`` is ``P(|01> -> |10>)``, the phase- and
+``|11>``-blind quantity the length scan maximises. They can diverge at high drive, and
+that divergence is itself the leakage story.
 
 Usage
 -----
@@ -56,44 +35,23 @@ Usage
         --outdir results/etasweep_1Gate4.2SNAIL \\
         --plot figs/etasweep_1Gate4.2SNAIL/gate_quality_vs_eta.png
 
-One file per sweep
-------------------
-Everything the fan-out produces goes into ONE HDF5 file (``h5_io``)::
+Output layout (one HDF5 file, ``h5_io``)::
 
     eta_sweep.h5
-      /sweep              <- the summary document: rows, settings, timings
-      /runs/eta1p2        <- that eta's COMPLETE tune-up, in tune_up's --out schema
-      /runs/eta1p5             (operating_point, t_g0_ns, stages -- every chevron)
-      /runs/eta1p8        <- a FAILED eta keeps its measured chevrons here too
-      /sweep/device       <- a COPY of the device config every eta ran with, so
-      /runs/eta1p2/device      the sweep still reads once the device file moves on
-      /sweep/figures      <- the rendered figures, stored with the data they draw
-      /runs/eta1p2/figures     (--plot-each; extract them with h5_io, see below)
+      /sweep              <- summary: rows, settings, timings (+ /device, /figures)
+      /runs/eta1p2        <- that eta's COMPLETE tune-up in tune_up's --out schema,
+      /runs/eta1p8           also kept for a FAILED eta (+ /device, /figures)
 
-so a sweep is one artefact to copy off the cluster instead of a directory of
-per-eta JSONs, and each eta's calibration stays addressable on its own::
+Each run is addressable on its own (it carries its own device copy)::
 
     python -m snail_solver.tune_up --replot results/.../eta_sweep.h5:/runs/eta1p8 \\
         --plot-ridge figs/eta1p8_ridge.png
     python -m snail_solver.post_chirp \\
         --from-tuneup results/.../eta_sweep.h5:/runs/eta1p8 ...
-
-(no ``--device`` needed on that second one: the stored run carries its own copy
-of the configuration it was calibrated with.)
-
-Reading one group reads only that group, so replotting the summary never pays
-for the chevrons. ``--out something.json`` still writes the summary as text, and
-then the per-eta runs land beside it as ``tuneup_<tag>.h5`` (JSON cannot hold
-several documents in one file).
-
-Figures live in the file too: ``--plot-each`` embeds each eta's chevrons, ridge
-and post-chirp figure in that eta's own group, and ``--plot`` embeds the summary
-figure in ``/sweep`` -- so pulling one eta out of a sweep brings its pictures with
-it, and none of them can be paired with the wrong run::
-
     python -m snail_solver.h5_io eta_sweep.h5:/runs/eta1p8 --extract figs/eta1p8/
 
-Re-plot from a finished run, with no solves at all::
+``--out something.json`` writes the summary as text, with the per-eta runs beside it
+as ``tuneup_<tag>.h5``. Re-plot a finished run with no solves::
 
     python -m snail_solver.tune_up_sweep --replot \\
         results/etasweep_1Gate4.2SNAIL/eta_sweep.h5 --plot figs/final.png
@@ -115,8 +73,6 @@ import numpy as np
 from snail_solver.h5_io import (attach_figures, has_group, is_hdf5, load_doc,
                                 save_doc, save_tree, split_address)
 
-TWO_PI = 2.0 * np.pi
-
 
 def _plain(o: Any) -> Any:
     """json default: ndarrays and numpy scalars to plain Python."""
@@ -130,9 +86,7 @@ def _plain(o: Any) -> Any:
 def parse_etas(spec: str) -> List[float]:
     """``"1.2:2.0:9"`` (start:stop:points) or ``"1.2,1.5,1.8"`` -> a list of floats.
 
-    The colon form is the common case -- a uniform grid -- and the comma form is
-    there for hand-picked points. Rejects a non-positive eta outright: ``t_g0 =
-    2A/eta*`` divides by it.
+    Rejects a non-positive eta: ``t_g0 = 2A/eta*`` divides by it.
     """
     text = str(spec).strip()
     if ":" in text:
@@ -153,12 +107,7 @@ def parse_etas(spec: str) -> List[float]:
 
 
 def sweep_holds_runs(sweep_path: Optional[str]) -> bool:
-    """Whether this sweep output can hold the per-eta runs inside itself.
-
-    Only HDF5 can. The JSON fallback is not a deprecated path so much as the
-    honest one: a text summary cannot carry nine tune-ups' worth of binary
-    traces, so those go beside it instead.
-    """
+    """Whether this sweep output can hold the per-eta runs inside itself (HDF5 only)."""
     return bool(sweep_path
                 and os.path.splitext(split_address(sweep_path)[0])[1].lower() != ".json")
 
@@ -166,22 +115,16 @@ def sweep_holds_runs(sweep_path: Optional[str]) -> bool:
 def store_run(tag: str, doc: Dict[str, Any], *, sweep_path: Optional[str] = None,
               outdir: Optional[str] = None,
               attrs: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Put one eta's complete tune-up document where this sweep keeps its runs.
+    """Store one eta's complete tune-up document where this sweep keeps its runs.
 
-    Into ``<sweep>.h5:/runs/<tag>`` when the sweep output is HDF5 -- one file for
-    the whole fan-out -- and otherwise into ``<outdir>/tuneup_<tag>.h5`` beside a
-    JSON summary. Either way the stored document is in ``tune_up``'s own ``--out``
-    schema, so the address this returns can be handed straight to
-    ``tune_up --replot`` or ``post_chirp --from-tuneup``.
+    ``<sweep>.h5:/runs/<tag>`` when the sweep output is HDF5, else
+    ``<outdir>/tuneup_<tag>.h5`` beside a JSON summary. The document is in
+    ``tune_up``'s ``--out`` schema, so the returned address works with
+    ``tune_up --replot`` and ``post_chirp --from-tuneup``. Called as each eta
+    finishes, so a killed sweep keeps what it finished.
 
-    Written as each eta finishes rather than at the end, so a sweep killed at
-    hour six still has its first five hours on disk.
-
-    Returns
-    -------
-    str or None
-        The address written (``file`` or ``file:/group``), or None when there is
-        nowhere to put it (no `sweep_path` and no `outdir`).
+    Returns the address written (``file`` or ``file:/group``), or None when there is
+    nowhere to put it.
     """
     if sweep_holds_runs(sweep_path):
         return save_doc(split_address(sweep_path)[0], doc, attrs=attrs,
@@ -192,15 +135,10 @@ def store_run(tag: str, doc: Dict[str, Any], *, sweep_path: Optional[str] = None
 
 
 def embed_figures(run_address: Optional[str], figures: Dict[str, str]) -> int:
-    """Put this eta's figures inside the document its data went to.
+    """Embed this eta's figures in the document its data went to.
 
-    The per-eta figures are also written under ``<outdir>/figs/<tag>/`` as they
-    always were; this is the copy that cannot be separated from the run. A sweep
-    file therefore carries one ``figures`` group per eta, and a run addressed out
-    of it (``FILE:/runs/eta1p8``) brings its own pictures along.
-
-    Silent no-op when there is nowhere to put them (no run stored, or a JSON
-    summary with no HDF5 file behind it) -- a figure never fails a sweep.
+    The loose copies under ``<outdir>/figs/<tag>/`` stay; this one travels with the
+    run. Silent no-op (returns 0) with no HDF5 run to put them in.
     """
     if not run_address or not figures:
         return 0
@@ -234,24 +172,16 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
         A ``run_tune_up`` operating point (``t_g_ns``, ``amp_scale``,
         ``wp_offset_GHz``, ``target_eta``, ``spec_abs_GHz``, ``drag_beat_GHz``).
     chirp_coeffs_GHz : sequence of float, or []
-        The chirp to score. Pass ``[]`` for the flat carrier -- **never None**.
-        ``build_coupler`` treats None as "fall back to ``config['chirp_coeffs_GHz']``",
-        which would silently score a device-level chirp instead of no chirp;
-        ``[]`` goes through ``make_chirp`` to a trivial (None) tone chirp, i.e. the
-        byte-identical un-chirped solver path.
+        The chirp to score. Pass ``[]`` for the flat carrier -- **never None**:
+        ``build_coupler`` reads None as "inherit ``config['chirp_coeffs_GHz']``".
     drag_channels : sequence of DragChannel, optional
-        The recursive-DRAG channels to PLAY. Multi-channel DRAG does not go through
-        ``record["drag_beat_GHz"]`` -- that field is the one-channel legacy path and
-        is ``None`` whenever `drag_channels` was used -- so omitting this scores an
-        UN-DRAGGED pulse. The chirp is still DRAG-aware either way (the chirp<->DRAG
-        fixed point folds the corrected envelope back into the Stark law), which is
-        what made the omission invisible: the numbers moved with the channel set
-        while the scored pulse carried no correction at all.
+        The recursive-DRAG channels to PLAY. Multi-channel DRAG does not travel via
+        ``record["drag_beat_GHz"]`` (the one-channel legacy field, None whenever
+        channels were used), so omitting this scores an UN-DRAGGED pulse -- silently,
+        since the chirp itself is DRAG-aware either way.
     refit_length : bool, default False
-        Re-fit the length for THIS chirp before scoring, instead of reusing the
-        record's. Costs a full length scan (~`tg_points` + 19 serial solves). The
-        fair comparison for the flat carrier, whose length was fitted with the
-        chirp on.
+        Re-fit the length for THIS chirp first (a full length scan, ~`tg_points` + 19
+        serial solves) -- the fair comparison for the flat carrier.
 
     Returns
     -------
@@ -285,9 +215,8 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
                         spec_abs_GHz=spec_abs_GHz, solver=solver, logger=logger,
                         drag_channels=drag_channels)
         t_g = float(L["t_g_ns"])
-    # amp_scale is never free: it is whatever holds |eta| at the target for THIS
-    # length. Recomputing (rather than reading record["amp_scale"]) is what makes
-    # the refit branch correct, and is an exact no-op when the length is unchanged.
+    # amp_scale holds |eta| at the target for THIS length: recomputing it makes the
+    # refit branch correct and is an exact no-op when the length is unchanged.
     amp = float(fixed_eta_amp_scale(config, t_g, target_eta))
 
     cpl, _w_p, peak_eta = build_coupler(
@@ -303,9 +232,7 @@ def score_gate(config: Dict[str, Any], record: Dict[str, Any],
             "peak_eta": float(peak_eta), "chirp_coeffs_GHz": chirp,
             "F_avg": float(F), "leakage": float(leak), "transfer": float(P),
             "refit_length": bool(refit_length),
-            # What was PLAYED, not what was designed. Recorded because a scored
-            # number that silently dropped the DRAG is indistinguishable from one
-            # that kept it.
+            # What was PLAYED, so a score that dropped its DRAG is visible as such.
             "n_drag_channels": int(len(drag_channels) if drag_channels else 0),
             "drag_beat_GHz": (float(drag_beat_GHz)
                               if drag_beat_GHz is not None else None)}
@@ -334,38 +261,30 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
                   **map_kw) -> Dict[str, Any]:
     """Re-calibrate at every ``target_eta`` and score the gate at each.
 
-    Each eta is independent: a failure at one is recorded and the sweep continues,
-    because a calibration that stops being measurable at high drive is a RESULT
-    about the device, not an outage. ``RabiFitError`` carries the chevrons it did
-    measure, so those are saved (and plotted with `plot_each`) even though no
-    chirp could be built from them.
+    A failure at one eta is recorded and the sweep continues: a calibration that
+    stops being measurable at high drive is a RESULT, not an outage. A
+    ``RabiFitError``'s measured chevrons are still stored (and plotted).
 
     Parameters
     ----------
     target_etas : sequence of float
         The drive strengths to calibrate at. ``t_g0 = 2A/eta*`` for each.
     eta_lo, eta_hi : float
-        The Rabi ROW window at each target, as a fraction of that target -- not a
-        target range. `eta_hi` above 1.0 makes the chirp an extrapolation past
-        measured data.
+        The Rabi ROW window as a fraction of each target (not a target range);
+        `eta_hi` > 1.0 makes the chirp an extrapolation.
     adaptive_span : bool, default False
-        Use per-row adaptive offset spans instead of one fixed span. Better
-        sampling of the weak rows, but the rows then share no offset axis, so
-        `plot_chirp_ridge` cannot draw -- `plot_each` needs the fixed span.
+        Per-row adaptive offset spans. The rows then share no offset axis, so
+        `plot_chirp_ridge` cannot draw.
     flat_refit_length : bool, default False
         Also score a flat carrier with its OWN fitted length (a third series).
     sweep_path : str, optional
-        The sweep's own output file. When it is HDF5, each eta's complete
-        tune-up is stored INSIDE it under ``runs/<tag>`` as that eta finishes
-        (see :func:`store_run`); the row then carries the address. Without it
-        (or with a ``.json`` sweep output) the runs go to `outdir` as separate
-        files.
+        The sweep's output file; when HDF5, each eta's tune-up is stored inside it
+        under ``runs/<tag>`` (see :func:`store_run`), else in `outdir`.
     save_point_prefix : str, optional
-        Save each result into the device JSON as ``<prefix>_eta1p8``. Needs
-        `device_path`.
+        Save each result into the device JSON as ``<prefix>_eta1p8`` (needs
+        `device_path`).
     **map_kw
-        Forwarded to `run_tune_up`, which passes them to `rabi_shift_table` --
-        the only route to its un-CLI-exposed guards (``r2_min``, ``leak_max``,
+        Forwarded via `run_tune_up` to `rabi_shift_table` (``r2_min``, ``leak_max``,
         ``nrmse_max``, ``secondary_max``).
 
     Returns
@@ -388,23 +307,21 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
     rows: List[Dict[str, Any]] = []
     for i, eta_star in enumerate(etas):
         tag = eta_tag(eta_star)
+        t_g0 = TU.nominal_t_g(config, eta_star)
         log.info(f"=== [{i + 1}/{len(etas)}] target_eta={eta_star:g} "
-                 f"(t_g0={TU.nominal_t_g(config, eta_star):.3f} ns) ===")
+                 f"(t_g0={t_g0:.3f} ns) ===")
         t0 = time.perf_counter()
 
         span = wp_span_MHz
         if span is None and not adaptive_span:
-            # One fixed span per eta, sized for this target's strongest row, so the
-            # rows share an offset axis and plot_chirp_ridge can draw. ridge_span_MHz
-            # warns if wp_points is too coarse for the weakest row.
+            # One fixed span per eta so the rows share an offset axis (ridge plot).
             span, _want = TU.ridge_span_MHz(
                 config, eta_star, eta_lo=eta_lo, eta_hi=eta_hi,
                 span_linewidths=span_linewidths, wp_points=wp_points, logger=log)
 
-        # Record the span ACTUALLY used, not the wp_span_MHz argument: the default
-        # path sizes it per eta, so `settings` alone cannot reproduce a row.
+        # The span ACTUALLY used: the default sizes it per eta.
         row: Dict[str, Any] = {"target_eta": eta_star, "tag": tag,
-                               "t_g0_ns": float(TU.nominal_t_g(config, eta_star)),
+                               "t_g0_ns": float(t_g0),
                                "wp_span_MHz": (None if span is None else float(span))}
         try:
             out = TU.run_tune_up(
@@ -419,8 +336,7 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
                 post_chirp_points=post_chirp_points, solver=solver, logger=log,
                 **map_kw)
         except TU.RabiFitError as exc:
-            # The measurement worked; only the interpretation failed. Keep the
-            # chevrons -- they are the evidence for WHY it failed.
+            # Only the interpretation failed: keep the chevrons as the evidence.
             row.update({"ok": False, "seconds": time.perf_counter() - t0,
                         "error": {"type": "RabiFitError", "stage": "rabi",
                                   "message": str(exc)}})
@@ -460,11 +376,8 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
         rec = out["operating_point"]
         stages = out["stages"]
 
-        # Store the per-eta result in tune_up's OWN --out schema, so
-        #   tune_up --replot <address> --plot-ridge ...
-        #   post_chirp --from-tuneup <address> ...
-        # both work on it verbatim -- whether it lives in this sweep's file or
-        # in its own.
+        # tune_up's own --out schema, so tune_up --replot / post_chirp --from-tuneup
+        # read it verbatim.
         p = store_run(tag, {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
                             "stages": stages, "device": dict(config)},
                       sweep_path=sweep_path, outdir=outdir,
@@ -478,8 +391,7 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
             for name, fn in (
                     ("rabi", lambda: TU.plot_rabi_table(
                         stages["rabi"], os.path.join(fdir, "rabi_chevrons.png"))),
-                    # named as tune_up names it, so figure_names() reads the same
-                    # on a run stored here and on a standalone tune_up --out
+                    # named as tune_up names it (figure_names() reads the same)
                     ("chirp_ridge", lambda: TU.plot_chirp_ridge(
                         stages["rabi"], stages["chirp"], rec["wp_offset_GHz"],
                         rec["t_g_ns"], os.path.join(fdir, "chirp_ridge.png"))),
@@ -496,8 +408,6 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
                     log.info(f"  {name} plot skipped: "
                              f"{type(pexc).__name__}: {pexc}")
             row["figs"] = figs
-            # ... and into that eta's OWN group, so one run pulled out of the
-            # sweep file (tune_up --replot FILE:/runs/eta1p8) brings its pictures.
             embed_figures(p, figs)
 
         # --- score the real gate, chirped vs flat -----------------------------
@@ -554,9 +464,7 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
     return {
         "source": "tune_up_sweep",
         "device_path": device_path,
-        # The configuration every eta was calibrated with, copied in so the sweep
-        # reads back the same months later even if the device file has moved on.
-        "device": dict(config),
+        "device": dict(config),      # a copy, so the sweep outlives device edits
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "area_ns": float(TU._area(config)),
         "target_etas": etas,
@@ -574,7 +482,7 @@ def run_eta_sweep(config: Dict[str, Any], target_etas: Sequence[float], *,
             "drag_beat_GHz": None, "spec_abs_GHz": None,
             "qubit_levels": config.get("qubit_levels"),
             "coupler_levels": config.get("coupler_levels"),
-            "map_kw": {k: v for k, v in map_kw.items()},
+            "map_kw": dict(map_kw),
         },
         "rows": rows,
         "summary": {"n_ok": n_ok, "n_failed": len(rows) - n_ok,
@@ -595,20 +503,14 @@ def plot_eta_sweep(doc: Dict[str, Any], out: str = "figs/gate_quality_vs_eta.png
                    title: Optional[str] = None) -> str:
     """Gate quality versus drive strength: the speed/leakage trade-off curve.
 
-    Three stacked panels sharing the eta axis:
+    (a) ``1 - F_avg`` (log) -- chirped, flat, and flat-refit if run.
+    (b) leakage, same series, with ``1 - transfer`` (one column, a different
+        quantity) as a thin trace.
+    (c) calibration health -- Rabi fit r2, chirp quartic fraction, dropped rows and
+        railed lengths -- so a rise in (a) can be told apart from a calibration that
+        stopped being measurable.
 
-    (a) ``1 - F_avg`` on a log axis -- chirped, flat, and (if run) flat-refit.
-        The headline: the knee is where the drive stops being worth it.
-    (b) leakage, same series, with ``1 - transfer`` as a thin trace. The two are
-        DIFFERENT quantities (4-column subspace vs one column) and are drawn
-        distinctly on purpose.
-    (c) calibration health -- the Rabi fit r2, the chirp's quartic fraction, and
-        markers for dropped rows and railed length fits. Without this panel a
-        rising infidelity in (a) is ambiguous between "the gate got worse" and
-        "the calibration stopped being measurable".
-
-    Failed etas are drawn as dotted vertical rules across all panels, never
-    silently dropped.
+    Failed etas are drawn as dotted vertical rules, never dropped.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -702,15 +604,10 @@ def plot_eta_sweep(doc: Dict[str, Any], out: str = "figs/gate_quality_vs_eta.png
                     textcoords="offset points", xytext=(0, -10), ha="center",
                     rotation=90, va="top", fontsize=6, color="#c0392b")
 
-    # -- gate length on a second axis --------------------------------------
-    # The CALIBRATED length, not 2A/eta -- step 4 of the tune-up exists precisely to
-    # correct that analytic seed.
-    #
-    # LAST, after the failure rules. A twiny does not track its parent, it only
-    # copies the limits it is given, and the axvline for a failed eta OUTSIDE the
-    # successful ones widens the shared x axis. Building this earlier pinned the top
-    # axis to the pre-vline limits and silently slid every t_g label off its own eta
-    # -- the exact case in test_renders_three_series_and_a_failed_eta.
+    # -- calibrated (not 2A/eta) gate length on a second axis -------------
+    # LAST: a twiny only copies the limits it is given, and a failed eta's axvline
+    # outside the successful ones widens the x axis, which would slide every t_g
+    # label off its eta (test_renders_three_series_and_a_failed_eta).
     axt = ax.twiny()
     axt.set_xlim(ax.get_xlim())
     axt.set_xticks(eta)
@@ -794,12 +691,10 @@ def main() -> None:
                     help="figures land here, and the per-eta runs too when --out "
                          "is JSON [results/etasweep_<device>]")
     ap.add_argument("--out", default=None,
-                    help="the sweep file [<outdir>/eta_sweep.h5]. HDF5 holds the "
-                         "whole fan-out: the summary under /sweep and each eta's "
-                         "complete tune-up under /runs/<tag>, each addressable as "
-                         "FILE:/runs/eta1p8 by tune_up --replot and post_chirp "
-                         "--from-tuneup. A .json target keeps the old layout: a "
-                         "text summary, with the runs beside it as tuneup_<tag>.h5")
+                    help="the sweep file [<outdir>/eta_sweep.h5]: summary under "
+                         "/sweep, each eta's tune-up under /runs/<tag>. A .json "
+                         "target writes a text summary with the runs beside it as "
+                         "tuneup_<tag>.h5")
     ap.add_argument("--plot", nargs="?", const="figs/gate_quality_vs_eta.png",
                     default=None, help="the summary figure")
     ap.add_argument("--plot-each", action="store_true",
@@ -811,21 +706,18 @@ def main() -> None:
     ap.add_argument("--stop-on-error", action="store_true",
                     help="abort on the first failing eta instead of recording it")
     ap.add_argument("--replot", metavar="FILE", default=None,
-                    help="regenerate --plot from a previous --out -- no solves. "
-                         "HDF5 or (pre-HDF5) JSON, detected by content; only the "
-                         "summary group is read, never the stored runs")
+                    help="regenerate --plot from a previous --out (HDF5 or JSON) "
+                         "-- no solves; only the summary is read")
     args = ap.parse_args()
 
     # --- the zero-solve path, before anything heavy is imported -----------
     if args.replot:
-        # Reading /sweep alone keeps a summary replot cheap: the runs in the same
-        # file are the bulk of it, and the figure does not use them.
+        # Read /sweep alone: the runs are the bulk of the file and are not drawn.
         target = (args.replot + ":/sweep" if has_group(args.replot, "sweep")
                   else args.replot)
         doc = load_doc(target)
         path = plot_eta_sweep(doc, out=args.plot or "figs/gate_quality_vs_eta.png")
         print(f"wrote {path}")
-        # re-drawn from this file, so refresh the copy it carries
         embed_figures(target, {"gate_quality_vs_eta": path})
         return
 
@@ -857,9 +749,7 @@ def main() -> None:
     out_path = args.out or os.path.join(outdir, "eta_sweep.h5")
     holds_runs = sweep_holds_runs(out_path)
     if holds_runs:
-        # Truncate ONCE, up front. The per-eta runs are appended as they finish,
-        # so without this a rerun into the same name would inherit the previous
-        # sweep's runs for every eta this one fails to reach.
+        # Truncate ONCE, up front, so a rerun cannot inherit a previous sweep's runs.
         save_tree(out_path, {}, attrs={
             "tool": "snail_solver.tune_up_sweep",
             "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -919,9 +809,7 @@ def main() -> None:
     print(f"  {s['n_ok']} ok, {s['n_failed']} failed, {s['seconds'] / 60:.1f} min")
 
     if args.plot:
-        # A sweep whose file is on disk has not failed, even if every eta did: the
-        # failures ARE the result. Do not turn "nothing to draw" into a non-zero exit
-        # that looks like the run itself died.
+        # "Nothing to draw" (every eta failed) is a result, not a non-zero exit.
         try:
             fig = plot_eta_sweep(doc, out=args.plot)
             print(f"  wrote {fig}")

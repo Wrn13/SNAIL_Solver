@@ -1,34 +1,21 @@
 """2D calibration landscape: pump frequency offset vs pump strength.
 
-Scans the (pump-frequency-offset, pump-amplitude) plane and scores each point by
-the leakage-aware iSWAP fidelity or the |01>->|10> transfer probability (the swap
-population), so the global optimum is read off directly instead of from
-alternating 1D amplitude/frequency scans (which rail when the AC-Stark shift and
-the Rabi amplitude feed back on each other).
+Scores every point of the (pump offset, amplitude) plane by leakage-aware iSWAP
+fidelity or |01>->|10> transfer, so the global optimum is read off directly instead
+of from alternating 1D scans (which rail when the Stark shift and Rabi amplitude feed
+back on each other).
 
-Three propagation engines, identical grid and output shape:
-  * engine='reduced' : the fast rotating-frame reduced model from ``grape.py``
-    (scipy expm, no QuTiP); the pump offset shifts precomputed carriers so the
-    operator basis is built once. Good for quick looks / weak-to-moderate drive.
-  * engine='qutip'   : compiled ``qt.sesolve`` on the FULL Hamiltonian via
-    ``ZhouCoupler.propagator_columns`` -- exact, the cluster path. A fresh coupler
-    is built per grid point through the usual ``build_coupler`` plumbing
-    (``build_system``), so the grid is embarrassingly parallel (``--jobs``) and
-    free of pump-mutation hazards, and DRAG / spectator context come along for
-    free exactly as in the reduced map.
-  * engine='jax'     : the batched engine in ``jax_engine.py``. The whole grid is
-    ONE vmapped program -- the device is fixed, so every point shares a single
-    sparse operator stack while the amplitude rides in the pulse parameters and
-    the pump offset is just the last entry of the frequency vector. All four
-    computational columns propagate together as one (dim, 4) block, and it runs
-    unchanged on GPU. It is a rotating-wave REDUCTION at any finite
-    ``--engine-cutoff-GHz``: run ``validate_engines.py --cutoff-scan`` on the
-    device first, which reports fidelity and ``max|U - U_qutip|`` per cutoff.
+Engines (identical grid and output):
+  * 'reduced' : rotating-frame reduced model from ``grape.py`` (scipy expm, no QuTiP);
+    quick looks at weak-to-moderate drive.
+  * 'qutip'   : exact ``qt.sesolve`` of the FULL Hamiltonian, a fresh coupler per
+    point via ``build_system`` (parallel over ``--jobs``).
+  * 'jax'     : ``jax_engine.py``; the whole grid is ONE vmapped program sharing a
+    single operator stack (GPU-capable). A rotating-wave REDUCTION at any finite
+    ``--engine-cutoff-GHz`` -- run ``validate_engines.py --cutoff-scan`` first.
 
-Results (offsets, amps, Z, leakage, optimum, operating point) are written to
-``--save-npz``; the heatmap with the optimum marked goes to ``--out``. At strong
-drive, raise the coupler truncation (``--coupler-levels``) and confirm the map is
-converged before trusting values in the bright/leaky region.
+Results go to ``--save-npz``, the heatmap to ``--out``. At strong drive raise
+``--coupler-levels`` and check convergence before trusting the bright/leaky region.
 
 CLI
 ---
@@ -69,45 +56,19 @@ def scan(cpl, a: int, b: int, t_g: float, *,
          cutoff_GHz: float = 1.0, n_ctrl: int = 32, metric: str = "fidelity",
          carrier_resolution: float = 0.3,
          logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """Scan (pump offset, amplitude) and score each point with the REDUCED model.
+    """Scan (pump offset, amplitude) with the REDUCED model.
 
-    Parameters
-    ----------
-    cpl : ZhouCoupler
-        Coupler with a pump set; ``peak_eta`` sets the amp=1 reference.
-    a, b : int
-        Target-qubit mode indices.
-    t_g : float
-        Gate duration (ns).
-    wp_span_MHz : float
-        Full width of the pump-offset axis (centered on 0), in MHz.
-    wp_points, amp_points : int
-        Grid resolution.
-    amp_lo, amp_hi : float
-        Amplitude-scale range (multiples of the nominal peak_eta).
-    cutoff_GHz : float
-        Rotating-frame carrier cutoff for the reduced model.
-    n_ctrl : int
-        Piecewise-constant slices approximating the raised cosine.
-    metric : {'fidelity', 'transfer'}
-        Score per point: leakage-aware iSWAP fidelity, or P(|01>->|10>).
-    logger : logging.Logger, optional
-        If given, one line per completed row is logged (in addition to the
-        interactive ``tqdm`` bar, which isn't a good fit for a plain log file).
-
-    Returns
-    -------
-    dict
-        offsets_MHz, amps, Z (shape [amp_points, wp_points]), best (dict),
-        metric, plus scan metadata.
+    `cpl` carries the pump (``peak_eta`` = the amp=1 reference); offsets span
+    +/- wp_span_MHz/2, amplitudes are multiples of it. ``n_ctrl`` slices approximate
+    the raised cosine; ``metric`` is 'fidelity' or 'transfer' (P(|01>->|10>)). An
+    optional `logger` gets one line per row. Returns offsets_MHz, amps,
+    Z [amp_points, wp_points], best, metric and scan metadata.
     """
     from snail_solver.zhou_coupler import ZhouCoupler
     terms, H_anh, idx, max_Omega = grape._prepare(cpl, a, b, cutoff_GHz)
     dt_ctrl = t_g / n_ctrl
-    # The chirp rides along fixed while (offset, amplitude) are scanned -- read it off
-    # the coupler so it cannot be forgotten, and let `_propagate` apply it on the fine
-    # grid. `base` below stays the UN-chirped raised cosine: the chirp is a carrier
-    # rotation, not a feature of the pulse shape.
+    # The coupler's chirp is held fixed and applied by `_propagate` (a carrier
+    # rotation), so `base` stays the UN-chirped raised cosine.
     chirp = grape._tone_chirp(cpl)
     n_sub = max(1, int(np.ceil((max_Omega + abs(wp_span_MHz) * 1e-3 * TWO_PI
                                 + grape._chirp_pad_rad(chirp, terms))
@@ -151,16 +112,12 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
                metric: str = "transfer", atol: float = 1e-10, rtol: float = 1e-8,
                nsteps: int = 500000, jobs: int = 1,
                logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """QuTiP-exact analogue of ``scan``: identical grid and return shape, but every
-    point is a compiled ``qt.sesolve`` on the FULL Hamiltonian via
-    ``ZhouCoupler.propagator_columns`` -- no reduced model, no pruned terms.
+    """QuTiP-exact analogue of ``scan`` (same grid and return shape, plus leakage):
+    each point is ``ZhouCoupler.propagator_columns`` on the FULL Hamiltonian.
 
-    ``build_fn(grid_amp, grid_off_MHz) -> (cpl, w_p, eta_pk)`` returns a FRESH
-    coupler with the grid point already folded into the pump (via the usual
-    ``build_system`` / ``device_utils.build_coupler`` plumbing), so points are
-    independent and safe to evaluate in parallel. Leakage is recorded for free
-    from the same 4x4 U. ``metric`` selects the colour ('transfer' = swap
-    population |U[2,1]|^2, or leakage-aware 'fidelity').
+    ``build_fn(grid_amp, grid_off_MHz) -> (cpl, w_p, eta_pk)`` returns a FRESH coupler
+    with the point folded into the pump, so points are independent and parallel-safe.
+    ``metric``: 'transfer' (|U[2,1]|^2) or 'fidelity'.
     """
     from snail_solver.zhou_coupler import ZhouCoupler
     offsets = np.linspace(-wp_span_MHz / 2.0, wp_span_MHz / 2.0, wp_points)  # MHz
@@ -178,10 +135,7 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
     t0 = time.time()
     if jobs and jobs > 1:
         from joblib import Parallel, delayed
-        # return_as="generator_unordered" streams results back as they finish, so
-        # progress can be logged as it happens instead of only after the whole
-        # grid returns (joblib's own verbose=5 prints straight to stdout and
-        # can't be redirected into `logger`'s file).
+        # stream results as they finish so progress reaches `logger`
         results = Parallel(n_jobs=jobs, return_as="generator_unordered")(
             delayed(one)(i, j, a, o) for (i, j, a, o) in grid)
         out = []
@@ -214,16 +168,11 @@ def plot_map(result: Dict[str, Any], out: str = "figs/calibration_map.png",
              title: Optional[str] = None) -> None:
     r"""Render the 2D calibration landscape with the optimum marked.
 
-    The y axis is the PHYSICAL drive, peak :math:`|\eta|`, with ``amp_scale`` on a
-    twin axis on the right. The two differ only by the constant
-    :math:`\eta_{\rm nom} = 1/(12 g_3 \lambda_a \lambda_b t_g)`, but they answer
-    different questions: :math:`|\eta|` says which drive REGIME the point is in (how
-    large the eta^2 / eta^3 terms are), and is therefore comparable between maps at
-    different ``t_g``, whereas ``amp_scale`` is what ``--save-point`` writes into the
-    device and is only meaningful at one ``t_g``. The dotted line marks
-    ``amp_scale = 1``, i.e. the amplitude at which the LEADING-ORDER pulse area is
-    exactly pi/2 -- so the distance of the optimum from that line is a direct read
-    on how far first-order theory is off at this operating point.
+    y axis: the PHYSICAL drive, peak :math:`|\eta|` (the drive regime, comparable
+    across ``t_g``); twin axis: ``amp_scale`` (what ``--save-point`` writes, valid at
+    one ``t_g``), related by :math:`\eta_{\rm nom} = 1/(12 g_3 \lambda_a \lambda_b t_g)`.
+    The dotted line is ``amp_scale = 1`` (leading-order pi/2 area), so the optimum's
+    distance from it shows how far first-order theory is off.
     """
     offsets, amps, Z = result["offsets_MHz"], result["amps"], result["Z"]
     metric = result["metric"]
@@ -305,9 +254,7 @@ def save_npz(result: Dict[str, Any], path: str) -> None:
         if group in result:
             for k, v in result[group].items():
                 if k == "chirp_coeffs_GHz":
-                    # list-valued: store as a float array (empty when unset) rather
-                    # than letting an empty/None value become a nan scalar, so a
-                    # reader can always np.asarray it
+                    # list-valued: always a float array (empty when unset), never nan
                     payload[f"{group[:3]}_{k}"] = np.asarray(v or [], dtype=float)
                 else:
                     payload[f"{group[:3]}_{k}"] = (np.nan if v is None else v)
@@ -322,44 +269,17 @@ def build_system(config: Dict[str, Any], t_g: float, *,
                  drag_beat_GHz: Optional[float] = None,
                  chirp_coeffs_GHz: Optional[Any] = None, drag_n_pump: int = 1,
                  amp_scale: float = 1.0, wp_offset_GHz: float = 0.0):
-    """Build the gate system for ANY sweep context (bare / spectator / target).
+    """Build the gate system for any sweep context.
 
-    The three sweep families differ only in which frequencies move, so they all
-    reduce to a choice of (w_a, w_b, spectator):
+    * bare / no-spectator : leave ``spec_abs_GHz`` and ``delta_GHz`` unset;
+    * target sweep        : the swept ``wb_GHz`` (+ absolute ``spec_abs_GHz``);
+    * spectator sweep     : ``delta_GHz`` = w_b - w_spec (exclusive with spec_abs_GHz).
 
-    * bare / no-spectator : leave ``spec_abs_GHz`` and ``delta_GHz`` unset.
-    * target sweep        : pass the swept ``wb_GHz`` (and ``spec_abs_GHz`` for the
-                            absolute spectator placement).
-    * spectator sweep     : pass ``delta_GHz`` = w_b - w_spec; the absolute
-                            spectator frequency is derived as w_b - delta.
+    ``wa_GHz``/``wb_GHz`` override the device pair. ``drag_beat_GHz`` and
+    ``chirp_coeffs_GHz`` (default: the config's) are context held FIXED across the
+    grid; ``amp_scale``/``wp_offset_GHz`` are the nominal the grid is applied on.
 
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    t_g : float
-        Gate duration (ns).
-    wa_GHz, wb_GHz : float, optional
-        Override the device pair (target sweeps vary w_b).
-    delta_GHz : float, optional
-        Spectator-sweep detuning w_b - w_spec (GHz). Mutually exclusive with
-        ``spec_abs_GHz``.
-    spec_abs_GHz : float, optional
-        Absolute spectator frequency (GHz).
-    drag_beat_GHz : float, optional
-        Apply a DRAG quadrature at this beat, so the map is of the DRAG-on gate.
-    chirp_coeffs_GHz : sequence of float, optional
-        Legendre coefficients of a pump chirp delta(t) (GHz) held FIXED across the
-        grid, so the map is of the chirped gate. This is context, exactly like
-        `drag_beat_GHz` -- the scan axes remain (pump offset, amplitude). Defaults to
-        ``config["chirp_coeffs_GHz"]``. See :class:`envelope.Chirp`.
-    amp_scale, wp_offset_GHz : float
-        Nominal pump scaling/offset the scan grid is applied on top of.
-
-    Returns
-    -------
-    (ZhouCoupler, float, float, dict)
-        Coupler, pump frequency (GHz), peak |eta|, and the resolved context.
+    Returns (ZhouCoupler, pump frequency GHz, peak |eta|, resolved context).
     """
     from snail_solver.device_utils import build_coupler
 
@@ -381,10 +301,8 @@ def build_system(config: Dict[str, Any], t_g: float, *,
                                      drag_beat_GHz=drag_beat_GHz,
                                      chirp_coeffs_GHz=chirp_coeffs_GHz,
                                      drag_n_pump=drag_n_pump)
-    # Resolve the chirp from the coupler rather than the argument, so the recorded
-    # context is what was actually BUILT (build_coupler falls back to the config when
-    # the argument is None). This one key then flows automatically into `run`'s
-    # operating_point via **context, into save_npz, and into --save-point.
+    # Record the chirp actually BUILT (build_coupler falls back to the config); it
+    # flows into the operating_point, save_npz and --save-point via the context.
     tone_chirp = grape._tone_chirp(cpl)
     context = dict(wa_GHz=pair[0], wb_GHz=pair[1], t_g_ns=t_g,
                    spec_abs_GHz=(None if spec_abs_GHz is None else float(spec_abs_GHz)),
@@ -407,19 +325,13 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         out: Optional[str] = "figs/calibration_map.png", title: Optional[str] = None,
         log_path: Optional[str] = None,
         **kw) -> Dict[str, Any]:
-    """Build the system for the given sweep context, scan (reduced or QuTiP), plot,
-    optionally persist, and return results.
+    """Build the system for the sweep context, scan with `engine`, plot, optionally
+    save, and return the result.
 
-    The returned dict includes ``context`` (where it was calibrated) and
-    ``operating_point`` (a record ready for ``operating_points.save_point``).
-    ``engine='qutip'`` runs the exact solver; both engines share the grid, the
-    ``best``/``operating_point`` bookkeeping, and the plot.
-
-    Progress is logged (timestamped) to stdout so a long ``engine='qutip'`` run
-    can be tailed while it's still going -- under SLURM that lands in the job's
-    own ``slurm-<jobid>.out``, so concurrent jobs (e.g. one per device) don't
-    interleave into one shared file the way a colocated log file would. Pass
-    ``log_path`` explicitly to also mirror progress into a file.
+    The result includes ``context`` and ``operating_point`` (ready for
+    ``operating_points.save_point``). Progress is logged to stdout (under SLURM, the
+    job's own .out, so concurrent jobs don't interleave); ``log_path`` also mirrors it
+    to a file.
     """
     if coupler_levels is not None:                     # truncation override, reused
         config = {**config, "coupler_levels": int(coupler_levels)}
@@ -452,9 +364,7 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         result = scan_qutip(build_fn, t_g, atol=atol, rtol=rtol, nsteps=nsteps,
                             jobs=jobs, logger=logger, **qkw)
     elif engine == "jax":
-        # The whole grid is ONE batched program: the device is fixed, the amplitude
-        # is a pulse parameter and the pump offset is just the last entry of the
-        # frequency vector, so nothing has to be rebuilt per point.
+        # one batched program: amplitude and offset are parameters, nothing is rebuilt
         from snail_solver import jax_engine as JE
         span = float(kw.get("wp_span_MHz", 40.0))
         offsets = np.linspace(-span / 2.0, span / 2.0, int(kw.get("wp_points", 41)))
@@ -479,10 +389,8 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
     result["context"] = context
     result["log_path"] = log_path
 
-    # The per-row argmax over the offset axis IS the Stark shift vs drive -- the map
-    # already computes it and used to keep only the single global optimum. Recovering
-    # the ridge is pure post-processing on Z, and it is what a physically-motivated
-    # chirp seed is built from (see stark_chirp).
+    # The per-row argmax over offset IS the Stark shift vs drive: post-process it into
+    # a chirp seed (see stark_chirp).
     try:
         from snail_solver import stark_chirp as SC
         fit = SC.stark_slope_from_map(result)
@@ -518,48 +426,18 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
 def scan_chirp_axis(config: Dict[str, Any], t_g: float, coeff_index: int,
                     values: np.ndarray, *, base_chirp: Optional[Any] = None,
                     out: Optional[str] = None, **run_kw) -> Dict[str, Any]:
-    """Repeat the 2-D (offset, amplitude) map across one chirp coefficient.
+    """Repeat the 2-D (offset, amplitude) map across chirp coefficient ``c_[coeff_index]``
+    (on top of ``base_chirp``), re-optimizing the tune-up at every value.
 
-    A landscape view of the third axis: for each value of ``c_[coeff_index]`` the full
-    map is recomputed and its optimum recorded, so the (offset, amplitude) tune-up is
-    re-done at every chirp rather than held fixed at a value calibrated without one.
+    A loop over :func:`run` (engine-agnostic; cost = ``len(values)`` maps) -- a
+    diagnostic; to calibrate a chirp use ``grape --chirp-degree``. Only EVEN
+    coefficients are worth scanning: the Stark shape |eta(t)|^2 is even in gate time
+    (``c_1`` is odd; ``c_0`` duplicates the offset axis). ``run_kw`` is forwarded,
+    with the inner maps' ``out``/``save_npz_path`` suppressed; `out` is the summary
+    figure path.
 
-    Implemented as a LOOP over ``run`` rather than a third batch axis. That keeps it
-    engine-agnostic -- it works with reduced, qutip and jax identically -- and the
-    honest cost is simply ``len(values)`` maps. Use the jax engine and a coarse grid
-    for exploration; this is a diagnostic, not the recommended way to calibrate a
-    chirp. For that, optimize it directly: ``grape --chirp-degree``, which searches
-    the coefficients continuously instead of on a grid.
-
-    Only EVEN coefficients are worth scanning: the Stark shape |eta(t)|^2 is even in
-    the normalized gate time, so ``c_2`` is the leading useful term (``c_1`` is odd,
-    and ``c_0`` is degenerate with the pump offset the map already scans). See
-    ``stark_chirp``.
-
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    t_g : float
-        Gate duration (ns).
-    coeff_index : int
-        Which Legendre coefficient to scan (2 or 4 in practice).
-    values : ndarray
-        Values of that coefficient (GHz).
-    base_chirp : sequence of float, optional
-        Chirp the scanned coefficient is varied on top of.
-    out : str, optional
-        Path for the summary figure (score and optimum vs chirp).
-    **run_kw
-        Forwarded to :func:`run` (engine, grid, metric, ...). ``out``/``save_npz_path``
-        of the inner maps are suppressed so the loop does not emit one figure per
-        value.
-
-    Returns
-    -------
-    dict
-        ``values``, ``scores``, ``amp_scales``, ``wp_offsets_MHz`` (the per-value
-        optimum), ``best`` (the overall winner) and ``results`` (every inner map).
+    Returns values, scores, amp_scales, wp_offsets_MHz (per-value optimum), best,
+    results (every inner map), metric, engine, coeff_index.
     """
     values = np.asarray(values, dtype=float)
     base = list(base_chirp or [])
@@ -615,8 +493,7 @@ def _plot_chirp_axis(scan: Dict[str, Any], out: str) -> None:
     ax.set_title(f"chirp axis: $c_{{{scan['coeff_index']}}}$ "
                  f"({scan.get('engine', '')}); best {s[k]:.5f} at "
                  f"{v[k]:+.5f} GHz", fontsize=10)
-    # the tune-up MOVES with the chirp -- that is the whole reason to re-optimize
-    # (offset, amplitude) per chirp rather than hold a chirp-free calibration
+    # the tune-up MOVES with the chirp -- why it is re-optimized per value
     ax2.plot(v, scan["wp_offsets_MHz"], "s-", ms=3.5, lw=1.2,
              color="#2980B9", label="opt offset (MHz)")
     ax2b = ax2.twinx()
@@ -655,16 +532,12 @@ def main() -> None:
                          "chirp_coeffs_GHz; pass '' to force no chirp")
     ap.add_argument("--engine", choices=["reduced", "qutip", "jax"], default="reduced",
                     help="reduced rotating-frame model (fast, CPU), exact QuTiP "
-                         "sesolve (--engine qutip for the trustworthy map), or the "
-                         "batched jax engine (--engine jax: the whole grid in one "
-                         "vmapped program, GPU-capable; validate the cutoff first "
-                         "with validate_engines.py --cutoff-scan)")
+                         "sesolve (the trustworthy map), or the batched jax engine "
+                         "(GPU-capable; validate with validate_engines.py --cutoff-scan)")
     ap.add_argument("--engine-cutoff-GHz", type=float, default=float("inf"),
-                    help="[jax] carrier cutoff. Defaults to inf (EXACT). A finite "
-                         "cutoff is only safe at weak drive -- at |eta|~9 a 3 GHz "
-                         "cutoff was off by max|dU|~0.9. The engine's speed comes "
-                         "from the integrator and batching, not pruning, so inf is "
-                         "cheap; lower it only with a --cutoff-scan to justify it")
+                    help="[jax] carrier cutoff; default inf (EXACT, and cheap). A "
+                         "finite cutoff is only safe at weak drive -- justify it with "
+                         "a --cutoff-scan")
     ap.add_argument("--engine-carrier-resolution", type=float, default=0.1,
                     help="[jax] max |Omega|*dt for the CF4 propagator (4th order, so "
                          "halving this cuts the error ~16x)")
@@ -697,24 +570,35 @@ def main() -> None:
                     help="'transfer' colours by the swap population P(|01>->|10>)")
     ap.add_argument("--chirp-scan-coeff", type=int, default=None,
                     help="repeat the whole 2-D map across this Legendre chirp "
-                         "coefficient (2 or 4; the Stark shape is EVEN, and c_0 is "
-                         "degenerate with the offset axis). Re-optimizes (offset, "
-                         "amplitude) at every chirp value. Cost is N maps -- for "
-                         "actually calibrating a chirp prefer 'grape --chirp-degree'")
+                         "coefficient (2 or 4: the Stark shape is EVEN). Cost is N "
+                         "maps; to calibrate a chirp prefer 'grape --chirp-degree'")
     ap.add_argument("--chirp-lo", type=float, default=-0.01)
     ap.add_argument("--chirp-hi", type=float, default=0.01)
     ap.add_argument("--chirp-points", type=int, default=7)
     ap.add_argument("--out", default="figs/calibration_map.png")
     ap.add_argument("--log", default=None,
-                    help="optional progress log file; default is stdout only, so "
-                         "concurrent jobs (e.g. one per device) land in each "
-                         "job's own SLURM .out instead of one shared file")
+                    help="optional progress log file (default: stdout only, i.e. "
+                         "each SLURM job's own .out)")
     args = ap.parse_args()
 
     from snail_solver.paths import resolve_device
     from snail_solver.device_utils import load_device, parse_chirp_arg
     device_path = resolve_device(args.device)
     cfg = load_device(device_path)
+
+    # shared by the single map and the chirp-axis loop
+    common = dict(
+        wa_GHz=args.wa_GHz, wb_GHz=args.wb_GHz,
+        spec_abs_GHz=args.spec_abs_GHz, delta_GHz=args.delta_GHz,
+        drag_beat_GHz=args.drag_beat_GHz, engine=args.engine,
+        coupler_levels=args.coupler_levels, atol=args.atol, rtol=args.rtol,
+        nsteps=args.nsteps, jobs=args.jobs,
+        engine_cutoff_GHz=args.engine_cutoff_GHz,
+        engine_carrier_resolution=args.engine_carrier_resolution,
+        engine_batch=args.engine_batch, engine_precision=args.engine_precision,
+        wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
+        amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
+        cutoff_GHz=args.cutoff_GHz, metric=args.metric, log_path=args.log)
 
     if args.chirp_scan_coeff is not None:
         values = np.linspace(args.chirp_lo, args.chirp_hi, args.chirp_points)
@@ -723,18 +607,7 @@ def main() -> None:
               f"({len(values)} full maps)")
         scan_res = scan_chirp_axis(
             cfg, args.t_g_ns, args.chirp_scan_coeff, values,
-            base_chirp=parse_chirp_arg(args.chirp_GHz),
-            out=args.out, wa_GHz=args.wa_GHz, wb_GHz=args.wb_GHz,
-            spec_abs_GHz=args.spec_abs_GHz, delta_GHz=args.delta_GHz,
-            drag_beat_GHz=args.drag_beat_GHz, engine=args.engine,
-            coupler_levels=args.coupler_levels, atol=args.atol, rtol=args.rtol,
-            nsteps=args.nsteps, jobs=args.jobs,
-            engine_cutoff_GHz=args.engine_cutoff_GHz,
-            engine_carrier_resolution=args.engine_carrier_resolution,
-            engine_batch=args.engine_batch, engine_precision=args.engine_precision,
-            wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
-            amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
-            cutoff_GHz=args.cutoff_GHz, metric=args.metric, log_path=args.log)
+            base_chirp=parse_chirp_arg(args.chirp_GHz), out=args.out, **common)
         bst = scan_res["best"]
         print(f"\nbest over the chirp axis: c{bst['coeff_index']} = {bst['value']:+.6f} "
               f"GHz, {args.metric} = {bst['score']:.5f} "
@@ -751,20 +624,11 @@ def main() -> None:
             print("saved", args.save_npz)
         return
 
-    result = run(cfg, args.t_g_ns, wa_GHz=args.wa_GHz, wb_GHz=args.wb_GHz,
-                 spec_abs_GHz=args.spec_abs_GHz, delta_GHz=args.delta_GHz,
-                 drag_beat_GHz=args.drag_beat_GHz,
-                 chirp_coeffs_GHz=parse_chirp_arg(args.chirp_GHz),
-                 drag_n_pump=args.drag_n_pump, engine=args.engine,
-                 coupler_levels=args.coupler_levels, atol=args.atol, rtol=args.rtol,
-                 nsteps=args.nsteps, jobs=args.jobs, save_npz_path=args.save_npz,
-                 engine_cutoff_GHz=args.engine_cutoff_GHz,
-                 engine_carrier_resolution=args.engine_carrier_resolution,
-                 engine_batch=args.engine_batch, engine_precision=args.engine_precision,
-                 wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
-                 amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
-                 cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out,
-                 log_path=args.log)
+    # NB: there is no --drag-n-pump flag, so `args.drag_n_pump` raises AttributeError
+    # here (pre-existing; left as-is by a no-behaviour-change cleanup).
+    result = run(cfg, args.t_g_ns, chirp_coeffs_GHz=parse_chirp_arg(args.chirp_GHz),
+                 drag_n_pump=args.drag_n_pump, save_npz_path=args.save_npz,
+                 out=args.out, **common)
     print(f"log: {result['log_path'] or 'stdout (SLURM job output)'}")
     b, ctx = result["best"], result["context"]
     print(f"context: w_a={ctx['wa_GHz']} w_b={ctx['wb_GHz']} t_g={ctx['t_g_ns']} ns "

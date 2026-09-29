@@ -1,13 +1,8 @@
 """Durable, tailable progress logging for long solver runs.
 
-Plain ``print()`` is line-buffered when stdout isn't a tty, so under ``srun`` on
-SLURM the progress prints from a long calibration/sweep run can sit unflushed
-until the job finishes. ``setup_run_logger`` gives callers a logger that writes
-timestamped lines to stdout -- which SLURM already captures into that job's own
-``slurm-<jobid>.out`` -- and, optionally, to a log file colocated with the run's
-outputs. Concurrent jobs (e.g. one per device) that don't pass an explicit,
-per-job ``log_path`` therefore land in separate SLURM output files instead of
-interleaving into one shared file.
+``print()`` output can sit unflushed under ``srun`` until the job ends. The logger
+from ``setup_run_logger`` writes timestamped lines to stdout (captured per job in
+``slurm-<jobid>.out``) and optionally to a log file beside the run's outputs.
 """
 from __future__ import annotations
 
@@ -23,16 +18,11 @@ def setup_run_logger(log_path: Optional[str], name: str) -> logging.Logger:
     Parameters
     ----------
     log_path : str, optional
-        File to append to; its parent directory is created if missing. Leave
-        unset to log to stdout only -- the right default for concurrent jobs
-        that would otherwise share (and interleave writes into) one file.
+        File to append to (parent created if missing). Leave unset for stdout only,
+        the right default for concurrent jobs that would interleave into one file.
     name : str
-        Logger name. Use a name derived from ``log_path`` so concurrent runs
-        writing to different files don't share (and duplicate onto) handlers.
-
-    Returns
-    -------
-    logging.Logger
+        Logger name; derive it from ``log_path`` so runs writing to different files
+        don't share (and duplicate onto) handlers.
     """
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)

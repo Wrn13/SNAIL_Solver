@@ -1,38 +1,31 @@
 """The time-dependent pulse a scan column plays, in three variants, at chosen detunings.
 
-Everything in the curve figures is a SCORE -- one number per column. This draws the
-objects those numbers came from: the complex pump amplitude eta(t), rebuilt from the
-stored operating point through the same `config_at_wp` -> `build_coupler` path
-`curve_drag_vs_bare.py` scores, and sampled with `ZhouCoupler._eta_at` -- the single
-source of truth for the pump the solver sees. Nothing here re-derives the pulse, so a
-figure cannot drift from what was simulated.
+The curve figures plot SCORES; this draws the pulse behind them: the complex pump
+amplitude eta(t), rebuilt from the stored operating point through the same
+`config_at_wp` -> `build_coupler` path `curve_drag_vs_bare.py` scores and sampled with
+`ZhouCoupler._eta_at` (what the solver sees), so the figure cannot drift from the
+simulation.
 
-Three variants per detuning, all at the CALIBRATED operating point (same t_g, same
-amp_scale, same carrier), so the only difference between them is the corrections:
+Three variants per detuning, all at the CALIBRATED operating point (same t_g,
+amp_scale and carrier), so they differ only in the corrections:
 
     chirp + DRAG    the gate as calibrated and scored
     chirp only      the same chirp, DRAG not played
     neither         the bare base envelope
 
-Drawing them on one length is the comparison `curve_drag_vs_bare.py` makes, not a
-simplification of it: the `bare` trace's own length refit returns the calibrated
-length for these columns. Where it does not, the refit length is annotated and the
-drawn pulse is still the calibrated one -- this figure is about shape, not duration.
+(The `bare` trace's own length refit normally returns the calibrated length; where
+it does not, the refit length is annotated -- this figure is about shape.)
 
-Three panels:
-
-  1. |eta(t)|. The chirp is a PURE PHASE, so "chirp only" and "neither" have the
-     identical magnitude and lie on top of each other; only DRAG moves |eta|, and
-     only at second order.
-  2. and 3. The baseband quadratures I = Re eta and Q = Im eta at the FIXED carrier
-     w_p -- what an AWG would play. Q is where both corrections live: "neither" is
-     identically zero there, the chirp rotates the real envelope into it, and DRAG
-     adds the derivative term on top.
+Panels: 1. |eta(t)| -- the chirp is a PURE PHASE, so "chirp only" and "neither"
+coincide and only DRAG moves |eta|, at second order. 2./3. I = Re eta and Q = Im eta
+at the FIXED carrier w_p (what an AWG plays): "neither" has no Q, the chirp rotates
+the envelope into it, and DRAG adds the derivative term.
 
 Usage:  plot_pulse_time.py SCAN.h5 OUTDIR DELTA_MHz,DELTA_MHz[,...] [CURVES.json]
 
 Writes one figure per detuning plus a side-by-side comparison of all of them.
 """
+import json
 import os
 import sys
 
@@ -52,10 +45,8 @@ DELTAS_MHz = [float(x) for x in sys.argv[3].split(",")]
 CURVES = sys.argv[4] if len(sys.argv) > 4 else None    # for the scored 1-F annotations
 N_TIME = 2001
 
-# (key, colour, linestyle, width, label). Categorical slots 1-3 of the validated
-# default palette, in the SAME roles `plot_drag_curves.py` gives them, so a reader
-# moving between the two figures does not have to relearn the colours. Line style
-# duplicates the encoding, and slots 1-3 are the set that validates all-pairs.
+# (key, colour, linestyle, width, label). Palette slots 1-3 in the same roles as
+# `plot_drag_curves.py`; line style duplicates the encoding.
 VARIANTS = (
     ("drag",  "#2a78d6", "-",       1.9, "chirp + DRAG"),
     ("chirp", "#1baf7a", (0, (5, 2)), 1.5, "chirp only"),
@@ -71,7 +62,6 @@ def _scored(curves_path, delta_GHz, target_eta):
     """The `curve_drag_vs_bare.py` traces for this column, or {} if unavailable."""
     if not curves_path or not os.path.exists(curves_path):
         return {}
-    import json
     for r in json.load(open(curves_path)):
         if (abs(float(r["delta_GHz"]) - delta_GHz) < 5e-4
                 and abs(float(r["target_eta"]) - target_eta) < 1e-6):
@@ -104,9 +94,8 @@ def column(scan, delta_MHz, curves_path=None):
     cfg = config_at_wp(scan["device"], float(r["w_p_GHz"]), branch=r["branch"],
                        levels=int(r["coupler_levels"]), chirp_coeffs_GHz=chirp)
     t_g = float(op["t_g_ns"])
-    # amp_scale is not free: it is whatever holds |eta| at the target for this
-    # length, and it is common to all three variants. Recomputing it is how
-    # `score_gate` builds the pulse, and is an exact no-op against the stored value.
+    # amp_scale holds |eta| at the target for this length (common to all variants);
+    # recomputing it is what `score_gate` does, an exact no-op vs the stored value.
     amp = float(fixed_eta_amp_scale(cfg, t_g, float(op["target_eta"])))
     t = np.linspace(0.0, t_g, N_TIME)
 
@@ -179,9 +168,7 @@ def draw(axes, c, with_ylabels=True):
               loc="lower center")
     if with_ylabels:
         ax.set_ylabel(r"amplitude  $|\eta|$", color=INK, fontsize=9)
-    # "chirp only" and "neither" coincide here -- a chirp is a pure phase -- and
-    # DRAG separates from them only at second order, so say in numbers what the
-    # panel cannot resolve rather than leaving it to look like no correction.
+    # The variants barely separate here, so state in numbers what the panel cannot.
     note = (f"peak $|\\eta|$ = {c['peak_eta']:.2f}   DRAG moves $|\\eta|$ by "
             f"{100 * c['pulses']['drag']['ratio']:.2f}% of the base peak; the chirp, "
             f"being a pure phase, by nothing\n"

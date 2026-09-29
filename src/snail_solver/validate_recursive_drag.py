@@ -2,56 +2,39 @@
 validate_recursive_drag.py
 ==========================
 
-Does recursive DRAG actually beat single-derivative DRAG on THIS device?
+Does recursive DRAG (Li, Calarco & Motzoi, npj QI 10, 66 (2024)) actually beat
+single-derivative DRAG on THIS device? The other recursion checks only show the pulse
+is built correctly; this module measures whether composing corrections helps.
 
-Everything else added with the recursion checks that the pulse we build is the one
-Li, Calarco & Motzoi define (npj QI 10, 66 (2024)) -- exact derivatives, the right
-composition order, agreement across all four solve paths. None of that is evidence
-that composing the corrections *helps here*. This module is that evidence, or its
-absence.
-
-The experiment (their Fig. 2b, transposed to this device)
-----------------------------------------------------------
-Their claim is specifically about **frequency crowding**: a single derivative
-correction has one knob, so with more than one nearby off-resonant process it can only
-trade one process's error against another's, while one correction per process
-suppresses all of them at once. So the sweep axis has to be the thing that controls
-how crowded the spectrum is -- here the SPECTATOR frequency, which sets the beats of
-the collision channels (``sweep_common._collision_candidates``).
-
-At each spectator placement we score the same gate under four schemes::
+The experiment (their Fig. 2b, transposed)
+------------------------------------------
+Their claim is about **frequency crowding**: one derivative correction can only trade
+one off-resonant process's error against another's, while one correction per process
+suppresses all of them. So the sweep axis is the SPECTATOR frequency, which sets the
+beats of the collision channels (``sweep_common._collision_candidates``). At each
+placement the same gate is scored under::
 
     none        no DRAG at all
-    F1          first-order DRAG on the NEAREST collision   (what the repo did before)
+    F1          first-order DRAG on the NEAREST collision
     F1oF1       the two nearest, composed
     F1oF1oF2    the three nearest, multi-photon innermost   (the paper's Eq. 8)
 
-Reading the result honestly
----------------------------
-The number to look at is ``dF`` = infidelity, and the comparison that matters is
-``F1`` vs the composed schemes AT THE SAME spectator placement. Two ways this can
-come out, and both are informative:
-
-* the composed schemes win, by a margin that GROWS as the beats close in -- the
-  paper's claim, reproduced;
-* they do not -- which on this device would most likely mean the second and third
-  collisions are far enough away to be irrelevant at these parameters, i.e. the
-  regime is not frequency-crowded. ``beats_MHz`` in the output says which.
-
-A composed scheme can also be WORSE, and the cause is usually visible in
-``corr_ratio`` (:func:`device_utils.drag_correction_ratio`): once the correction is
-comparable to the pulse it corrects, the perturbative expansion has stopped meaning
-anything and adding another order makes it worse, not better. That is a real result
-about the operating point, not a bug.
+Reading the result
+------------------
+Compare ``dF`` (infidelity) of ``F1`` vs the composed schemes AT THE SAME placement.
+Either the composed schemes win by a margin that grows as the beats close in (the
+paper's claim), or they do not -- most likely because the 2nd/3rd collisions are too
+far away to matter (``beats_MHz`` says which). A composed scheme can also be WORSE:
+check ``corr_ratio`` (:func:`device_utils.drag_correction_ratio`); once the correction
+is comparable to the pulse the perturbative expansion has broken down. That is a real
+result about the operating point, not a bug.
 
 Base shape
 ----------
-Defaults to ``sine_power`` with ``m = 3``. This is not cosmetic: a Hann window has
-only two vanishing end derivatives, and under ``F1oF1oF2`` the pulse literally
-diverges as ``t^(-1/2)`` at both gate edges (see :class:`envelope.SinePowerRamp`, and
-``test_hann_diverges_under_the_full_recursion``). Running this comparison on a Hann
-would measure that divergence rather than the physics. ``--shape raised_cosine`` is
-allowed so the contrast can be shown deliberately.
+Defaults to ``sine_power`` with ``m = 3``: a Hann window has only two vanishing end
+derivatives, so under ``F1oF1oF2`` it diverges as ``t^(-1/2)`` at both edges (see
+:class:`envelope.SinePowerRamp`, ``test_hann_diverges_under_the_full_recursion``).
+``--shape raised_cosine`` shows that contrast deliberately.
 
 CLI
 ---
@@ -66,8 +49,6 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
-
-TWO_PI = 2.0 * np.pi
 
 #: The schemes compared at every spectator placement, as (label, n_channels).
 SCHEMES = (("none", 0), ("F1", 1), ("F1oF1", 2), ("F1oF1oF2", 3))
@@ -115,16 +96,12 @@ def calibrate_operating_point(config: Dict[str, Any], target_eta: float, *,
                               logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """A working gate to run the comparison ON, before any spectator is added.
 
-    This is not optional set-up -- it is what makes the sweep measure anything. At an
-    UNCALIBRATED point the gate is dominated by rotation-angle and detuning error
-    (infidelity ~0.2 in a first attempt at these parameters), and a leakage-suppression
-    scheme cannot be seen underneath that: every scheme scores roughly the same large
-    number, and which one wins is noise.
+    Essential: an UNCALIBRATED gate is dominated by rotation/detuning error (dF ~0.2
+    here), which buries any leakage suppression and makes the ranking noise.
 
-    Fixes the length from ``nominal_t_g(target_eta)`` (the analytic full iSWAP at that
-    drive) with ``amp_scale`` holding the peak there, then calibrates the carrier with
-    one DRAG-off, spectator-free chevron. That single offset is then held across the
-    whole sweep, so every cell differs only in the spectator and the DRAG scheme.
+    ``t_g = nominal_t_g(target_eta)`` (analytic full iSWAP) with ``amp_scale`` holding
+    the peak there; the carrier comes from one DRAG-off, spectator-free chevron. That
+    offset is held across the sweep, so cells differ only in spectator and scheme.
     """
     from snail_solver import find_stark_resonance as FSR
     from snail_solver.tune_up import fixed_eta_amp_scale, nominal_t_g
@@ -157,24 +134,22 @@ def sweep(config: Dict[str, Any], t_g: float, *,
     Parameters
     ----------
     config : dict
-        Merged device configuration. The base shape is overridden by `shape`/`m`.
+        Merged device configuration; the base shape is overridden by `shape`/`m`.
     t_g : float
-        Gate length (ns), held fixed across the sweep so the comparison is
-        like-for-like.
+        Gate length (ns), fixed across the sweep.
     spec_GHz : sequence of float, optional
-        Explicit spectator placements. Default: `points` values spanning
-        ``+/- span_GHz/2`` about qubit b, skipping placements that land on top of a
-        qubit (where no DRAG scheme is meaningful -- an on-resonant collision needs
-        frequency allocation, not a derivative correction).
+        Spectator placements. Default: `points` values spanning ``+/- span_GHz/2``
+        about qubit b, skipping any within 20 MHz of a qubit (a resonant collision
+        needs frequency allocation, not a derivative correction).
     schemes : sequence of (label, n_channels)
         Defaults to :data:`SCHEMES`.
 
     Returns
     -------
     dict
-        ``spec_GHz``, ``schemes``, ``rows`` (one per placement, keyed by scheme
-        label), ``t_g_ns``, ``shape``, and ``best`` (the scheme with the lowest mean
-        infidelity across the sweep).
+        ``spec_GHz``, ``schemes``, ``rows`` (per placement, keyed by scheme label),
+        ``t_g_ns``, ``shape``, ``m``, ``mean_dF``, ``best`` (lowest mean dF) and
+        ``reference`` (the no-spectator, no-DRAG gate).
     """
     cfg = dict(config)
     cfg["envelope"] = shape
@@ -185,18 +160,14 @@ def sweep(config: Dict[str, Any], t_g: float, *,
     wa, wb = (float(x) for x in cfg["qubit_freqs_GHz"])
     if spec_GHz is None:
         grid = wb + np.linspace(-float(span_GHz) / 2, float(span_GHz) / 2, int(points))
-        # a spectator sitting exactly on a qubit is a resonant collision, not an
-        # off-resonant one: no derivative correction applies, so it is not a fair cell
         grid = np.array([f for f in grid
                          if min(abs(f - wa), abs(f - wb)) > 0.02])
     else:
         grid = np.asarray(spec_GHz, dtype=float)
 
-    # The no-spectator, no-DRAG gate. If THIS is already bad the comparison below is
-    # meaningless -- a leakage-suppression scheme cannot be seen underneath a gate
-    # that is not rotating, and whichever scheme happens to score best is noise. This
-    # is not hypothetical: at peak |eta| ~ 1.8 the bundled device configs put ~88% of
-    # the population in the coupler before any spectator is added.
+    # The no-spectator, no-DRAG gate. If THIS is already bad the comparison is noise:
+    # e.g. at peak |eta| ~ 1.8 the bundled configs put ~88% of the population in the
+    # coupler before any spectator is added.
     reference = _score_point(cfg, t_g, None, 0, amp_scale=amp_scale,
                              wp_offset_GHz=wp_offset_GHz,
                              chirp_coeffs_GHz=chirp_coeffs_GHz, solver=solver)
@@ -256,9 +227,7 @@ def summarize(result: Dict[str, Any]) -> str:
     if ref is not None:
         out.append(f"  reference gate (no spectator, no DRAG): dF={ref['dF']:.3e}  "
                    f"leak={ref['leak']:.3e}")
-    # Refuse to draw a conclusion from a gate that does not work. A broken baseline
-    # produces a confident-looking ranking that is pure noise, which is worse than
-    # reporting nothing.
+    # Refuse a verdict from a broken baseline: its ranking would be confident noise.
     if ref is not None and ref["dF"] > 0.1:
         out += ["",
                 f"  NO VERDICT: the reference gate is already at dF={ref['dF']:.2f} "
@@ -336,9 +305,8 @@ def main() -> None:                                        # pragma: no cover
     solver = {"atol": args.atol, "rtol": args.rtol, "nsteps": 200000}
 
     t_g, amp_scale, wp_offset, cal = args.t_g, args.amp_scale, args.wp_offset_GHz, None
-    # A device JSON that already carries a calibrated operating point is the best
-    # starting gate there is -- re-deriving it costs a chevron sweep and can only be
-    # worse. Explicit CLI flags still win.
+    # A device JSON's calibrated operating point beats re-deriving it (a chevron
+    # sweep). Explicit CLI flags still win.
     if not args.no_calibrate and "t_g_ns" in config and args.t_g is None:
         t_g = float(config["t_g_ns"])
         amp_scale = float(config.get("amp_scale", 1.0))

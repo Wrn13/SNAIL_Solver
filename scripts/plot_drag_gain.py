@@ -15,6 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
 CURVES, OUT = sys.argv[1], sys.argv[2]
 SLOT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
@@ -72,7 +73,6 @@ ax.set_ylabel("fidelity gain\n$(1-F)_{\\mathrm{bare}}\\,/\\,(1-F)_{\\mathrm{chir
 ax.set_title("Where chirped recursive DRAG pays  (above branch, $w_s$ = 4.7 GHz)",
              color=INK, fontsize=12, pad=10)
 h, l = ax.get_legend_handles_labels()
-from matplotlib.lines import Line2D
 h.append(Line2D([], [], marker="o", color=MUTED, ls="none", ms=10, mfc="none",
                 mew=1.6))
 l.append("A-subharmonic channel corrected")

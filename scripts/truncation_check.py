@@ -1,12 +1,9 @@
 """Coupler-level convergence at the columns a paper would quote.
 
-`predicted_levels` is a scaling argument, not a bound, and on this device it is
-misleading: it called for 1.9 levels at a column where the observable was still
-moving by a factor of 3 between 7 and 9. So the reported points need an explicit
-convergence table rather than an argument.
-
-Replays each column's own calibrated pulse at several cutoffs -- same t_g, amplitude,
-chirp and channels -- so only the Hilbert space changes.
+`predicted_levels` is a scaling argument, not a bound: on this device it called for
+1.9 levels where the observable still moved 3x between 7 and 9. So the quoted points
+get an explicit table: each eta's best column replayed at several cutoffs (same t_g,
+amplitude, chirp and channels), so only the Hilbert space changes.
 
 Usage:  truncation_check.py RUN.h5[,RUN2.h5...] [LEVELS] [WORKERS]
 """
@@ -48,15 +45,15 @@ if __name__ == "__main__":
 
     jobs = []
     for s in SRC:
-        scan = (load_doc(s).get("scan") or load_doc(s))
+        doc = load_doc(s)
+        scan = doc.get("scan") or doc
         dev = scan["device"]
         ok = [r for r in scan.get("rows", []) if r.get("ok")]
         if not ok:
             continue
         # The column a paper would quote: the best coherent infidelity at this eta.
         best = min(ok, key=lambda r: 1.0 - r["fidelity"]["F_avg"])
-        for lev in LEVELS:
-            jobs.append({"row": best, "device": dev, "levels": lev})
+        jobs += [{"row": best, "device": dev, "levels": lev} for lev in LEVELS]
     print(f"{len(jobs)} solves ({len(jobs) // max(len(LEVELS), 1)} column(s) x "
           f"{len(LEVELS)} cutoffs) on {WORKERS} workers", flush=True)
 

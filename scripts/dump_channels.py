@@ -1,9 +1,7 @@
 """Plain-text listing of the DRAG channels targeted at every column.
 
-The channel set lives nested inside each row of the scan HDF5, where a tree viewer
-shows it as an opaque blob. This flattens it: what was PLAYED per column, what the
-audit considered, and a tally of which physical processes the recursion actually
-spent its slots on.
+Flattens the per-row channel sets of the scan HDF5: what was PLAYED per column, what
+the audit considered but did not correct, and a tally of the processes played.
 
 Usage:  dump_channels.py RUNDIR [OUT.txt]
 """
@@ -18,13 +16,7 @@ RUNDIR = sys.argv[1]
 OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(RUNDIR, "channels.txt")
 
 L = []
-
-
-def w(s=""):
-    L.append(s)
-
-
-tally = Counter()
+w = L.append
 played_tally = Counter()
 
 for path in sorted(glob.glob(os.path.join(RUNDIR, "eta*.h5"))):
@@ -56,14 +48,10 @@ for path in sorted(glob.glob(os.path.join(RUNDIR, "eta*.h5"))):
               f"  g/|det|={c.get('ratio') or float('nan'):.3f}   {lab}")
             if r.get("ok"):
                 played_tally[lab] += 1
-            tally[lab] += 1
         # What the audit saw but did NOT correct, and why.
         for a in ((r.get("channel_audit") or {}).get("rows") or []):
-            if a.get("selected") or a.get("category") == "target":
-                continue
-            if not a.get("reason"):
-                continue
-            if (a.get("g_MHz") or 0.0) < 1e-6:
+            if (a.get("selected") or a.get("category") == "target"
+                    or not a.get("reason") or (a.get("g_MHz") or 0.0) < 1e-6):
                 continue
             w(f"      (not corrected) {a['detuning_MHz']:+9.1f} MHz  k={a['n_pump']}  "
               f"{a['category']:>8}  g={a['g_MHz']:7.2f} MHz  -- {a['reason']}")

@@ -3,22 +3,14 @@
 post_chirp.py
 =============
 
-Does the calibrated chirp actually help, on the REAL shaped gate, and up to
-what drive?
+Does the calibrated chirp help on the REAL shaped gate, and up to what drive?
 
-``tune_up.py`` builds a chirp from a CONSTANT-probe diagnostic -- a property of
-the device, not of the pulse (see its module docstring). This module re-runs
-the ACTUAL raised-cosine gate, with the calibrated chirp, as a chevron sweep
-across drive strengths, and (by default) the identical gate with the chirp
-switched off at the same length/amplitude/offset -- the ``chirp_ablation``
-comparison ``run_tune_up`` already does at ONE point, generalised across drive
-strength and across the pump-offset axis. This is the direct, gate-level
-answer to "does the chirp work", complementing the constant-probe diagnostics
-in ``tune_up.py``.
-
-Every row's gate length is rescaled to keep it a genuine full swap at its own
-drive (see ``tune_up.post_chirp_table``), so a row's contrast collapsing means
-something is actually going wrong at that drive -- not that the row is just a
+``tune_up.py`` derives the chirp from a constant-probe diagnostic (a device
+property). This module re-runs the actual raised-cosine gate with that chirp as a
+chevron sweep across drive strength and pump offset, and by default the same gate
+with the chirp off (``run_tune_up``'s one-point ``chirp_ablation``, generalised).
+Each row's length is rescaled to stay a full swap at its own drive (see
+``tune_up.post_chirp_table``), so lost contrast means a real failure, not a
 partial rotation.
 
 Usage
@@ -45,11 +37,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", default=None,
                     help="device JSON (bare name resolves under devices/). Optional "
-                         "with --from-tuneup, which carries its own copy of the "
-                         "configuration the tune-up ran with -- pass one only to run "
-                         "against a DIFFERENT device than the tune-up used, and the "
-                         "context check below will tell you if it disagrees. Required "
-                         "with --point (the point lives in that file)")
+                         "with --from-tuneup, which carries its own device copy; pass "
+                         "one only to override it (the context check flags a "
+                         "mismatch). Required with --point")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--from-tuneup", metavar="FILE", default=None,
                      help="a tune_up --out file (HDF5, or pre-HDF5 JSON): reads "
@@ -72,10 +62,8 @@ def main() -> None:
                     help="skip the flat-carrier (chirp off) comparison row")
     ap.add_argument("--reproject-chirp", action="store_true",
                     help="re-derive the chirp at EACH row's drive from the Rabi "
-                         "table instead of using the calibrated chirp verbatim -- "
-                         "answers 'would the procedure work here', not 'does the "
-                         "calibrated gate work here'. Needs --from-tuneup (the "
-                         "Rabi table isn't saved with a --point)")
+                         "table instead of using the calibrated chirp verbatim. "
+                         "Needs --from-tuneup (a --point has no Rabi table)")
     ap.add_argument("--chirp-degree", type=int, default=8)
     ap.add_argument("--coupler-levels", type=int, default=None)
     ap.add_argument("--jobs", type=int, default=0)
@@ -90,9 +78,8 @@ def main() -> None:
     ap.add_argument("--plot", nargs="?", const="figs/post_chirp_chevrons.png",
                     default=None)
     ap.add_argument("--replot", metavar="FILE", default=None,
-                    help="skip the run entirely and regenerate --plot from a "
-                         "previously written --out -- no new solves. HDF5 or JSON, "
-                         "detected by content")
+                    help="no solves: regenerate --plot from a previous --out "
+                         "(HDF5 or JSON, detected by content)")
     args = ap.parse_args()
 
     if args.reproject_chirp and args.from_tuneup is None:
@@ -114,7 +101,7 @@ def main() -> None:
         if args.plot:
             path = plot_post_chirp_table(post, out=args.plot, rabi_table=rabi_table)
             print(f"wrote {path}")
-            # re-drawn from this file, so refresh the copy it carries
+            # refresh the figure copy the file carries
             if is_hdf5(split_address(args.replot)[0]):
                 attach_figures(args.replot, {"post_chirp": path})
         return
@@ -133,10 +120,8 @@ def main() -> None:
         record = saved["operating_point"]
         rabi_table = saved["stages"]["rabi"]
         if config is None:
-            # The run carries the configuration it was calibrated with. Using it is
-            # strictly better than re-reading the device file: that file gets edited
-            # (coupler_levels, frequencies) between the tune-up and this check, and
-            # then this "validation" would be measuring a different device.
+            # Use the config the run was calibrated with: the device file may have
+            # been edited since, and then this would validate a different device.
             config = saved.get("device")
             if config is None:
                 ap.error(f"--device is required: {args.from_tuneup} was written "
@@ -152,10 +137,8 @@ def main() -> None:
         config = {**config, "coupler_levels": int(args.coupler_levels)}
 
     from snail_solver.operating_points import check_context
-    # t_g is pinned to the POINT's own calibrated length: post_chirp_table derives
-    # every row's length from it directly, never from config["t_g_ns"] (a generic
-    # starting guess), so that is not a context mismatch worth flagging here --
-    # only the device's own frequencies (wa/wb/spec_abs) are.
+    # Pin t_g to the point's own length: rows derive from it, not config["t_g_ns"]
+    # (a generic guess), so only the device frequencies count as a mismatch.
     mismatches = check_context(record, config, t_g=float(record["t_g_ns"]))
     if mismatches:
         raise SystemExit(
@@ -178,9 +161,8 @@ def main() -> None:
 
     print("\n=== post-chirp result ===")
     print(f"  target_eta   = {record['target_eta']}")
-    ok = post["residual_MHz"]
     import numpy as np
-    finite = np.asarray(ok, dtype=float)
+    finite = np.asarray(post["residual_MHz"], dtype=float)
     finite = finite[np.isfinite(finite)]
     if finite.size:
         print(f"  residual_MHz = mean {np.mean(np.abs(finite)):.3f}  "
@@ -205,7 +187,7 @@ def main() -> None:
     if args.plot:
         path = plot_post_chirp_table(post, out=args.plot, rabi_table=rabi_table)
         print(f"  wrote {path}")
-        # the figure belongs with the sweep it draws, not only in figs/
+        # embed the figure with the sweep it draws
         if written and is_hdf5(split_address(written)[0]):
             attach_figures(written, {"post_chirp": path})
             print(f"  embedded it in {written}")

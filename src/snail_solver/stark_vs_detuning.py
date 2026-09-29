@@ -2,27 +2,19 @@
 stark_vs_detuning.py
 ====================
 
-Companion to the spectator sweep (run_sweep_zhou.py --sweep spectator). That sweep
-shows how DRAG suppresses a spectator as its detuning Delta = w_b - w_spec varies.
-This tool answers the paired question: how does the AC-Stark-shifted iSWAP
-resonance itself move as the SAME spectator is walked across the band?
+Companion to the spectator sweep (run_sweep_zhou.py --sweep spectator): how does
+the AC-Stark-shifted iSWAP resonance move as the same spectator is walked across
+the band, Delta = w_b - w_spec?
 
-For each detuning it builds the full (a, b, coupler, spectator) system with the
-spectator at w_spec = w_b - Delta, drives a CONSTANT pump at the operating |eta|,
-and runs a pump-frequency chevron (find_stark_resonance.scan with spec_abs_GHz) to
-locate the resonance. The spectator's dispersive pull on the a<->b resonance makes
-the located offset vary with Delta, with a feature at the one-pump collision
-Delta = w_p = |w_b - w_a|. The bare (spectator-free) offset is drawn as a baseline
-so the spectator contribution is the gap between the two.
+For each Delta it builds the (a, b, coupler, spectator) system, drives a CONSTANT
+pump at the operating |eta| (the constant-pump full-iSWAP value for t_g, half the
+raised-cosine peak; see find_stark_resonance) and locates the resonance with a
+pump-frequency chevron (find_stark_resonance.scan with spec_abs_GHz). The
+spectator's dispersive pull shows up as the gap to the bare-pair baseline, with a
+feature at the one-pump collision Delta = w_p = |w_b - w_a|.
 
-Physics note: this is a constant-pulse Stark probe (see find_stark_resonance), so
-the amplitude is the constant-pump full-iSWAP |eta| for t_g -- half the raised-
-cosine peak. The probe amplitude is set by the (a, b) pair and is the same at every
-detuning; only the resonance LOCATION moves with the spectator.
-
-Needs QuTiP (it integrates the exact Hamiltonian) -- run on a compute node. Pair
-the resulting figure with plot_results.py's DRAG-vs-frequency panels from the same
-device and --specfreqs for a like-for-like comparison.
+Needs QuTiP -- run on a compute node. Pair the figure with plot_results.py's
+DRAG-vs-frequency panels for the same device and --specfreqs.
 
 Usage
 -----
@@ -37,7 +29,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import json
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -52,38 +43,14 @@ def sweep_detunings(config: Dict[str, Any], detunings_GHz: List[float], t_g: flo
                     window_factor: float, time_points: int,
                     solver: Dict[str, Any], n_jobs: Optional[int],
                     baseline: bool = True) -> Dict[str, Any]:
-    """Locate the Stark-shifted iSWAP resonance at each spectator detuning.
+    """Locate the Stark-shifted iSWAP resonance at each detuning Delta = w_b - w_spec.
 
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration (qubit_freqs_GHz = [w_a, w_b]).
-    detunings_GHz : list of float
-        Spectator detunings Delta = w_b - w_spec (GHz) to scan.
-    t_g : float
-        Operating gate time (ns); sets the constant-pump probe |eta|.
-    amp_scale : float
-        Amplitude-scale correction (1.0 = raw analytic normalization).
-    span_MHz : float
-        Full chevron pump-offset width (MHz), centered on the bare |w_b - w_a|.
-    points : int
-        Number of pump-offset samples per chevron.
-    window_factor : float
-        Chevron time window = window_factor * t_g.
-    time_points : int
-        Time samples across the window.
-    solver : dict
-        QuTiP tolerances (atol, rtol, nsteps).
-    n_jobs : int, optional
-        Worker processes for the per-chevron offset scan.
-    baseline : bool, default True
-        Also compute the spectator-free (bare-pair) offset for reference.
+    t_g (ns) sets the constant-pump probe |eta|; span_MHz is the full chevron
+    offset width centred on the bare |w_b - w_a|; the chevron window is
+    window_factor * t_g. baseline also scans the spectator-free pair.
 
-    Returns
-    -------
-    dict
-        detunings_GHz, w_spec_GHz, stark_offset_MHz [n_det], contrast [n_det],
-        baseline_offset_MHz (float or nan), eta_op, w_p_bare_GHz, t_g_ns.
+    Returns detunings_GHz, w_spec_GHz, stark_offset_MHz [n_det], contrast [n_det],
+    baseline_offset_MHz (float or nan), eta_op, w_p_bare_GHz, t_g_ns.
     """
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     w_p_bare = abs(wb - wa)
@@ -120,20 +87,8 @@ def sweep_detunings(config: Dict[str, Any], detunings_GHz: List[float], t_g: flo
 
 
 def plot_dispersion(npz_path: str, png_path: str) -> None:
-    """Render Stark resonance offset (MHz) vs spectator detuning Delta, with the
-    bare-pair baseline and the one-pump collision Delta = w_p marked.
-
-    Parameters
-    ----------
-    npz_path : str
-        .npz produced by main().
-    png_path : str
-        Output PNG.
-
-    Returns
-    -------
-    None
-    """
+    """Plot Stark resonance offset (MHz) vs Delta from main()'s .npz, with the
+    bare-pair baseline and the one-pump collision Delta = w_p marked."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -211,8 +166,11 @@ def main() -> None:
     os.makedirs(outdir, exist_ok=True)
     config = load_device(resolve_device(args.device))
 
-    amp_scale = float(args.amp_scale if args.amp_scale is not None
-                      else config.get("amp_scale", 1.0))
+    def opt(value, key, default, cast):
+        """CLI value, else the device's, else default."""
+        return cast(value if value is not None else config.get(key, default))
+
+    amp_scale = opt(args.amp_scale, "amp_scale", 1.0, float)
     t_g = args.t_g
     if args.target_eta is not None:
         t_g = target_eta_area(float(config["g3_GHz"]), float(config["lam_a"]),
@@ -221,14 +179,10 @@ def main() -> None:
         t_g = float(config.get("t_g_ns", 200.0))
     t_g = float(t_g)
 
-    span_MHz = float(args.span_MHz if args.span_MHz is not None
-                     else config.get("stark_span_MHz", 60.0))
-    points = int(args.points if args.points is not None
-                 else config.get("stark_points", 21))
-    window_factor = float(args.window_factor if args.window_factor is not None
-                          else config.get("stark_window_factor", 2.0))
-    time_points = int(args.time_points if args.time_points is not None
-                      else config.get("stark_time_points", 120))
+    span_MHz = opt(args.span_MHz, "stark_span_MHz", 60.0, float)
+    points = opt(args.points, "stark_points", 21, int)
+    window_factor = opt(args.window_factor, "stark_window_factor", 2.0, float)
+    time_points = opt(args.time_points, "stark_time_points", 120, int)
     detunings = ([float(x) for x in args.specfreqs.split(",")]
                  if args.specfreqs else list(DEFAULT_SPECFREQS_GHz))
     solver = {"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps}

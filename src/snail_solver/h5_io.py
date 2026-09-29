@@ -1,84 +1,40 @@
 """Nested result documents <-> HDF5, with a JSON fallback for old files.
 
-Why HDF5 for run outputs
-------------------------
-The tools here return one deeply nested document per run -- an operating-point
-record plus a ``stages`` tree that carries every chevron's full offset axis,
-time axis and population traces. Written as JSON that document is a wall of
-decimal text: a single ``tune_up`` sweep is tens of MB of ``0.123456789012``,
-it loses every array's dtype and shape (``np.asarray`` has to guess them back),
-and nothing can read a single chevron out of it without parsing the whole file.
+Run outputs are deeply nested documents (an operating-point record plus a
+``stages`` tree of chevron axes and population traces). As HDF5, arrays stay
+binary with their dtype and shape, are gzip-compressed, and are individually
+addressable (``f["stages/rabi/chevrons/i00003/metric"]``); ``h5ls -r`` browses it.
 
-HDF5 fixes exactly those three things. Arrays stay binary and keep their dtype
-and shape, they are gzip-compressed on the way out (float traces compress ~3-5x),
-and the file is a directory tree -- ``h5ls -r run.h5`` lists every stage, and
-``f["stages/rabi/chevrons/i00003/metric"]`` reads one chevron's envelope without
-touching the rest. That is what makes a directory of runs browsable rather than
-merely stored.
-
-The encoding
-------------
-The mapping is generic (nothing here knows what a chevron is), reversible, and
-chosen so the file reads well in ``h5ls``/HDFView rather than to be clever:
+The encoding is generic and reversible:
 
 ======================  =========================================================
 Python                  HDF5
 ======================  =========================================================
-``dict``                group (keys become members; insertion order is tracked)
-``list`` of scalars     dataset, tagged ``_container="list"`` so it comes back
-                        as a ``list`` and not an ``ndarray``
-``list`` (anything      group tagged ``_container="list"``, with one member (or
-else)                   attribute, for scalar elements) per entry named
-                        ``i00000``, ``i00001``, ... -- sorted on read, so order
-                        survives
+``dict``                group (insertion order tracked)
+``list`` of scalars     dataset tagged ``_container="list"`` (comes back a list)
+``list`` (other)        group tagged ``_container="list"``, one member/attribute
+                        per entry named ``i00000``, ``i00001``, ... (sorted on read)
 ``ndarray``             dataset (gzip for anything sizeable)
-scalars, ``None``       attribute on the parent group; ``None`` is a native HDF5
-                        null (``h5py.Empty``), and a long string spills to its
-                        own dataset rather than blowing the 64 KB attribute limit
-``bytes``               dataset of ``uint8`` tagged ``_container="bytes"`` --
-                        this is what carries a rendered figure
-anything else           ``str(value)`` attribute -- the same last resort
-                        ``json.dump(..., default=...)`` used to take
+scalars, ``None``       attribute on the parent group; ``None`` is ``h5py.Empty``;
+                        a long string spills to its own dataset (64 KB attr limit)
+``bytes``               ``uint8`` dataset tagged ``_container="bytes"`` (figures)
+anything else           ``str(value)`` attribute
 ======================  =========================================================
 
-Scalars living in the PARENT's attributes (rather than as one-element datasets)
-is what keeps the tree legible: ``h5ls -v run.h5/stages/chirp`` shows every
-fitted coefficient at a glance, and only the genuinely large things are datasets.
+Scalars live in the parent's attributes so ``h5ls -v`` shows fitted coefficients
+at a glance; only large things are datasets.
 
-One file, many runs
--------------------
-A group inside a file is addressable as ``file.h5:/group/path`` wherever a path
-is taken, and :func:`save_doc` on such an address APPENDS -- every other run in
-the file is left alone. That is what lets a sweep keep its whole fan-out (the
-summary, and each eta's complete tune-up) in ONE file, while
-``tune_up --replot sweep.h5:/runs/eta1p8`` still replots a single point and reads
-only that group.
-
-Figures live in the run file too
---------------------------------
-A run's figures are the same measurement as its arrays, so they are stored with
-it rather than in a parallel ``figs/`` tree that has to be kept in step by hand:
-:func:`attach_figure` puts each rendered PNG under the run's own ``figures``
-group (``/figures`` for a single run, ``/runs/eta1p8/figures`` inside a sweep
-file), keyed by what it shows -- ``rabi``, ``chirp_ridge``, ``post_chirp``. The
-tools still write the ``--plot`` file on disk as before; the embedded copy is the
-one that travels with the data, so a run file copied off the cluster carries its
-own pictures and cannot be paired with the wrong ones.
-
-They come back out as files with :func:`extract_figures`, or straight from the
-command line::
+A ``file.h5:/group/path`` address is accepted wherever a path is, and
+:func:`save_doc` on one APPENDS, leaving the file's other runs alone -- so a sweep
+keeps its whole fan-out in one file. :func:`attach_figure` embeds rendered figures
+in the run's own ``figures`` group so they travel with the data::
 
     python -m snail_solver.h5_io run.h5                    # what is in there
     python -m snail_solver.h5_io run.h5 --extract figs/    # PNGs back on disk
 
-Reading old runs
-----------------
-:func:`load_doc` sniffs the file's magic number, not its name, so every
-``--replot`` accepts both the HDF5 files written now and every JSON file written
-before -- and a JSON document round-trips through this module unchanged in
-meaning (lists stay lists, ``None`` stays ``None``). :func:`save_doc` dispatches
-on the SUFFIX instead: ``.json`` still writes JSON on request, a bare name gets
-``.h5`` appended, and anything else is HDF5.
+:func:`load_doc` sniffs the magic number (not the name), so HDF5 and old JSON
+files both load. :func:`save_doc` dispatches on the suffix: ``.json`` writes JSON,
+a bare name gets ``.h5``, anything else is HDF5.
 """
 from __future__ import annotations
 
@@ -91,41 +47,28 @@ import numpy as np
 #: Written to every file's root as ``format``; bump when the mapping changes.
 SCHEMA = "snail_solver/nested-1"
 
-#: Suffixes routed to HDF5 by :func:`save_doc`. Everything else that is not
-#: ``.json`` also becomes HDF5 -- this list only documents the usual spellings.
-H5_SUFFIXES = (".h5", ".hdf5", ".he5")
-
 _MAGIC = b"\x89HDF\r\n\x1a\n"
 
-#: Where :func:`attach_figure` keeps a document's rendered figures, relative to
-#: that document's own group.
+#: Where :func:`attach_figure` keeps a document's figures, relative to its group.
 FIGURES_GROUP = "figures"
 
-#: Recorded on each embedded figure so a reader (or a browser) knows what it is.
+#: Recorded on each embedded figure.
 _MIME = {".png": "image/png", ".pdf": "application/pdf", ".svg": "image/svg+xml",
          ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
-#: Attributes the encoding owns. Real keys never start with an underscore
-#: (they are Python identifiers from the result dicts), so this cannot collide.
+#: Attributes the encoding owns (real keys never start with an underscore).
 _RESERVED = ("_container", "_len")
 
-#: Strings longer than this go to a dataset. HDF5 keeps attributes in the object
-#: header, which is capped at 64 KB in the default (non-``latest``) libver; a long
-#: log message or traceback in a result dict would otherwise fail the whole write.
+#: Strings longer than this go to a dataset: attributes live in the object header,
+#: capped at 64 KB in the default libver, so a long traceback would fail the write.
 _MAX_ATTR_STR = 4096
 
-#: Compress datasets from this many elements up. Below it the gzip filter's own
-#: per-chunk overhead is larger than what it saves.
+#: Compress datasets from this many elements up (below it gzip overhead dominates).
 _COMPRESS_FROM = 64
 
 
 def _h5py():
-    """Import h5py, with an actionable message if it is missing.
-
-    It is a hard dependency of this project, but a stale environment (a cluster
-    venv built before it was added) fails here rather than at import time of
-    whichever tool happened to be run.
-    """
+    """Import h5py, with an actionable message for a stale environment."""
     try:
         import h5py
     except ImportError as exc:                                # pragma: no cover
@@ -139,10 +82,8 @@ def _h5py():
 def split_address(target: str) -> tuple:
     """``"run.h5:/runs/eta1p8"`` -> ``("run.h5", "runs/eta1p8")``.
 
-    The separator is ``:/`` rather than a bare ``:`` so an ordinary path is never
-    mistaken for an address -- a colon is legal in a filename, but ``:/`` inside
-    one is not something these tools ever produce. Returns ``(target, None)``
-    when there is no group part.
+    Splits on ``:/`` (not a bare ``:``, which is legal in a filename). Returns
+    ``(target, None)`` when there is no group part.
     """
     text = str(target)
     i = text.rfind(":/")
@@ -160,6 +101,22 @@ def is_hdf5(path: str) -> bool:
         return False
 
 
+def _resolve(path: str, group: Optional[str]) -> tuple:
+    """Split an address; an explicit `group` wins over the address's."""
+    file_path, addr_group = split_address(path)
+    return file_path, group or addr_group
+
+
+def _ensure_parent(path: str) -> None:
+    if os.path.dirname(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+def _stamp_format(fh) -> None:
+    if "format" not in fh.attrs:
+        fh.attrs["format"] = SCHEMA
+
+
 # ===========================================================================
 # writing
 # ===========================================================================
@@ -172,18 +129,10 @@ def _is_scalar(v: Any) -> bool:
 def _flat_kind(seq) -> Optional[str]:
     """``"num"``, ``"str"`` or None -- can this sequence become one dataset?
 
-    Only a homogeneous sequence may: ``np.asarray(["a", 1])`` silently makes an
-    array of STRINGS, which would round-trip ``1`` back as ``"1"``. A sequence
-    holding None cannot either (there is no null in a numeric dataset), so those
-    fall through to the group form, where None is a real HDF5 null.
-
-    A list OF LISTS gets the same treatment when it is rectangular and numeric --
-    which is how a JSON run's population traces arrive, and how they are rebuilt
-    by ``load_doc`` on an old file. One (n_offset, n_time) dataset per trace beats
-    n_offset one-dimensional ones for both size and legibility, and ``tolist()``
-    restores the nested lists exactly. Lists of NDARRAYS deliberately do NOT take
-    this path: stacking them would round-trip each element back as a list, and a
-    caller that reads ``.shape`` off one would break.
+    Only a homogeneous sequence may (``np.asarray(["a", 1])`` would round-trip
+    ``1`` as ``"1"``), and none holding None. A rectangular numeric list OF LISTS
+    also qualifies (JSON-era population traces; ``tolist()`` restores them). Lists
+    of NDARRAYS deliberately do not: each element would come back as a list.
     """
     if len(seq) == 0:
         return None
@@ -202,10 +151,7 @@ def _flat_kind(seq) -> Optional[str]:
 
 
 def _put_attr(grp, key: str, value: Any) -> None:
-    """Store a scalar (or None) as an attribute of `grp`.
-
-    Long strings spill into a dataset instead -- see :data:`_MAX_ATTR_STR`.
-    """
+    """Store a scalar (or None) as an attribute; long strings spill to a dataset."""
     h5py = _h5py()
     if value is None:
         grp.attrs.create(key, h5py.Empty("f"))
@@ -234,11 +180,8 @@ def _put_array(grp, key: str, arr: np.ndarray, *, as_list: bool = False) -> None
 
 
 def _put_bytes(grp, key: str, data: bytes) -> None:
-    """Store an opaque blob (a rendered figure) as a tagged ``uint8`` dataset.
-
-    Deliberately NOT gzipped: PNG and PDF are already compressed, so the filter
-    would spend time to gain nothing.
-    """
+    """Store a blob (a rendered figure) as a tagged ``uint8`` dataset, uncompressed
+    (PNG/PDF already are)."""
     ds = grp.create_dataset(key, data=np.frombuffer(data, dtype=np.uint8))
     ds.attrs["_container"] = "bytes"
     return ds
@@ -289,39 +232,19 @@ def _write_tree(grp, tree: Dict[str, Any]) -> None:
 def save_tree(path: str, tree: Dict[str, Any],
               attrs: Optional[Dict[str, Any]] = None, *,
               group: Optional[str] = None) -> str:
-    """Write a nested document to `path` as HDF5.
+    """Write a nested document to `path` (or a ``file.h5:/group`` address) as HDF5.
 
-    Parameters
-    ----------
-    path : str
-        Output path, or a ``file.h5:/group`` address. The parent directory is
-        created if needed.
-    group : str, optional
-        Write into this group instead of the root, APPENDING to an existing file
-        and replacing only this group. That is how one file holds many runs. Note
-        that HDF5 does not reclaim a replaced group's space, so a file rewritten
-        over and over is worth deleting rather than overwriting.
-    tree : dict
-        The document. Keys must be strings without ``/``; values may be dicts,
-        lists, ndarrays, scalars or None to any depth (see the module docstring).
-    attrs : dict, optional
-        Provenance written to the ROOT group alongside ``format`` -- e.g. the
-        command line, the device, the timestamp. Kept out of `tree` so it can
-        never be mistaken for data by a plotting function.
-
-    Returns
-    -------
-    str
-        The path written.
+    `tree` keys must be strings without ``/``. `attrs` is provenance (command
+    line, device, timestamp) written to the destination group's attributes,
+    kept out of `tree` so it is never mistaken for data. With a `group`, the file
+    is APPENDED to and only that group replaced (HDF5 does not reclaim the old
+    group's space). Returns the address written.
     """
     h5py = _h5py()
-    path, addr_group = split_address(path)
-    group = group or addr_group
-    if os.path.dirname(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+    path, group = _resolve(path, group)
+    _ensure_parent(path)
     with h5py.File(path, "a" if group else "w", track_order=True) as fh:
-        if "format" not in fh.attrs:
-            fh.attrs["format"] = SCHEMA
+        _stamp_format(fh)
         if group:
             if group in fh:
                 del fh[group]                                 # replace, don't merge
@@ -357,8 +280,7 @@ def _read_dataset(ds) -> Any:
     if h5py.check_string_dtype(ds.dtype):
         if ds.shape == ():
             return ds.asstr()[()]
-        out = list(ds.asstr()[...])
-        return out
+        return list(ds.asstr()[...])
     arr = ds[...]
     kind = _read_attr(ds.attrs.get("_container"))
     if kind == "bytes":
@@ -387,17 +309,12 @@ def _read_group(grp) -> Any:
 def load_tree(path: str, *, group: Optional[str] = None) -> Dict[str, Any]:
     """Read a document written by :func:`save_tree` back into nested dicts.
 
-    `path` may be a ``file.h5:/group`` address (or `group` given separately), and
-    then only that group is read -- pulling one run out of a sweep file does not
-    pay for the rest of the file.
-
-    Root provenance attributes (``format`` and whatever `attrs` carried) come
-    back as ordinary top-level keys apart from ``format`` itself, which is
-    dropped -- it describes the file, not the run.
+    With a group (address or `group`), only that group is read. Root provenance
+    attributes come back as top-level keys, except ``format`` (it describes the
+    file, not the run).
     """
     h5py = _h5py()
-    path, addr_group = split_address(path)
-    group = group or addr_group
+    path, group = _resolve(path, group)
     with h5py.File(path, "r") as fh:
         if group is not None and group not in fh:
             raise KeyError(f"{path} has no group {group!r} "
@@ -433,40 +350,20 @@ def _figures_group(fh, addr: Optional[str], *, create: bool):
 
 
 def attach_figure(target: str, name: str, image_path: str) -> str:
-    """Embed a rendered figure into the run file it belongs to.
+    """Embed the rendered file `image_path` into the run file it belongs to.
 
-    The figure and the arrays it was drawn from are the same measurement, so
-    keeping them in one file is what stops a run being paired with someone else's
-    picture three months later. The ``--plot`` file on disk is still written; this
-    is a copy that travels with the data.
-
-    Parameters
-    ----------
-    target : str
-        The run file, or a ``file.h5:/runs/eta1p8`` address -- the figure lands in
-        THAT document's own ``figures`` group, so every run in a sweep file keeps
-        its own. The file is appended to, never truncated.
-    name : str
-        What the figure shows (``rabi``, ``chirp_ridge``, ``post_chirp``), not a
-        filename. Re-attaching under the same name replaces it -- though HDF5 does
-        not reclaim the old bytes, so a file replotted many times is worth running
-        through ``h5repack`` (or simply rewriting) to compact.
-    image_path : str
-        The rendered file to read. Any format; the suffix picks the recorded MIME
-        type.
-
-    Returns
-    -------
-    str
-        The address of the embedded figure.
+    `target` is the run file or a ``file.h5:/runs/eta1p8`` address; the figure
+    lands in that document's own ``figures`` group (file appended, never
+    truncated). `name` says what it shows (``rabi``, ``chirp_ridge``); re-attaching
+    replaces it (old bytes are not reclaimed -- ``h5repack`` to compact). The
+    suffix picks the recorded MIME type. Returns the embedded figure's address.
     """
     h5py = _h5py()
     file_path, addr = split_address(target)
     with open(image_path, "rb") as fh:
         data = fh.read()
     with h5py.File(file_path, "a", track_order=True) as fh:
-        if "format" not in fh.attrs:
-            fh.attrs["format"] = SCHEMA
+        _stamp_format(fh)
         figs = _figures_group(fh, addr, create=True)
         if name in figs:
             del figs[name]                                    # replace, don't merge
@@ -479,12 +376,10 @@ def attach_figure(target: str, name: str, image_path: str) -> str:
 
 
 def attach_figures(target: str, figures: Dict[str, str]) -> int:
-    """Embed several figures at once; returns how many were stored.
+    """Embed several figures; returns how many were stored.
 
-    A figure that cannot be stored -- missing, unreadable, a file another process
-    holds open -- is skipped rather than raised on: it is never worth failing a
-    finished run over, which is the same rule the callers already apply to
-    RENDERING one.
+    A figure that cannot be stored (missing, unreadable, locked) is skipped, never
+    raised: it is not worth failing a finished run over.
     """
     n = 0
     for name, path in (figures or {}).items():
@@ -511,16 +406,8 @@ def figure_names(target: str) -> list:
 
 def extract_figures(target: str, outdir: str = ".",
                     names: Optional[Sequence[str]] = None) -> list:
-    """Write a document's embedded figures back out as files.
-
-    Each keeps the filename it was rendered under, so a directory of extracted
-    runs looks exactly like the ``figs/`` tree the tools write directly.
-
-    Returns
-    -------
-    list of str
-        The paths written, in file order.
-    """
+    """Write a document's embedded figures back out under their original
+    filenames; returns the paths written, in file order."""
     file_path, addr = split_address(target)
     out = []
     if not is_hdf5(file_path):                                # a JSON run has none
@@ -545,11 +432,7 @@ def extract_figures(target: str, outdir: str = ".",
 # format-dispatching front door
 # ===========================================================================
 def resolve_out_path(path: str) -> str:
-    """The path :func:`save_doc` would actually write for this name.
-
-    A bare name (no suffix) gets ``.h5``; every other suffix is left alone. Split
-    out so a CLI can tell the user where its output will land before running.
-    """
+    """The path :func:`save_doc` would write: a bare name gets ``.h5``."""
     root, ext = os.path.splitext(path)
     return path if ext else root + ".h5"
 
@@ -559,45 +442,27 @@ def save_doc(path: str, doc: Dict[str, Any],
              group: Optional[str] = None) -> str:
     """Write `doc` as HDF5, or as JSON if `path` ends in ``.json``.
 
-    The suffix is the whole switch: HDF5 is the default for run outputs, and
-    ``--out something.json`` remains available for a small document that wants
-    to stay human-readable (or to feed a tool that has not been converted).
-
-    With a `group` (or a ``file.h5:/group`` address) the write APPENDS into the
-    file. JSON has no such thing, so asking for a group on a ``.json`` target is
-    an error rather than a silently flattened file.
-
-    Returns
-    -------
-    str
-        The address actually written -- NOT necessarily `path`, since a bare name
-        gains a ``.h5`` and a grouped write returns the full ``file:/group``.
+    With a group (or ``file.h5:/group`` address) the write appends into the file;
+    a group on a ``.json`` target is a ValueError. Returns the address actually
+    written (a bare name gains ``.h5``; a grouped write returns ``file:/group``).
     """
-    file_path, addr_group = split_address(path)
-    group = group or addr_group
+    file_path, group = _resolve(path, group)
     if os.path.splitext(file_path)[1].lower() == ".json":
         if group:
             raise ValueError(
                 f"cannot write group {group!r} into the JSON file {file_path!r}: "
                 f"only HDF5 holds several documents in one file")
-        path = file_path
-        if os.path.dirname(path):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as fh:
+        _ensure_parent(file_path)
+        with open(file_path, "w") as fh:
             json.dump(dict(doc, **(attrs or {})), fh, indent=2, default=_plain)
-        return path
+        return file_path
     return save_tree(resolve_out_path(file_path), doc, attrs=attrs, group=group)
 
 
 def load_doc(path: str, *, group: Optional[str] = None) -> Dict[str, Any]:
-    """Read a document written by :func:`save_doc`, HDF5 or JSON.
-
-    Dispatches on the file's MAGIC NUMBER rather than its suffix, so a run
-    renamed (or an old ``.json`` handed to a ``--replot`` that now defaults to
-    HDF5) still loads. `path` may be a ``file.h5:/group`` address.
-    """
-    file_path, addr_group = split_address(path)
-    group = group or addr_group
+    """Read a document written by :func:`save_doc`, HDF5 or JSON (by magic
+    number, not suffix). `path` may be a ``file.h5:/group`` address."""
+    file_path, group = _resolve(path, group)
     if is_hdf5(file_path):
         return load_tree(file_path, group=group)
     if group:

@@ -2,27 +2,18 @@
 validate_engines.py
 ===================
 
-Measure the batched engine (`jax_engine`) against the QuTiP reference, instead of
-assuming they agree.
+Measure the fast engines against the QuTiP reference instead of assuming they agree.
+Each approximation is justified by numbers:
 
-This exists because two choices in the engine are approximations that must be
-justified by numbers, not by argument:
-
-1. **cutoff_GHz** -- pruning fast carriers is what makes the engine fast, but it
-   is a rotating-wave reduction, not an identity. ``--cutoff-scan`` reports
-   fidelity and ``||U_engine - U_qutip||`` across a range of cutoffs so the
-   production value is chosen from data and the residual error is a REPORTED
-   number.
-2. **precision** -- ``f32`` is mixed (float64 phases, complex64 state). Whether
-   it is worth using is a property of the node, so ``--precision-scan`` reports
-   both the accuracy delta and the measured wall-clock speedup. If the speedup is
-   marginal, the honest answer is to stay on f64.
-
-3. **the reduced model** -- ``grape._propagate`` backs the DEFAULT calibration map
-   and every reduced-scored optimizer path, but had no column here, which is how it
-   went unnoticed that it ignored ``PumpTone.chirp`` outright. ``--reduced-scan``
-   measures it against the same QuTiP reference; with ``--chirp-GHz`` it is the
-   one-command check that all three engines agree on a CHIRPED device.
+1. **cutoff_GHz** -- pruning fast carriers is a rotating-wave reduction.
+   ``--cutoff-scan`` reports fidelity and ``max|U_engine - U_qutip|`` per cutoff, so
+   the production value and its residual error come from data.
+2. **precision** -- ``f32`` is mixed (float64 phases, complex64 state).
+   ``--precision-scan`` reports the accuracy delta and the measured speedup on this
+   node; if the speedup is marginal, stay on f64.
+3. **the reduced model** -- ``grape._propagate`` backs the DEFAULT calibration map and
+   every reduced-scored optimizer path. ``--reduced-scan`` measures it against QuTiP;
+   with ``--chirp-GHz`` it checks all three engines on a CHIRPED device.
 
 Usage
 -----
@@ -42,22 +33,23 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 import numpy as np
 
 TWO_PI = 2.0 * np.pi
 
 
-def _build(args, levels: Optional[List[int]] = None):
-    """A coupler from a device JSON, with optional truncation override."""
+def _build(args):
+    """A coupler from a device JSON; ``--quick`` truncates to 2-level qubits and a
+    3-level coupler."""
     from snail_solver.device_utils import build_coupler, load_device
     from snail_solver.paths import resolve_device
 
     cfg = load_device(resolve_device(args.device))
-    if levels is not None:
+    if args.quick:
         cfg = dict(cfg)
-        cfg["qubit_levels"], cfg["coupler_levels"] = levels[0], levels[1]
+        cfg["qubit_levels"], cfg["coupler_levels"] = 2, 3
     t_g = float(args.t_g_ns if args.t_g_ns is not None else cfg["t_g_ns"])
     chirp = ([float(x) for x in args.chirp_GHz.split(",") if x.strip()]
              if args.chirp_GHz else None)
@@ -80,19 +72,25 @@ def _score(U):
     return ZhouCoupler._iswap_fidelity_from_U(U, True)
 
 
-def cutoff_scan(args) -> None:
-    """Fidelity and ||dU|| vs cutoff_GHz -- the table that picks the production cutoff."""
-    from snail_solver import jax_engine as JE
-
-    levels = [2, 3] if args.quick else None
-    _cfg, cpl, t_g, w_p, eta = _build(args, levels)
+def _print_header_and_reference(args, cpl, t_g, w_p, eta, extra: Optional[str] = None):
+    """Print the device line (+ `extra`), then run and print the QuTiP reference."""
     print(f"device={args.device}  dim={cpl.dim}  t_g={t_g:.3f} ns  w_p={w_p:.6f} GHz  "
           f"|eta|={eta:.4f}")
-
+    if extra is not None:
+        print(extra)
     U_ref, dt_ref = _reference(cpl, t_g, args.atol, args.rtol)
     F_ref, leak_ref = _score(U_ref)
     print(f"reference (QuTiP sesolve, exact): F={F_ref:.10f}  leak={leak_ref:.3e}  "
           f"[{dt_ref:.1f}s]\n")
+    return U_ref, F_ref
+
+
+def cutoff_scan(args) -> None:
+    """Fidelity and ||dU|| vs cutoff_GHz -- the table that picks the production cutoff."""
+    from snail_solver import jax_engine as JE
+
+    _cfg, cpl, t_g, w_p, eta = _build(args)
+    U_ref, F_ref = _print_header_and_reference(args, cpl, t_g, w_p, eta)
 
     cutoffs = [float(x) for x in args.cutoffs.split(",")] if args.cutoffs else \
         [1.0, 2.0, 3.0, 5.0, 10.0, np.inf]
@@ -117,8 +115,7 @@ def precision_scan(args) -> None:
     """f32-mixed vs f64: accuracy delta AND measured speedup, on this node."""
     from snail_solver import jax_engine as JE
 
-    levels = [2, 3] if args.quick else None
-    _cfg, cpl, t_g, _w_p, _eta = _build(args, levels)
+    _cfg, cpl, t_g, _w_p, _eta = _build(args)
     cut = float(args.cutoff)
     print(f"device={args.device}  dim={cpl.dim}  cutoff={cut} GHz  t_g={t_g:.3f} ns")
 
@@ -146,14 +143,13 @@ def batch_scan(args) -> None:
     """Per-point cost vs batch size -- the actual case for the GPU path."""
     from snail_solver import jax_engine as JE
 
-    levels = [2, 3] if args.quick else None
-    _cfg, cpl, t_g, w_p, _eta = _build(args, levels)
+    _cfg, cpl, t_g, w_p, _eta = _build(args)
     eng = JE.build_engine(cpl, cutoff_GHz=float(args.cutoff), precision=args.precision)
     print(f"device={args.device}  dim={cpl.dim}  {eng!r}")
 
     try:
         import jax
-        import jax.numpy as jnp
+        import jax.numpy  # noqa: F401
     except ImportError:
         print("jax not available; skipping batch scan")
         return
@@ -186,32 +182,18 @@ def batch_scan(args) -> None:
 def reduced_scan(args) -> None:
     """The 'reduced' rotating-frame model vs the QuTiP reference -- chirp included.
 
-    This engine had no column here, and that is exactly how it went unnoticed that
-    ``grape._propagate`` ignored ``PumpTone.chirp`` entirely: the reduced model is
-    what backs the DEFAULT calibration map and every reduced-scored optimizer path,
-    yet only qutip-vs-jax was ever measured. Running it under ``--chirp-GHz`` is now
-    a one-command check that all three engines agree on a chirped device.
-
-    Unlike the batched engine, this model has THREE error sources, so the ladder
-    refines all of them together: the carrier cutoff (pruned terms), the
-    piecewise-constant control count ``n_ctrl``, and the fine-step resolution. The
-    pump is sampled through ``cpl._eta`` and then de-chirped, exactly as
-    ``grape._optimize_crab`` does, so the chirp is re-applied by ``_propagate`` on
-    its fine grid rather than held per slice.
+    This model has THREE error sources, refined together by the ladder: the carrier
+    cutoff, the control count ``n_ctrl`` and the fine-step resolution. The pump is
+    sampled through ``cpl._eta`` and de-chirped, as ``grape._optimize_crab`` does, so
+    ``_propagate`` re-applies the chirp on its fine grid.
     """
     from snail_solver import grape
 
-    levels = [2, 3] if args.quick else None
-    _cfg, cpl, t_g, w_p, eta = _build(args, levels)
+    _cfg, cpl, t_g, w_p, eta = _build(args)
     chirp = grape._tone_chirp(cpl)
-    print(f"device={args.device}  dim={cpl.dim}  t_g={t_g:.3f} ns  w_p={w_p:.6f} GHz  "
-          f"|eta|={eta:.4f}")
-    print(f"chirp: {'none' if chirp is None else list(map(float, chirp.coeffs_GHz))}")
-
-    U_ref, dt_ref = _reference(cpl, t_g, args.atol, args.rtol)
-    F_ref, leak_ref = _score(U_ref)
-    print(f"reference (QuTiP sesolve, exact): F={F_ref:.10f}  leak={leak_ref:.3e}  "
-          f"[{dt_ref:.1f}s]\n")
+    U_ref, F_ref = _print_header_and_reference(
+        args, cpl, t_g, w_p, eta,
+        f"chirp: {'none' if chirp is None else list(map(float, chirp.coeffs_GHz))}")
 
     cut = float(args.cutoff)
     terms, H_anh, idx, max_Omega = grape._prepare(cpl, 0, 1, cut)
@@ -227,9 +209,7 @@ def reduced_scan(args) -> None:
     for n_ctrl in ladder:
         res = float(args.carrier_resolution)
         ts = (np.arange(n_ctrl) + 0.5) * (t_g / n_ctrl)
-        eta_ctrl = np.array([complex(cpl._eta(tone, float(t))) for t in ts])
-        if chirp is not None:                      # _eta applies it last -> exact
-            eta_ctrl = eta_ctrl * np.exp(1j * np.asarray(chirp.phase(ts, np)))
+        eta_ctrl = grape._dechirped_samples(cpl, tone, ts)
         n_sub = max(1, int(np.ceil((max_Omega + pad) * (t_g / n_ctrl) / res)))
         t0 = time.time()
         U = grape._propagate(eta_ctrl, t_g, terms, H_anh, idx, n_sub, chirp=chirp)

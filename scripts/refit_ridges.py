@@ -3,24 +3,19 @@
 
     scripts/refit_ridges.py RUN.h5 [RUN2.h5 ...] [--policies a,b,c] [--csv OUT]
 
-READ-ONLY and SOLVES NOTHING. Every number comes from `stages/rabi/chevrons`,
-which the run already wrote for every column -- including the ones that failed,
-because a failed column attaches its partial table to the exception and
-`_write_run` stores it anyway.
+READ-ONLY and SOLVES NOTHING. Every number comes from `stages/rabi/chevrons`, which
+the run wrote for every column -- failed ones too, since a failed column attaches its
+partial table to the exception and `_write_run` stores it.
 
-Why this exists. A column's cost is its Rabi sweep: 91% of a pass-A column's
-wall time on the 2026-09-25 grid, 69% of a pass-B column's. Everything after it
-is numpy. So "would another law have fitted this ridge?" is a two-minute
-question over 189 real columns, while "would another measurement have?" is a
-three-day one. Settle the first before touching the pipeline, and never spend
-the second to answer the first.
+The Rabi sweep is 69-91% of a column's cost (2026-09-25 grid) and everything after it
+is numpy, so "would another law have fitted this ridge?" is minutes over 189 columns,
+while "would another measurement have?" is days. Settle the first before touching the
+pipeline.
 
-The report is the input to a decision, not the decision. r2 rises trivially by
-fitting fewer rows over a shorter range and then extrapolating to eta*, so the
-table prints `extrap` (eta* over the highest drive actually fitted) and `last`
-(the highest kept term against the lowest, at eta*, the generalization of
-`quartic_fraction` whose warn threshold is 0.25) beside it. A law is only
-usable when all three are good.
+r2 rises trivially by fitting fewer rows over a shorter range and extrapolating to
+eta*, so the table also prints `extrap` (eta* over the highest drive fitted) and
+`last` (highest kept term over the lowest at eta*; generalizes `quartic_fraction`,
+warn 0.25). A law is only usable when all three are good.
 """
 from __future__ import annotations
 
@@ -39,19 +34,15 @@ from snail_solver import ridge_refit as RR          # noqa: E402
 #: `r2_min` in `rabi_shift_table`, and `quartic_warn` in `run_tune_up`.
 R2_MIN = 0.9
 LAST_TERM_WARN = 0.25
-#: eta* is inside the measured rows when this is <= 1. Anything above is the
-#: law being read outside the data that produced it, which no r2 can detect.
+#: eta* is inside the measured rows when this is <= 1; above it the law is read
+#: outside the data that produced it, which no r2 can detect.
 EXTRAP_MAX = 1.0
 
 
 def scan_context(path: str) -> Dict[str, Any]:
-    """The config and probe settings the run was made under.
-
-    Rebuilt from the file rather than re-specified on the command line, so a
-    report cannot silently describe a different device from the one measured.
-    Only the ENVELOPE matters here -- the probe moments depend on the pulse
-    shape and nothing else -- but the whole settings dict is carried so the
-    report can print what it assumed.
+    """The config and probe settings the run was made under, rebuilt from the file so
+    a report cannot describe a different device from the one measured. Only the
+    ENVELOPE affects the probe moments; the settings are carried for printing.
     """
     from snail_solver.h5_io import load_tree, split_address
     from snail_solver.sweep_common import DEFAULT_CONFIG
@@ -63,12 +54,10 @@ def scan_context(path: str) -> Dict[str, Any]:
 
     cfg = dict(DEFAULT_CONFIG)
     cfg.update({k: v for k, v in device.items() if k in DEFAULT_CONFIG})
-    # `--envelope-m` is a SCAN setting, not a device property, and pass A's
-    # baseline is only a baseline because it was pinned to 3. Prefer it over
-    # whatever the device file happened to carry.
+    # `--envelope-m` is a SCAN setting (pass A's baseline is pinned to 3), so it wins
+    # over whatever the device file carried.
     if settings.get("envelope_m") is not None:
         cfg["envelope_m"] = int(settings["envelope_m"])
-        cfg.setdefault("envelope", "sine_power")
         if not str(cfg.get("envelope") or "").strip():
             cfg["envelope"] = "sine_power"
     etas = np.atleast_1d(np.asarray(scan.get("target_etas", [1.3]), dtype=float))
@@ -204,11 +193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     summarize(all_rows, policies)
 
     if args.csv:
-        keys: List[str] = []
-        for r in all_rows:
-            for k in r:
-                if k not in keys:
-                    keys.append(k)
+        keys = list(dict.fromkeys(k for r in all_rows for k in r))
         with open(args.csv, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=keys)
             w.writeheader()

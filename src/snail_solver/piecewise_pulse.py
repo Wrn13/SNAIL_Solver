@@ -7,23 +7,16 @@ into three Hamiltonians played back to back::
     H_flat   on [t_r, t_g - t_r]      |eta| = eta_flat, constant
     H_ramp~  on [t_g - t_r, t_g]      the rise mirrored, eps(t_g - t) = eps(t)
 
-and the state at the end of each is handed to the next. On the plateau the drive
-is constant, so its AC-Stark shift is STATIC: with the carrier parked on the
-Stark-shifted resonance at ``eta_flat`` (no chirp at all), ``H_flat`` is the
-post-Stark-shifted Hamiltonian -- what a perfect chirp leaves behind. Anything that
-still pulls population away on the plateau is a frequency collision that no chirp
-can remove, and the ramps are only the transients that prepare its input state.
+each handing its final state to the next. On the plateau the AC-Stark shift is
+STATIC, so with the carrier parked on the Stark-shifted resonance at ``eta_flat``
+(no chirp) ``H_flat`` is what a perfect chirp leaves behind: anything still pulling
+population away there is a frequency collision no chirp can remove.
 
-Why "mirrored", not time-reversed
----------------------------------
-Every term of the Hamiltonian carries its own carrier ``e^{-i Omega t}`` in the
-bare-mode interaction frame (:meth:`ZhouCoupler.expand_terms`), so a literal
-``H(t_g - t)`` would flip every carrier phase: it is not a pulse anyone can play.
-Only the ENVELOPE is mirrored. All three segments are therefore windows of ONE
-Hamiltonian in absolute time, and :func:`evolve_piecewise` over the three windows
-is the single-shot solve exactly -- which the tests pin.
-
-This module only imports the pipeline; it never changes it.
+Only the ENVELOPE is mirrored, not time-reversed: every term carries its own carrier
+``e^{-i Omega t}`` (:meth:`ZhouCoupler.expand_terms`), so a literal ``H(t_g - t)``
+is not a playable pulse. The three segments are windows of ONE Hamiltonian in
+absolute time, and :func:`evolve_piecewise` over them equals the single-shot solve
+exactly (pinned by the tests). This module only imports the pipeline.
 """
 from __future__ import annotations
 
@@ -48,9 +41,8 @@ CATEGORY_CHANNEL = {"coupler": "P_coupler", "spectator": "P_spectator",
 def segment_bounds(env) -> List[Tuple[float, float]]:
     """``[(0, t_r), (t_r, t_g - t_r), (t_g - t_r, t_g)]`` for a flat-top envelope.
 
-    A shape with no plateau (``t_rise = t_g/2``, or any non-ramp envelope) returns a
-    zero-length middle window rather than raising, so the same code reads a Hann
-    gate as "all transient".
+    With no plateau (``t_rise = t_g/2``, or a non-ramp envelope) the middle window
+    has zero length, so a Hann gate reads as "all transient".
     """
     t_g = float(env.t_g)
     t_r = float(getattr(env, "t_rise", t_g / 2.0))
@@ -88,8 +80,7 @@ def evolve_piecewise(cpl, state0: np.ndarray, bounds: Sequence[Tuple[float, floa
     Parameters
     ----------
     cpl : ZhouCoupler
-        Pumped coupler. ONE Hamiltonian is built and every window is a slice of it
-        in absolute time -- see the module docstring for why.
+        Pumped coupler; every window is a slice of its ONE Hamiltonian.
     state0 : ndarray
         A ket, shape ``(dim,)``, or a density matrix, shape ``(dim, dim)``.
     bounds : sequence of (t0, t1)
@@ -99,8 +90,7 @@ def evolve_piecewise(cpl, state0: np.ndarray, bounds: Sequence[Tuple[float, floa
         (the plateau, for its spectrum). Others keep ~5 ns chunks.
     c_ops : sequence of Qobj, optional
         Collapse operators (``open_system.collapse_ops``). Given, every window runs
-        ``mesolve`` and the hand-off is a density matrix; otherwise ``sesolve``, and a
-        ket is handed on (``rho = |psi><psi|`` is exact for a closed system).
+        ``mesolve`` and hands on a density matrix; otherwise ``sesolve`` and a ket.
 
     Returns
     -------
@@ -123,9 +113,8 @@ def evolve_piecewise(cpl, state0: np.ndarray, bounds: Sequence[Tuple[float, floa
     for k, (t0, t1) in enumerate(bounds):
         tl = _tlist(t0, t1, dt_out.get(k))
         if t1 - t0 <= 0.0:                       # empty window: nothing happens
-            arr = np.asarray([boundary[-1]])
             times.append(np.array([float(t0)]))
-            states.append(arr)
+            states.append(np.asarray([boundary[-1]]))
             boundary.append(boundary[-1])
             continue
         if open_system:
@@ -165,9 +154,8 @@ def channel_populations(cpl, states: np.ndarray, init: Sequence[int],
                         ) -> Dict[str, np.ndarray]:
     """``find_stark_resonance.population_channels`` for kets OR density matrices.
 
-    That function only ever reads ``|psi|^2``, so it is fed ``sqrt(p)`` -- whose
-    square is the diagonal of rho exactly -- rather than a second copy of its
-    channel definitions. Returns ``{channel: array over time}``.
+    That function only reads ``|psi|^2``, so it is fed ``sqrt(p)`` (whose square is
+    exactly diag(rho)). Returns ``{channel: array over time}``.
     """
     p = probabilities(states, is_rho=is_rho)
     arr = population_channels(cpl, np.sqrt(np.clip(p, 0.0, None)), init, tgt)
@@ -178,20 +166,17 @@ def project_computational(cpl, state: np.ndarray, occupations: Sequence[Sequence
                           ) -> np.ndarray:
     """`state` restricted to the listed BARE Fock states and renormalized.
 
-    Starting the plateau from this is a SUDDEN switch-on of ``H_flat``: the
-    projection strips the adiabatic dressing the ramp built, so the plateau then
-    rings at every collision's ``W_j`` with the sudden-switch amplitude. That is the
-    plateau's intrinsic collision fingerprint, independent of ramp shape -- but it is
-    NOT a "clean" reference for ramp contamination (an adiabatic ramp hands over a
-    dressed state, which rings far less). Use a slow-ramp run for that.
+    Starting the plateau from this is a SUDDEN switch-on of ``H_flat``: it strips the
+    ramp's adiabatic dressing, so the plateau rings at every collision's ``W_j`` --
+    its intrinsic fingerprint. It is NOT a clean reference for ramp contamination (an
+    adiabatic ramp hands over a dressed state that rings far less); use a slow ramp.
     """
     idx = [cpl.fock_index(list(o)) for o in occupations]
     s = np.asarray(state, dtype=complex)
+    out = np.zeros_like(s)
     if s.ndim == 1:
-        out = np.zeros_like(s)
         out[idx] = s[idx]
         return out / np.linalg.norm(out)
-    out = np.zeros_like(s)
     out[np.ix_(idx, idx)] = s[np.ix_(idx, idx)]
     return out / np.real(np.trace(out))
 
@@ -202,11 +187,10 @@ def project_computational(cpl, state: np.ndarray, occupations: Sequence[Sequence
 def plateau_t_g(config: Dict[str, Any], eta_flat: float, t_rise_ns: float) -> float:
     r"""Gate length that is a full iSWAP at plateau drive `eta_flat`.
 
-    A sine-power ramp is point-symmetric about its midpoint
-    (``R(t_r - s) = 1 - R(s)``), so each ramp holds exactly half its rectangle and
-    the area is ``eta_flat (t_g - t_r)``. Pinning it to the iSWAP area ``A`` gives
-    ``t_g = A/eta_flat + t_r``. At fixed ramp time this makes plateau amplitude and
-    plateau length ONE knob: ``t_flat = A/eta_flat - t_r``.
+    A sine-power ramp is point-symmetric (``R(t_r - s) = 1 - R(s)``), so the area is
+    ``eta_flat (t_g - t_r)``; pinning it to the iSWAP area ``A`` gives
+    ``t_g = A/eta_flat + t_r``. At fixed ramp time, plateau amplitude and length are
+    ONE knob: ``t_flat = A/eta_flat - t_r``.
     """
     from snail_solver.tune_up import _area
     t_g = _area(config) / float(eta_flat) + float(t_rise_ns)
@@ -230,11 +214,10 @@ def build_plateau_gate(config: Dict[str, Any], eta_flat: float, t_rise_ns: float
                        t_g_ns: Optional[float] = None):
     """A flat-top iSWAP at plateau drive `eta_flat`, carrier fixed, no chirp, no DRAG.
 
-    Built through the pipeline's own ``device_utils.build_coupler`` (iSWAP-area
-    normalization, anharmonicity, truncation) on a COPY of `config` whose envelope is
-    a sine-power ramp with the requested rise. `t_g_ns` overrides the area-derived
-    length; the amplitude is then still held at `eta_flat`, so the gate over- or
-    under-rotates -- that is for probing, not for scoring.
+    Built through ``device_utils.build_coupler`` on a COPY of `config` whose envelope
+    is a sine-power ramp with the requested rise. `t_g_ns` overrides the area-derived
+    length while holding the amplitude at `eta_flat`, so the gate then mis-rotates --
+    for probing, not scoring.
 
     Returns ``(cpl, t_g, cfg)``.
     """
@@ -262,28 +245,22 @@ def predict_plateau_channels(cpl, t_g_ns: float, *, window_GHz: float = 1.0,
                              min_g_MHz: float = 0.05) -> List[Dict[str, Any]]:
     r"""Every collision of the post-Stark plateau Hamiltonian, with its two-level fate.
 
-    The audit (``spectator_audit.interaction_channels``) evaluated on `cpl` -- whose
-    peak IS the plateau drive -- gives each process's coupling `g` and its detuning
-    from the pump that is actually playing. The pump sits on the dressed target, so
-    the audit's detuning already carries the target's Stark shift through the
-    carrier; the channel's OWN levels shift too, and ``level_stark_shifts`` supplies
-    that (second order, so only a guide once ``g/|Delta| ~ 1``)::
+    ``spectator_audit.interaction_channels`` on `cpl` (whose peak IS the plateau
+    drive) gives each process's coupling `g` and detuning ``det_j`` from the playing
+    pump; since the pump sits on the dressed target, ``det_j`` already carries the
+    target's Stark shift. The channel's OWN levels shift too (``level_stark_shifts``,
+    second order)::
 
         Delta_j = det_j - [dE(f) - dE(i)]          (pump minus transition, MHz)
 
-    The second-order dressing is only a guide: next to a strong collision
-    (``g/|Delta| ~ 0.3-1``, e.g. the qubit-A subharmonic near ``delta ~ 0``) it is
-    badly wrong, and the measured plateau lines follow the audit's own detuning
-    (which already carries the measured target shift through the carrier) far
-    better. ``W_MHz`` therefore uses ``det_j``; ``W_dressed_MHz`` keeps the dressed
-    variant, and :func:`match_lines` accepts either.
+    That dressing is badly wrong next to a strong collision (``g/|Delta| ~ 0.3-1``),
+    where the measured lines follow ``det_j`` far better. So ``W_MHz`` uses ``det_j``
+    and ``W_dressed_MHz`` the dressed variant; :func:`match_lines` accepts either.
 
-    A two-level process ``H = [[0, g], [g, Delta]]`` switched on suddenly moves
-    population ``P = 4g^2/W^2 sin^2(pi W t)`` with ``W = sqrt(Delta^2 + 4 g^2)``. `W`
-    is the line the plateau trajectory should show, and ``W t_flat`` an integer is a
-    full return. Adiabatic ramps suppress the oscillation and leave only the static
-    dressing ``~ (g/Delta)^2``, which the down-ramp undoes -- so a strong line on the
-    plateau is itself a measure of how non-adiabatic the ramp was.
+    A suddenly switched two-level process ``[[0, g], [g, Delta]]`` moves
+    ``P = 4g^2/W^2 sin^2(pi W t)``, ``W = sqrt(Delta^2 + 4 g^2)``: `W` is the line the
+    plateau should show. Adiabatic ramps leave only the static dressing
+    ``~ (g/Delta)^2``, so a strong plateau line measures how non-adiabatic the ramp was.
     """
     from snail_solver.spectator_audit import interaction_channels, level_stark_shifts
 
@@ -298,13 +275,12 @@ def predict_plateau_channels(cpl, t_g_ns: float, *, window_GHz: float = 1.0,
         det = float(r["detuning_MHz"])
         dressed = det - (dE[f] - dE[i])
         W = float(np.hypot(det, 2.0 * g))
-        W_dressed = float(np.hypot(dressed, 2.0 * g))
         out.append({
             "name": r["name"], "category": r["category"], "n_pump": int(r["n_pump"]),
             "i_index": i, "f_index": f, "i_occ": cpl.decode_index(i),
             "f_occ": cpl.decode_index(f), "g_MHz": g, "detuning_MHz": det,
             "dressed_detuning_MHz": float(dressed), "W_MHz": W,
-            "W_dressed_MHz": W_dressed,
+            "W_dressed_MHz": float(np.hypot(dressed, 2.0 * g)),
             "P_max": float(4.0 * g * g / W ** 2) if W > 0 else 1.0,
             "g_over_det": float(g / max(abs(dressed), 1e-9)),
             "channel": CATEGORY_CHANNEL.get(r["category"], "P_leak"),
@@ -319,10 +295,9 @@ def matrix_pencil(t: np.ndarray, y: np.ndarray, *, order: Optional[int] = None,
                   rel_sv: float = 1e-3, pencil_frac: float = 0.4) -> List[Dict[str, float]]:
     """Frequencies, dampings and amplitudes of ``y(t) = sum_k a_k e^{s_k t}``.
 
-    Hua & Sarkar's matrix pencil. Chosen over an FFT because the plateau is only
-    ~50-100 ns: an FFT resolves no better than ``1/t_flat`` ~ 10-20 MHz, which cannot
-    split a 30 MHz subharmonic from its neighbours, while the pencil's resolution is
-    set by SNR, and these trajectories are noise-free to the solver tolerance.
+    Hua & Sarkar's matrix pencil, not an FFT: on a ~50-100 ns plateau an FFT resolves
+    only ``1/t_flat`` ~ 10-20 MHz, while the pencil's resolution is set by SNR and
+    these trajectories are noise-free to solver tolerance.
 
     Returns the positive-frequency components, strongest first, as
     ``{f_MHz, damping_per_us, amplitude}`` (``amplitude`` is the peak-to-peak/2 of the
@@ -340,8 +315,7 @@ def matrix_pencil(t: np.ndarray, y: np.ndarray, *, order: Optional[int] = None,
     M = int(order) if order is not None else int(np.sum(s > rel_sv * s[0]))
     M = max(1, min(M, L))
     V = Vh[:M].conj().T
-    V1, V2 = V[:-1], V[1:]
-    z = np.linalg.eigvals(np.linalg.pinv(V1) @ V2)
+    z = np.linalg.eigvals(np.linalg.pinv(V[:-1]) @ V[1:])
     # a pole that grows (or dies) by more than e^20 over the record is a fit
     # artefact, and its powers would overflow the Vandermonde solve below
     z = z[np.isfinite(z) & (np.abs(np.log(np.abs(z) + 1e-300)) * N < 20.0)]
@@ -369,15 +343,15 @@ def match_lines(lines: Sequence[Dict[str, float]], predicted: Sequence[Dict[str,
                 ) -> List[Dict[str, Any]]:
     """Pair each measured line with the nearest predicted ``W_j``.
 
-    Prefers channels whose category deposits into `channel`; an unmatched strong line
-    is reported as such -- it is a process the audit does not list (higher order,
-    outside the window, or a truncation artefact).
+    Prefers channels whose category deposits into `channel`. An unmatched strong line
+    is a process the audit does not list (higher order, outside the window, or a
+    truncation artefact).
     """
+    cands = [p for p in predicted if p["category"] != "target"]
     out = []
     for ln in lines:
         if ln["amplitude"] < min_amp:
             continue
-        cands = [p for p in predicted if p["category"] != "target"]
         best, best_d = None, np.inf
         for p in cands:
             d = min(abs(p["W_MHz"] - ln["f_MHz"]),
@@ -403,18 +377,16 @@ def match_lines(lines: Sequence[Dict[str, float]], predicted: Sequence[Dict[str,
 class PlateauPhaseMod:
     r"""Phase modulation ``Phi(t) = A w(t) sin(w_m (t - t_r))`` confined to the plateau.
 
-    Duck-types :class:`envelope.Chirp` (``phase``, ``detuning``, ``detuning_jet``,
-    ``is_trivial``, parameter vector), so ``ZhouCoupler._eta_at`` plays it as the
-    tone's chirp unchanged: ``eta -> eta e^{-i Phi(t)}``. A term carrying `k` pump
-    quanta then sees ``e^{-i k Phi}``, i.e. it is split into sidebands at
-    ``k w_m`` multiples weighted by ``J_n(k A)`` -- a channel whose collision sits
-    ``n w_m`` away from a sideband is moved, and one with ``J_0(k A) = 0`` loses its
-    carrier line. The target is one-pump, so it is suppressed by ``J_0(A)`` too:
-    that is the price, and :func:`build_plateau_gate` does not re-normalize for it.
+    Duck-types :class:`envelope.Chirp`, so ``ZhouCoupler._eta_at`` plays it as the
+    tone's chirp: ``eta -> eta e^{-i Phi(t)}``. A term carrying `k` pump quanta sees
+    ``e^{-i k Phi}``, i.e. sidebands at multiples of ``w_m`` weighted by ``J_n(k A)``;
+    a channel with ``J_0(k A) = 0`` loses its carrier line. The one-pump target is
+    suppressed by ``J_0(A)`` too, and :func:`build_plateau_gate` does not
+    re-normalize for it.
 
     ``w(t)`` is 0 on the ramps and rises as a sine-power ramp (order `m`) over
-    `edge_ns` inside each end of the plateau, so ``Phi`` is continuous through its
-    `m`-th derivative and the ramps are exactly the un-modulated ones.
+    `edge_ns` inside each end of the plateau, so ``Phi`` is C^m and the ramps are
+    exactly the un-modulated ones.
     """
 
     def __init__(self, A_rad: float, f_m_GHz: float, t_rise_ns: float, t_g_ns: float,
@@ -441,15 +413,10 @@ class PlateauPhaseMod:
     def coeffs_GHz(self) -> np.ndarray:           # only read by error messages
         return np.array([self.A, self.f_m_GHz])
 
-    # -- window w(t) and its derivatives -----------------------------------
     def _window_jet(self, t, order: int, xp):
-        """``w, w', ..., w^(order)``: 0 on the ramps, a sine-power rise over `edge`,
-        1, and the mirrored fall.
-
-        The window IS a :class:`envelope.SinePowerRamp` over the plateau, so its first
-        `m` derivatives vanish at both ends and ``delta = Phi'`` stays smooth through
-        ``delta^(m-1)`` -- a ``sin^2`` edge is only C^1 and puts a step in ``delta'``.
-        """
+        """``w, w', ..., w^(order)``: a :class:`envelope.SinePowerRamp` over the plateau,
+        so ``delta = Phi'`` is smooth through ``delta^(m-1)`` (a ``sin^2`` edge would
+        put a step in ``delta'``)."""
         t = xp.asarray(t)
         return list(self._window.jet_at(t - self.t_r, order, xp))
 

@@ -3,31 +3,23 @@
 find_stark_resonance.py
 =======================
 
-Locate the AC-Stark-shifted iSWAP resonance so the pump can be driven at the
-frequency that actually closes the swap, rather than the bare guess
-w_p = |w_b - w_a|.
+Locate the AC-Stark-shifted iSWAP resonance, so the pump is driven at the frequency
+that actually closes the swap rather than the bare w_p = |w_b - w_a|.
 
-Why this is needed
-------------------
-The pump does not only activate the a<->b exchange; through the SNAIL non-linearity
-it also AC-Stark shifts the two qubits (and dresses the coupler) by an amount that
-grows with the pump photon number |eta|^2. The resonance therefore moves to
+Through the SNAIL non-linearity the pump also Stark-shifts the qubits (and dresses
+the coupler) by an amount ~ |eta|^2, moving the resonance to
 
-    w_p^res = |w_b - w_a| + Delta_Stark(eta),   Delta_Stark = differential shift,
+    w_p^res = |w_b - w_a| + Delta_Stark(eta),   Delta_Stark = differential shift.
 
-so a pump placed at the bare |w_b - w_a| sits at a residual detuning delta, which
-caps the achievable transfer at g_eff^2 / (g_eff^2 + delta^2) and injects coherent
-error. This tool reproduces the hardware chevron calibration: it holds a CONSTANT
-pump at the operating |eta| and sweeps the pump-frequency offset (and time),
-records the |01>->|10> exchange, and returns the offset that maximises the swap
-contrast -- i.e. the Stark-shifted resonance. Feed the reported offset back into
-run_sweep_zhou / calibrate as ``wp_offset_GHz``.
+A pump at the bare frequency sits at a residual detuning delta, capping transfer at
+g_eff^2 / (g_eff^2 + delta^2). This tool reproduces the hardware chevron: a
+CONSTANT pump at the operating |eta|, swept in pump offset and time, recording the
+|01> -> |10> exchange; the contrast-maximising offset is the resonance. Feed it back
+as ``wp_offset_GHz``.
 
-The scan uses a constant (not raised-cosine) pump on purpose: the classic chevron
-is an amplitude-independent frequency measurement -- on resonance the exchange
-reaches full contrast regardless of whether the pi/2 amplitude is perfectly
-calibrated, so the vertex locates the frequency cleanly. Anharmonicity and the
-configured qutrit levels are included (they shift the resonance too).
+The constant pump is deliberate: on resonance the exchange reaches full contrast
+whatever the amplitude calibration, so the vertex locates the frequency cleanly.
+Anharmonicity and qutrit levels are included (they shift the resonance too).
 
 Usage
 -----
@@ -35,9 +27,8 @@ Usage
         --span-MHz 60 --points 41 --out stark.npz --plot stark.png
     python -m snail_solver.find_stark_resonance --device dev.json --t-g 200 --amp-scale 0.9 --jobs 16
 
-`dev.json` is the run_sweep_zhou schema (merged over its DEFAULT_CONFIG). QuTiP is
-required (the scan integrates the exact Hamiltonian); the resonance-location logic
-(`locate_resonance`) is pure numpy and unit-testable without QuTiP.
+`dev.json` is the run_sweep_zhou schema. The scan needs QuTiP; `locate_resonance`
+is pure numpy.
 """
 
 from __future__ import annotations
@@ -46,7 +37,7 @@ import argparse
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -59,29 +50,12 @@ TWO_PI: float = 2.0 * np.pi
 # Coupler at a fixed (constant) pump strength held over the whole window
 # ---------------------------------------------------------------------------
 def operating_eta(config: Dict[str, Any], t_g: float, amp_scale: float) -> float:
-    """Constant-pump |eta| that performs a full iSWAP in t_g (then scaled by
-    amp_scale). The Stark chevron is a CONSTANT pulse, so the probe amplitude is
-    the constant-pulse operating point -- not the raised-cosine peak:
+    """Constant-pump |eta| for a full iSWAP in t_g (ns), times amp_scale:
 
         eta = (pi/2) / (6 (2pi g3) la lb t_g) .
 
-    For a raised-cosine gate of the same t_g this is exactly half the RC peak, and
-    is a better single-amplitude proxy for that gate's pulse-averaged Stark shift
-    (Hann <eta^2> = 0.375 eta_peak^2, vs eta_peak^2 at the peak) than the peak is.
-
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    t_g : float
-        Operating gate time (ns).
-    amp_scale : float
-        Amplitude-scale correction from a prior amplitude calibration.
-
-    Returns
-    -------
-    float
-        Constant-pump operating |eta|.
+    This is half the raised-cosine peak for the same t_g, and a better proxy for
+    that gate's pulse-averaged Stark shift (Hann <eta^2> = 0.375 eta_peak^2).
     """
     from snail_solver.device_utils import build_coupler
     sub = dict(config)
@@ -99,65 +73,23 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                           chirp_coeffs_GHz: Optional[Sequence[float]] = None,
                           drag_n_pump: int = 1,
                           drag_channels=None):
-    """(a, b, coupler[, spectator]) system driven by a probe pump, with the pump
-    frequency offset from |w_b - w_a| by wp_offset_GHz. Anharmonicity / qutrit
-    levels are included.
+    """(a, b, coupler[, spectator]) system driven by a probe pump at
+    |w_b - w_a| + wp_offset_GHz. Returns ``(ZhouCoupler, w_p_GHz)``.
 
-    Two probe shapes:
-      * ``shape="constant"`` (default) -- a CONSTANT pump of peak |eta| = eta_op
-        held over [0, window_ns]. Amplitude-robust; it has d eta/dt = 0, so it
-        cannot see the DRAG-quadrature Stark shift.
-      * ``shape="gate"`` (alias ``"raised_cosine"``) -- the ACTUAL gate pulse: a
-        full iSWAP over [0, t_g_ns] in the envelope ``config["envelope"]`` selects,
-        normalized on (a, b) and scaled by amp_scale, with the DRAG
-        quadrature applied when ``drag_beat_GHz`` is given (tuned to that beat).
-        This DOES carry the DRAG-quadrature shift, so the located resonance is the
-        DRAG-ON resonance.
+    * ``shape="constant"``: pump of |eta| = eta_op held over [0, window_ns].
+      Amplitude-robust, but d eta/dt = 0 makes it blind to the DRAG-quadrature shift.
+    * ``shape="gate"`` / ``"raised_cosine"``: the actual gate -- a full iSWAP over
+      t_g_ns in ``config["envelope"]``, normalized on (a, b), scaled by amp_scale,
+      with DRAG tuned to ``drag_beat_GHz`` (delta = Delta - w_p) if given, so the
+      located resonance is the DRAG-on one.
 
-    With ``spec_abs_GHz`` given, a 4th spectator mode is added at that ABSOLUTE
-    frequency (participation lam_b, ``spec_levels`` levels, ``anharm_spec_GHz``).
+    ``spec_abs_GHz`` adds a 4th spectator mode at that ABSOLUTE frequency
+    (participation lam_b, ``spec_levels``, ``anharm_spec_GHz``).
 
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    eta_op : float
-        Constant pump strength |eta| (used only for ``shape="constant"``).
-    wp_offset_GHz : float
-        Offset added to the bare pump frequency w_b - w_a (GHz).
-    window_ns : float
-        Evolution window (ns); for the constant shape the pump is held over it.
-    spec_abs_GHz : float, optional
-        Spectator ABSOLUTE frequency (GHz). None -> no spectator (bare pair).
-    shape : str, default "constant"
-        "constant" or "raised_cosine".
-    t_g_ns : float, optional
-        Gate time (ns) for the raised-cosine pulse; required if shape="raised_cosine".
-    drag_beat_GHz : float, optional
-        DRAG beat detuning delta = Delta - w_p (GHz). If given (raised-cosine only),
-        apply the first-order DRAG quadrature tuned to it.
-    amp_scale : float, default 1.0
-        Amplitude-scale correction applied after the full-iSWAP normalization
-        (raised-cosine only).
-    chirp_coeffs_GHz : sequence of float, optional
-        Legendre coefficients of the gate's pump chirp delta(t) (GHz), raised-cosine
-        only. Pass the chirp the GATE actually runs with, so the located resonance is
-        the RESIDUAL offset on top of it. Omitting it on a chirped device
-        double-counts the chirp's mean component c0 -- the probe would measure the
-        un-chirped resonance, which the caller then writes into ``wp_offset_GHz``
-        while the gate ALSO applies c0. See :class:`envelope.Chirp`.
-
-    Raises
-    ------
-    ValueError
-        If a chirp is given with ``shape="constant"``: a chirp is defined on the
-        normalized gate time u = 2t/t_g - 1, and the constant probe has no gate to
-        normalize against. Use ``shape="raised_cosine"`` to measure a chirped gate.
-
-    Returns
-    -------
-    (ZhouCoupler, float)
-        The coupler and its pump frequency w_p (GHz).
+    ``chirp_coeffs_GHz`` (gate shape only) must be the chirp the gate runs with, so
+    the located offset is the RESIDUAL on top of it; omitting it double-counts c0
+    (see :class:`envelope.Chirp`). A nonzero chirp on the constant probe raises
+    ValueError: a chirp lives on u = 2t/t_g - 1, and there is no gate to normalize to.
     """
     from snail_solver.envelope import envelope_from_config
     from snail_solver.zhou_coupler import (ZhouCoupler, PumpTone, ConstantPulse,
@@ -188,14 +120,9 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                       anharmonicities_GHz=anharm)
 
     if shape in ("gate", "raised_cosine"):
-        # The actual gate pulse: a full iSWAP over t_g, DRAG tuned to the beat.
-        # Built exactly as run_sweep_zhou.build_point does (normalize then scale).
-        #
-        # The envelope comes from the CONFIG, not from a hardcoded RaisedCosine. This
-        # probe's whole claim is that it is the pulse being calibrated, and on a
-        # sine_power device (which recursive DRAG requires past one channel) a Hann
-        # probe is a different pulse -- the same trap chirp_from_measured_shift
-        # already guards against. Bit-identical for a raised_cosine device.
+        # Built as run_sweep_zhou.build_point does (normalize then scale). The
+        # envelope comes from the config: on a sine_power device a Hann probe would
+        # be a different pulse than the one being calibrated.
         t_g = float(t_g_ns if t_g_ns is not None else window_ns)
         env = envelope_from_config(config, t_g, amp=1.0)
         tone = PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
@@ -241,39 +168,16 @@ CHANNELS: Tuple[str, ...] = ("P01", "P10", "P_leak", "P_f_a", "P_f_b",
 
 def population_channels(cpl, states: np.ndarray, init: Sequence[int],
                         tgt: Sequence[int]) -> np.ndarray:
-    """Where the population actually is, per output time. Shape ``[len(CHANNELS), n_time]``.
+    """Population per channel and output time, shape ``[len(CHANNELS), n_time]``.
 
-    The chevron's two-level lineshape is an ASSUMPTION: peak transfer
-    ``Omega^2/(Omega^2+delta^2)`` holds only if population leaving ``|01>`` can
-    only arrive at ``|10>``. Every trajectory here is already a full multi-mode
-    Fock-space solve, so the population that violates that assumption is sitting
-    unread in the state vector. This reads it. No new physics, no new solve.
+    The chevron's two-level lineshape assumes population leaving `init` can only
+    reach `tgt`; this reads what violates that from the existing states (no new solve).
 
-    ``P01``/``P10`` are the intended exchange. ``P_leak = norm - P01 - P10`` is the
-    EXCLUSIVE complement -- the one honest number, everything a two-level fit
-    cannot account for. ``norm_defect = 1 - norm`` is a solver/truncation health
-    check, not itself leakage: it should stay ~1e-9 for a closed system: a
-    non-trivial value means the Fock truncation (``coupler_levels``, etc.) is
-    being pushed and the other channels here are suspect. ``P_f_a``/``P_f_b``
-    (qutrit ``|2>`` of each qubit mode), ``P_coupler`` (any coupler excitation),
-    ``P_double`` (the ``|11>`` state) and ``P_spectator`` (any excitation of a
-    4th spectator mode, if configured) are diagnostic and deliberately
-    OVERLAPPING -- they attribute where leakage is going, they do not partition
-    ``P_leak``.
-
-    Parameters
-    ----------
-    cpl : ZhouCoupler
-        The coupler the trajectory was evolved on.
-    states : ndarray, shape (n_time, dim)
-        State vectors at each output time, as returned by ``evolve_trajectory``.
-    init, tgt : sequence of int
-        Per-mode occupations of the two computational states (e.g. ``|01...>``
-        and ``|10...>``).
-
-    Returns
-    -------
-    ndarray, shape (len(CHANNELS), n_time)
+    ``P_leak = norm - P01 - P10`` is the EXCLUSIVE complement. ``norm_defect =
+    1 - norm`` is a truncation health check (~1e-9 when closed), not leakage.
+    ``P_f_a``/``P_f_b`` (qutrit ``|2>``), ``P_coupler`` (any coupler excitation),
+    ``P_double`` (``|11>``) and ``P_spectator`` (any 4th-mode excitation) are
+    OVERLAPPING attributions, not a partition of ``P_leak``.
     """
     from snail_solver.spectroscopy import marginal_population
 
@@ -293,14 +197,10 @@ def population_channels(cpl, states: np.ndarray, init: Sequence[int],
 
     P_f_a = _level(0, 2)
     P_f_b = _level(1, 2)
-    P_coupler = 1.0 - np.array([marginal_population(row, dims, cpl.coupler_index, 0)
-                                for row in probs])
-    double_occ = [0] * cpl.n_modes
-    double_occ[0] = 1
-    double_occ[1] = 1
+    P_coupler = 1.0 - _level(cpl.coupler_index, 0)
+    double_occ = [1, 1] + [0] * (cpl.n_modes - 2)
     P_double = probs[:, cpl.fock_index(double_occ)]
-    P_spectator = (1.0 - np.array([marginal_population(row, dims, 3, 0) for row in probs])
-                  if cpl.n_modes > 3 else np.zeros(n_time))
+    P_spectator = 1.0 - _level(3, 0) if cpl.n_modes > 3 else np.zeros(n_time)
     norm_defect = 1.0 - norm
 
     return np.stack([P01, P10, P_leak, P_f_a, P_f_b, P_coupler, P_double,
@@ -308,10 +208,8 @@ def population_channels(cpl, states: np.ndarray, init: Sequence[int],
 
 
 def _chevron_worker(args: Tuple) -> np.ndarray:
-    """One pump-offset column: the full population-channel stack over the time
-    grid (see :func:`population_channels`). Works for the 3-mode bare pair or the
-    4-mode pair+spectator (state/index built from n_modes), and for constant or
-    shaped(+DRAG) probe pulses (``build_kw``)."""
+    """One pump-offset column: the :func:`population_channels` stack over time,
+    for any mode count (bare pair or + spectator) and probe shape (``build_kw``)."""
     config, eta_op, wp_offset, times, solver, spec_abs_GHz, build_kw = args
     cpl, _w_p = build_chevron_coupler(config, eta_op, wp_offset, float(times[-1]),
                                       spec_abs_GHz=spec_abs_GHz, **build_kw)
@@ -322,19 +220,8 @@ def _chevron_worker(args: Tuple) -> np.ndarray:
 
 
 def _parabolic_vertex(x: Sequence[float], y: Sequence[float]) -> float:
-    """Sub-grid maximum via a 3-point parabola around the discrete argmax; falls
-    back to the grid point at the boundary.
-
-    Parameters
-    ----------
-    x, y : sequence of float
-        Sampled abscissae (sorted) and values.
-
-    Returns
-    -------
-    float
-        Interpolated x of the maximum.
-    """
+    """x of the maximum of sorted samples, refined by a 3-point parabola around the
+    argmax (the grid point itself at the boundary)."""
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     k = int(np.argmax(y))
     if k == 0 or k == len(x) - 1:
@@ -349,32 +236,13 @@ def _parabolic_vertex(x: Sequence[float], y: Sequence[float]) -> float:
 
 
 def coupler_number_trace(cpl, states: np.ndarray) -> np.ndarray:
-    """Coupler-mode photon-number expectation ``<n_s(t)>`` along a trajectory.
+    """Coupler-mode photon number ``<n_s(t)>`` along a trajectory, shape (n_time,).
 
-    The pump amplitude ``eta`` used throughout this module is, by construction
-    (``is_eta=True`` in :func:`build_chevron_coupler`), a classical drive-amplitude
-    LABEL on the envelope -- it is never derived from the coupler mode's actual
-    occupation. In ``ZhouCoupler.dressed_flux``, the coupler is one more dynamical
-    mode at its own bare frequency ``w_s``, and ``eta_p(t)`` is a SEPARATE
-    classical term at the pump frequency ``w_p``; whether this mode's real Fock
-    occupation is the same quantity as McKinney et al.'s ``eta = sqrt(n_s))``
-    (arXiv:2409.18262, Eq. 9 -- a different paper, about the coupler mode's own
-    coherent response) is UNRESOLVED (see the caveat in
-    ``tune_up.verify_eta_matches_ns``). Treat the returned trace as "how much the
-    coupler mode itself gets incidentally populated" -- a real, useful diagnostic
-    on its own terms, not a validated cross-check of a labelling identity.
-
-    Parameters
-    ----------
-    cpl : ZhouCoupler
-        The coupler the trajectory was evolved on (for ``dims``/``coupler_index``).
-    states : ndarray, shape (n_time, dim)
-        State vectors at each output time, as returned by ``evolve_trajectory``.
-
-    Returns
-    -------
-    ndarray, shape (n_time,)
-        ``<n_s(t)>``.
+    ``eta`` here is a classical drive LABEL (``is_eta=True``), separate from the
+    coupler's own Fock occupation; whether the two match McKinney et al.'s
+    ``eta = sqrt(n_s)`` (arXiv:2409.18262, Eq. 9) is UNRESOLVED (see
+    ``tune_up.verify_eta_matches_ns``). Read this as incidental coupler population,
+    not a validated cross-check.
     """
     from snail_solver.spectroscopy import expected_number
 
@@ -383,21 +251,8 @@ def coupler_number_trace(cpl, states: np.ndarray) -> np.ndarray:
 
 
 def locate_resonance(offsets_GHz: np.ndarray, max_transfer: np.ndarray) -> float:
-    """Stark-shifted resonance offset (GHz) = the offset that maximises the swap
-    contrast, parabolically refined. Pure numpy (no QuTiP).
-
-    Parameters
-    ----------
-    offsets_GHz : ndarray
-        Scanned pump-frequency offsets (GHz).
-    max_transfer : ndarray
-        Max over time of P(|10>) at each offset (the chevron envelope).
-
-    Returns
-    -------
-    float
-        Interpolated resonance offset (GHz).
-    """
+    """Resonance offset (GHz): the parabolically refined argmax of the chevron
+    envelope `max_transfer` over `offsets_GHz`. Pure numpy."""
     return _parabolic_vertex(offsets_GHz, max_transfer)
 
 
@@ -415,58 +270,20 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
          keep_full_channels: bool = False) -> Dict[str, Any]:
     """Run the pump-frequency chevron and locate the Stark-shifted resonance.
 
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    t_g : float
-        Operating gate time (ns); sets the probe amplitude via operating_eta.
-    amp_scale : float
-        Amplitude-scale correction from a prior amplitude calibration.
-    offsets_GHz : ndarray
-        Pump-frequency offsets to scan, relative to |w_b - w_a| (GHz).
-    window_ns : float
-        Chevron time window (ns); ~2 t_g captures a full on-resonance exchange.
-    n_time : int
-        Number of output times across the window.
-    solver : dict, optional
-        QuTiP tolerances (atol, rtol, nsteps); defaults provided.
-    n_jobs : int, optional
-        Worker processes (0/None -> SLURM_CPUS_PER_TASK or CPU count). Forced to 1
-        on GPU.
-    spec_abs_GHz : float, optional
-        If given, include a spectator mode at this ABSOLUTE frequency so the
-        located resonance includes its dispersive pull; None -> bare pair.
-    chirp_coeffs_GHz : sequence of float, optional
-        The gate's chirp (GHz), so the resonance is located as the RESIDUAL offset on
-        top of it rather than the un-chirped one. Requires ``shape='raised_cosine'``.
-        See :func:`build_chevron_coupler`.
-    eta_op : float, optional
-        Drive the constant probe at THIS |eta| instead of deriving it from
-        ``(t_g, amp_scale)`` via :func:`operating_eta`. This is what makes a
-        drive-strength sweep possible: the caller picks the physical drive directly
-        rather than reaching it indirectly through a gate length it does not mean.
-        Ignored by ``shape='raised_cosine'``, whose amplitude comes from the gate.
-    keep_full_channels : bool, default False
-        Also return the full ``[n_off, n_time]`` ``P01``/``P_leak`` rasters (see
-        :func:`population_channels`). Off by default so callers that keep whole
-        result dicts (``sweep_common``, ``calibrate_gate``) don't silently bloat;
-        the scalar per-offset leakage summaries (``leak_at_metric``, ``leak_max``,
-        the per-channel breakdown, ``leak_on_resonance``, ``norm_defect_max``) are
-        always computed and returned regardless, at negligible extra cost.
+    `offsets_GHz` are relative to |w_b - w_a|; `window_ns` ~2 t_g captures a full
+    exchange. `n_jobs` 0/None -> SLURM_CPUS_PER_TASK or CPU count. `eta_op` drives
+    the constant probe at that |eta| instead of :func:`operating_eta`'s (for drive
+    sweeps; ignored by the gate shape). `spec_abs_GHz` / `chirp_coeffs_GHz` /
+    `drag_beat_GHz`: see :func:`build_chevron_coupler`. `keep_full_channels` also
+    returns the ``[n_off, n_time]`` ``P01``/``P_leak`` rasters (off so callers that
+    keep whole dicts don't bloat).
 
-    Returns
-    -------
-    dict
-        offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer [n_off],
-        eta_op, w_p_bare_GHz, resonance_offset_GHz, resonance_w_p_GHz, the probe
-        metadata shape, drag_beat_GHz, spec_abs_GHz, chirp_coeffs_GHz, plus the
-        leakage diagnostics from :func:`population_channels`: ``metric_time_index``
-        [n_off], ``leak_at_metric``/``leak_max``/``leak_f_a``/``leak_f_b``/
-        ``leak_coupler``/``leak_double``/``leak_spectator`` [n_off],
-        ``leak_on_resonance`` (scalar, at the offset nearest the located
-        resonance), ``norm_defect_max`` (scalar), and (if `keep_full_channels`)
-        ``P01``/``P_leak`` [n_off, n_time].
+    Returns offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer [n_off],
+    resonance_metric, metric_label, eta_op, w_p_bare_GHz, resonance_offset_GHz,
+    resonance_w_p_GHz, shape, drag_beat_GHz, spec_abs_GHz, chirp_coeffs_GHz,
+    metric_time_index [n_off], leak_at_metric / leak_max / leak_f_a / leak_f_b /
+    leak_coupler / leak_double / leak_spectator [n_off], leak_on_resonance (at the
+    offset nearest the resonance), norm_defect_max, and optionally P01 / P_leak.
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     eta_op = (float(eta_op) if eta_op is not None
@@ -479,8 +296,7 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
                 "amp_scale": float(amp_scale),
                 "chirp_coeffs_GHz": chirp_list,
                 "drag_n_pump": int(drag_n_pump),
-                # frozen dataclasses of plain scalars -- picklable, so they survive
-                # the multiprocessing fan-out to _chevron_worker unchanged
+                # frozen dataclasses of scalars: picklable for the process pool
                 "drag_channels": (list(drag_channels) if drag_channels else None)}
     args = [(config, eta_op, float(off), times, solver, spec_abs_GHz, build_kw)
             for off in offsets_GHz]
@@ -495,11 +311,9 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
     stack = np.array(cols)                      # [n_off, len(CHANNELS), n_time]
     P10 = stack[:, CHANNELS.index("P10"), :]    # [n_off, n_time]
     max_transfer = P10.max(axis=1)
-    # Resonance criterion: for the CONSTANT probe, max-over-time = max Rabi contrast.
-    # For the SHAPED full-iSWAP the gate is evaluated at t_g (the pump is off after),
-    # so locate on P(|10>) AT t_g -- max-over-time would credit off-resonant offsets
-    # with their best mid-pulse value, broadening the peak and pulling the resonance
-    # off the frequency that actually completes the swap at t_g.
+    # Constant probe: max-over-time is the Rabi contrast. Shaped gate: use P(|10>)
+    # AT t_g -- max-over-time would credit off-resonant offsets with mid-pulse
+    # values, broadening the peak and pulling the resonance.
     if shape == "raised_cosine":
         k_tg = int(np.argmin(np.abs(np.asarray(times, dtype=float) - float(t_g))))
         metric = P10[:, k_tg]
@@ -509,13 +323,12 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
         metric = max_transfer
         metric_label = "max-over-time P(|10>)"
         metric_time_index = np.argmax(P10, axis=1)
-    res_off = locate_resonance(np.asarray(offsets_GHz, dtype=float), metric)
+    offs = np.asarray(offsets_GHz, dtype=float)
+    res_off = locate_resonance(offs, metric)
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     w_p_bare = abs(wb - wa)
 
-    # Leakage diagnostics (see population_channels): scalar per-offset summaries are
-    # always computed -- cheap post-processing on `stack`, already in hand -- and only
-    # the full P01/P_leak rasters are gated behind `keep_full_channels`.
+    # Leakage summaries per offset (cheap: `stack` is already in hand).
     rows = np.arange(stack.shape[0])
 
     def _at_metric(channel: str) -> np.ndarray:
@@ -529,10 +342,10 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
     leak_double = _at_metric("P_double")
     leak_spectator = _at_metric("P_spectator")
     norm_defect_max = float(stack[:, CHANNELS.index("norm_defect"), :].max())
-    j_res = int(np.argmin(np.abs(np.asarray(offsets_GHz, dtype=float) - res_off)))
+    j_res = int(np.argmin(np.abs(offs - res_off)))
     leak_on_resonance = float(leak_at_metric[j_res])
 
-    out = {"offsets_GHz": np.asarray(offsets_GHz, dtype=float), "times_ns": times,
+    out = {"offsets_GHz": offs, "times_ns": times,
            "P10": P10, "max_transfer": max_transfer,
            "resonance_metric": metric, "metric_label": metric_label,
            "eta_op": float(eta_op),
@@ -558,22 +371,11 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
 # Plot
 # ---------------------------------------------------------------------------
 def render_chevron(chev: Dict[str, Any], png_path: str, title_suffix: str = "") -> None:
-    """Render one chevron (heatmap + max-transfer envelope) from a dict of arrays.
+    """Render one chevron (heatmap + resonance metric) to `png_path`.
 
-    Parameters
-    ----------
-    chev : dict
-        Must contain offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer,
-        resonance_offset_GHz, eta_op; optional shape / drag_beat_GHz / spec_abs_GHz
-        annotate the title.
-    png_path : str
-        Output PNG.
-    title_suffix : str, default ""
-        Extra text appended to the figure title (e.g. the point index / detuning).
-
-    Returns
-    -------
-    None
+    `chev` needs offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer,
+    resonance_offset_GHz, eta_op; shape / drag_beat_GHz / resonance_metric /
+    metric_label are optional.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -720,8 +522,7 @@ def main() -> None:
                   drag_n_pump=args.drag_n_pump,
                   chirp_coeffs_GHz=parse_chirp_arg(args.chirp_GHz))
 
-    np.savez(args.out, t_g_ns=t_g, amp_scale=amp_scale, **{
-        k: v for k, v in result.items()})
+    np.savez(args.out, t_g_ns=t_g, amp_scale=amp_scale, **result)
     print(f"operating |eta|        = {result['eta_op']:.4f}")
     print(f"bare w_p = |w_b-w_a|   = {result['w_p_bare_GHz']:.6f} GHz")
     print(f"Stark resonance offset = {result['resonance_offset_GHz']*1e3:+.2f} MHz")

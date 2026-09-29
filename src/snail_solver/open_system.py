@@ -1,13 +1,10 @@
 r"""Open-system scoring: what the gate achieves once T1 and T2 are switched on.
 
-Everything else in this package solves a CLOSED system (``qt.sesolve``), which is the
-right default -- it isolates the coherent error that pulse shaping can actually fix.
-But it also means gate LENGTH is free, and since ``t_g = 2A/eta`` that biases every
-comparison toward weak drive: a low ``eta`` buys a converged model and low leakage
-while its five-times-longer gate costs nothing at all.
-:func:`subharmonic_gate_scan.coherence_penalty` supplies a first-order estimate for
-ranking. This module supplies the actual number for the handful of points worth
-confirming.
+The rest of the package solves a CLOSED system (``qt.sesolve``), isolating the
+coherent error pulse shaping can fix -- but then gate LENGTH is free, and since
+``t_g = 2A/eta`` that biases comparisons toward weak drive.
+:func:`subharmonic_gate_scan.coherence_penalty` gives a first-order estimate for
+ranking; this module gives the actual number for the few points worth confirming.
 
 The metric is the SAME leakage-aware average gate fidelity the closed-system path
 uses (Pedersen PLA 367, 47 (2007); Wood & Gambetta PRA 97, 032306 (2018)), extended
@@ -18,11 +15,10 @@ computational subspace, with Kraus operators ``K_i`` and error matrices
     F = ( sum_i |Tr M_i|^2 + sum_i Tr[M_i M_i^dag] ) / ( d (d+1) )
     leakage = 1 - sum_i Tr[K_i^dag K_i] / d                          d = 4
 
-With a single (unitary) Kraus operator both sums collapse and this IS
-``ZhouCoupler._iswap_fidelity_from_U``. That is not a coincidence to be admired but a
-TEST: :func:`open_iswap_fidelity` with no collapse operators must reproduce
-``ZhouCoupler.iswap_fidelity`` to solver tolerance, which is what pins the
-normalisation. See ``tests/test_physics.py::TestOpenSystemScoring``.
+With a single (unitary) Kraus operator this IS ``ZhouCoupler._iswap_fidelity_from_U``;
+``tests/test_physics.py::TestOpenSystemScoring`` pins the normalisation by requiring
+:func:`open_iswap_fidelity` without collapse operators to reproduce
+``ZhouCoupler.iswap_fidelity``.
 
 Neither sum needs the Kraus operators themselves. Since
 ``E(|k><m|) = sum_i K_i |k><m| K_i^dag``::
@@ -46,10 +42,8 @@ _D = 4
 def dephasing_rate_MHz(t1_us: Optional[float], t2_us: Optional[float]) -> float:
     r"""Pure-dephasing rate ``1/T_phi`` from ``T1`` and ``T2``, in 1/ns.
 
-    ``1/T2 = 1/(2 T1) + 1/T_phi``, so the pure-dephasing part is what is LEFT after
-    relaxation's contribution is removed. A ``T2`` longer than ``2 T1`` is
-    unphysical; it is clamped to zero rather than silently producing a negative rate
-    (which would be gain, not noise).
+    ``1/T2 = 1/(2 T1) + 1/T_phi``. An unphysical ``T2 > 2 T1`` is clamped to zero
+    rather than producing a negative rate (gain, not noise).
     """
     inv_t2 = 0.0 if not t2_us else 1.0 / (float(t2_us) * 1e3)      # 1/ns
     inv_t1 = 0.0 if not t1_us else 1.0 / (float(t1_us) * 1e3)
@@ -63,11 +57,9 @@ def collapse_ops(cpl, *, t1_us: Optional[float] = None,
                  coupler_index: Optional[int] = None) -> List[Any]:
     r"""Collapse operators for the qubits (and optionally the coupler).
 
-    Built from the coupler's own embedded ladder operators, exactly as
-    ``ZhouCoupler``'s docstring prescribes: ``sqrt(1/T1) a_i`` for relaxation and
-    ``sqrt(2/T_phi) a_i^dag a_i`` for pure dephasing.
-
-    Times are in microseconds; rates come out in 1/ns to match ``t_g``.
+    From the coupler's embedded ladder operators: ``sqrt(1/T1) a_i`` (relaxation) and
+    ``sqrt(2/T_phi) a_i^dag a_i`` (pure dephasing). Times in microseconds; rates come
+    out in 1/ns to match ``t_g``.
 
     Parameters
     ----------
@@ -136,10 +128,8 @@ def _fidelity_from_map(E: np.ndarray, U_ideal: np.ndarray) -> Tuple[float, float
 def _fit_virtual_z(E: np.ndarray, U_ideal: np.ndarray) -> Tuple[float, np.ndarray]:
     """Maximise the fidelity over the two single-qubit virtual-Z phases.
 
-    Free in software, so scoring without them charges for a phase nobody would leave
-    uncorrected. Optimised on the already-built map, so it costs no extra solves --
-    a coarse grid to avoid the local maxima a bare local search falls into, then
-    Nelder-Mead from the best cell.
+    They are free in software. Optimised on the already-built map (no extra solves):
+    a coarse grid to escape local maxima, then Nelder-Mead from the best cell.
     """
     from scipy.optimize import minimize
 

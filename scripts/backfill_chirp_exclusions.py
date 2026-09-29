@@ -2,39 +2,27 @@
 
     backfill_chirp_exclusions.py RUNDIR [--max-frac 0.10] [--suffix _flagged]
 
-WHY THIS EXISTS
----------------
 A column can carry no chirp for two reasons that look identical in the output and
 demand opposite treatment:
 
-  * there was NO SHIFT TO CHIRP -- the law's excursion across the pulse is a
-    negligible fraction of the resonance half-width. `chirp == bare` is then a
-    RESULT, and a gain of 1.00x is the correct thing to report.
+  * NO SHIFT TO CHIRP -- the law's excursion across the pulse is a negligible
+    fraction of the resonance half-width. `chirp == bare` is a RESULT (gain 1.00x).
+  * a chirp COULD NOT BE MEASURED -- the ridge fit failed while the law still swept
+    a real fraction of a half-width, or the ridge railed and no law was fitted.
+    `chirp == bare` is an ARTEFACT; averaging it in at 1.00x drags the chirp's
+    benefit down exactly where the chirp does the most work.
 
-  * a chirp COULD NOT BE MEASURED -- the ridge fit failed while the law still
-    swept a real fraction of a half-width, or the ridge railed and no law was
-    fitted at all. `chirp == bare` is then an ARTEFACT of the calibration, and
-    averaging it in at 1.00x drags the chirp's measured benefit down precisely at
-    the detunings where the chirp does the most work.
-
-On the 2026-09-22 grid the second kind is 14 of 61 columns at eta = 1.3, and every
-one was reported at exactly 1.000x. Including them puts the chirp's gain at
-geomean 1.610x; excluding them puts it at 1.855x, with the median moving 1.19x ->
-1.85x because the 1.000x entries sat right at the middle of the distribution.
+(2026-09-22 grid, eta = 1.3: 14 of 61 columns were of the second kind; excluding them
+moves the chirp gain from geomean 1.610x / median 1.19x to 1.855x / 1.85x.)
 
 The discriminator is the excursion |k2 eta*^2 + k4 eta*^4| against the half-width
-1/(2 t_g). Measured over those 31 chirp-free columns the two populations separate
-cleanly on it: below 10% the fit residual is 1.0-16.7x the excursion (no signal),
-above 20% it is 0.21-0.58x (a real law that merely missed r2_min).
+1/(2 t_g). Over the 31 chirp-free columns the populations separate cleanly: below
+10% the fit residual is 1.0-16.7x the excursion (no signal), above 20% it is
+0.21-0.58x (a real law that merely missed r2_min).
 
-NO SOLVES. Every quantity is read from the per-column JSONs the run already wrote:
-the rejected law is stored even when it was not used. The curves files are NOT
-edited in place -- flagged copies are written beside them -- so the originals stay
-available for comparison.
-
-Downstream, `chirp_excluded` is what paired_gain_table.py and plot_drag_curves.py
-read; rows that are chirp-free for the legitimate reason are left untouched and
-keep contributing their honest 1.00x.
+NO SOLVES: everything is read from the per-column JSONs (the rejected law is stored
+even when unused). Flagged copies are written beside the curves files, never in place.
+`chirp_excluded` is what paired_gain_table.py and plot_drag_curves.py read.
 """
 import argparse
 import glob
@@ -45,20 +33,18 @@ LEGIT = "no_measurable_shift"
 UNMEASURABLE = "unmeasurable_chirp"
 RAILED = "railed_ridge"
 
-#: Coupler occupation above which --coupler-levels 9 cannot represent the state at
-#: all: the top of the ladder is populated and the leakage out of the model is
-#: uncharged, so 1-F comes out too GOOD. The 7-level run was 3x optimistic at ~0.85
-#: photons, so this is a factors-of-several problem. Flagged, not dropped -- the
-#: column still locates a resonance, it just cannot be quoted as a fidelity.
+#: Coupler occupation above which 9 coupler levels cannot represent the state: leakage
+#: off the top of the ladder is uncharged, so 1-F reads too GOOD (the 7-level run was
+#: 3x optimistic at ~0.85 photons). Flagged, not dropped: the column still locates a
+#: resonance, it just cannot be quoted as a fidelity.
 N_COUPLER_SEVERE = 0.5
 
 
 def excursion_frac(col):
     """|k2 eta^2 + k4 eta^4| / (1/(2 t_g)), or None when no law was stored.
 
-    A railed ridge raises before `fit_shift_curve` runs, so it carries no k2/k4 at
-    all. An unknown excursion is not a small one -- those columns can never qualify
-    as legitimately chirp-free.
+    A railed ridge raises before `fit_shift_curve`, so it has no k2/k4. An unknown
+    excursion is not a small one: such columns never count as legitimately chirp-free.
     """
     op = col.get("operating_point") or {}
     ch = col.get("chirp") or {}
@@ -71,20 +57,28 @@ def excursion_frac(col):
     return exc / (1e3 / (2.0 * float(t_g)))
 
 
-def coupler_load(rundir):
-    """{(eta, delta_mhz): n_coupler} from the per-column records."""
-    out = {}
+def _key(r):
+    return (round(float(r["target_eta"]), 2), round(float(r["delta_GHz"]) * 1e3))
+
+
+def _columns(rundir):
+    """Every readable per-column record of both passes."""
     for sub in ("passA_nodrag", "passB_drag"):
         for path in glob.glob(os.path.join(rundir, sub, "columns", "*.json")):
             try:
                 col = json.load(open(path))
             except (OSError, ValueError):
                 continue
-            n = col.get("n_coupler")
-            if n is None:
-                continue
-            key = (round(float(col["target_eta"]), 2),
-                   round(float(col["delta_GHz"]) * 1e3))
+            yield col
+
+
+def coupler_load(rundir):
+    """{(eta, delta_mhz): n_coupler} from the per-column records."""
+    out = {}
+    for col in _columns(rundir):
+        n = col.get("n_coupler")
+        if n is not None:
+            key = _key(col)
             out[key] = max(float(n), out.get(key, 0.0))
     return out
 
@@ -92,28 +86,21 @@ def coupler_load(rundir):
 def classify(rundir, max_frac):
     """{(eta, delta_mhz): (reason, frac)} for every CHIRP-FREE column in the run."""
     out = {}
-    for sub in ("passA_nodrag", "passB_drag"):
-        for path in glob.glob(os.path.join(rundir, sub, "columns", "*.json")):
-            try:
-                col = json.load(open(path))
-            except (OSError, ValueError):
-                continue
-            if not ((col.get("operating_point") or {}).get("chirp_free")):
-                continue
-            key = (round(float(col["target_eta"]), 2),
-                   round(float(col["delta_GHz"]) * 1e3))
-            frac = excursion_frac(col)
-            if frac is None:
-                reason = RAILED
-            elif frac <= max_frac:
-                reason = LEGIT
-            else:
-                reason = UNMEASURABLE
-            # passA and passB both hold the column; agree by taking the stricter
-            # reading, since either pass failing to measure a chirp is enough.
-            prev = out.get(key)
-            if prev is None or (prev[0] == LEGIT and reason != LEGIT):
-                out[key] = (reason, frac)
+    for col in _columns(rundir):
+        if not ((col.get("operating_point") or {}).get("chirp_free")):
+            continue
+        key = _key(col)
+        frac = excursion_frac(col)
+        if frac is None:
+            reason = RAILED
+        elif frac <= max_frac:
+            reason = LEGIT
+        else:
+            reason = UNMEASURABLE
+        # Both passes hold the column; either failing to measure a chirp is enough.
+        prev = out.get(key)
+        if prev is None or (prev[0] == LEGIT and reason != LEGIT):
+            out[key] = (reason, frac)
     return out
 
 
@@ -122,7 +109,7 @@ def apply_to(curves_path, cls, load, out_path, n_severe):
     n = {LEGIT: 0, UNMEASURABLE: 0, RAILED: 0}
     n_trunc = 0
     for r in rows:
-        key = (round(float(r["target_eta"]), 2), round(float(r["delta_GHz"]) * 1e3))
+        key = _key(r)
         nc = load.get(key)
         if nc is not None:
             r["n_coupler"] = nc

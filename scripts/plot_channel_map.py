@@ -1,22 +1,19 @@
 """Diagram: which interactions are DRAGged, and where in frequency they sit.
 
-Built from a stored column's `channel_audit`, so every number is the one the code
-used -- nothing here is hand-typed.
+Built from a stored column's `channel_audit`, so every number is the one the code used.
 
-Panel A -- the frequency landscape that PRODUCES the beats. The pump enters at w_p and
-its second harmonic at 2 w_p; a channel's beat is the distance from the relevant pump
-harmonic to the transition it drives. This is why moving `delta` moves the two-pump
-channels twice as fast as the one-pump ones.
+Panel A -- the frequency landscape that PRODUCES the beats: a channel's beat is the
+distance from the relevant pump harmonic (w_p or 2 w_p) to the transition it drives,
+which is why moving `delta` moves the two-pump channels twice as fast.
 
-Panel B -- the (detuning, coupling) plane, which is where DRAG lives. Two straight
-lines bound the usable region, because `drag_verdict` is a statement about g/|det|:
+Panel B -- the (detuning, coupling) plane, where DRAG lives. `drag_verdict` is about
+g/|det|, so two lines bound the usable region:
 
     g = |det|        perturbativity: above it the recursion has no leading term
-    g = 0.3 |det|    the correctability threshold the selector enforces (max_ratio)
+    g = 0.3 |det|    the selector's correctability threshold (max_ratio)
 
-and one vertical band bounds it from the other side: |det| < 1/t_g is inside the
-pulse's own spectral width, where nothing is adiabatic and DRAG has nothing to cancel.
-A channel is correctable only in the wedge between them.
+and |det| < 1/t_g (inside the pulse bandwidth, nothing to cancel) bounds it from the
+other side. A channel is correctable only in the wedge between them.
 
 Usage:  plot_channel_map.py COLUMN.json OUT.png
 """
@@ -44,8 +41,8 @@ INK, MUTED, GRID = "#1a1a19", "#5c5b55", "#d8d7d0"
 
 w_p = float(d["w_p_GHz"])
 dev = (d.get("run_doc") or {}).get("device") or {}
-w_a = float((dev.get("qubit_freqs_GHz") or [3.5, 5.13])[0])
-w_b = float((dev.get("qubit_freqs_GHz") or [3.5, 5.13])[1])
+qf = dev.get("qubit_freqs_GHz") or [3.5, 5.13]
+w_a, w_b = float(qf[0]), float(qf[1])
 w_s = float(dev.get("coupler_freq_GHz", 4.7))
 alpha = float(dev.get("anharm_qubit_GHz", -0.12))
 bw = 1e3 / float(a["t_g_ns"])

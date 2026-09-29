@@ -1,10 +1,10 @@
 r"""Walk the gate pump across a mode's own subharmonic, tuning up a pulse at every point.
 
 ``tune_up`` calibrates a subharmonic two-qubit gate at ONE pump frequency
-``w_p = |w_b - w_a| + wp_offset_GHz``. This module scans that pump across qubit A's
+``w_p = |w_b - w_a| + wp_offset_GHz``. This module scans the pump across qubit A's
 subharmonic, ``w_p = w_a/2 + delta``, and designs a chirped recursive-DRAG pulse at
-every offset, so the question "what does the calibration do as the pump's own second
-harmonic lands on a qubit" has an answer per column rather than per device.
+every offset, so "what does the calibration do as the pump's second harmonic lands on
+a qubit" has an answer per column.
 
 Geometry
 --------
@@ -14,44 +14,33 @@ Geometry
     2 w_p - w_a = 2 delta                           <- qubit A's subharmonic beat
     Delta_sub = w_s - 2 w_p = (w_s - w_a) - 2 delta  <- the SNAIL subharmonic axis
 
-``branch="below"`` is ``w_p = w_a - w_b``, and it sends ``w_b -> w_a/2 = w_p`` as
-``delta -> 0``: the partner qubit lands ON the pump frequency, so A's subharmonic and a
-direct drive on B collide at once. ``branch="above"`` puts ``w_b = 1.5 w_a + delta``,
-degenerate with nothing, which isolates A's subharmonic. Both are the same ``|w_b - w_a|``.
+``branch="below"`` (``w_p = w_a - w_b``) sends ``w_b -> w_a/2 = w_p`` as ``delta -> 0``,
+so A's subharmonic and a direct drive on B collide at once. ``branch="above"``
+(``w_b = 1.5 w_a + delta``) isolates A's subharmonic.
 
-**``delta = 0`` is not a gate.** The A-subharmonic beat is ``-2 delta``, so at the origin
-that channel is exactly resonant: ``g/|det| -> inf``, there is no leading term for DRAG to
-cancel, and the excitation is not adiabatic either (the detuning is inside the pulse's own
-bandwidth ``1/t_g``). The default grid therefore drops it, and any column carrying a
-non-perturbative channel is refused unless ``--force``.
+**``delta = 0`` is not a gate.** The A-subharmonic channel is exactly resonant there
+(``g/|det| -> inf``, and the detuning is inside the pulse bandwidth ``1/t_g``), so the
+default grid drops it, and any column carrying a non-perturbative channel is refused
+unless ``--force``.
 
-What the eta scan is
---------------------
+The eta scan
+------------
 ``--amp-points`` over ``[eta_lo, eta_hi] * target_eta`` is the **Rabi amplitude scan that
-determines the chirp** -- ``tune_up`` steps 1-2: measure the Stark shift law ``k2, k4``
-across drive strength, then project it along the pulse to get the Legendre coefficients.
-It is a calibration input, NOT an output axis: each column reports ONE fidelity, scored at
-the single operating point. Requesting eta 0.5 -> 2.5 in 0.05 steps is::
+determines the chirp** (``tune_up`` steps 1-2: measure ``k2, k4``, project to Legendre
+coefficients). It is a calibration input, NOT an output axis: each column reports ONE
+fidelity at its operating point. eta 0.5 -> 2.5 in 0.05 steps is::
 
     --target-eta 2.5 --eta-lo 0.2 --eta-hi 1.0 --amp-points 41
-    linspace(0.2, 1.0, 41) * 2.5  ==  0.50, 0.55, ..., 2.50
 
-``eta_hi = 1.0`` keeps the probe at or under the pulse's own peak, so the shift law is
-interpolated rather than extrapolated.
+``eta_hi = 1.0`` keeps the shift law interpolated rather than extrapolated.
 
 DRAG channels
 -------------
-Channels are DERIVED per column, never hand-listed: the collision structure moves with
-``delta``. ``spectator_audit.select_drag_channels`` always corrects the leakage (``|2>``
-ladder) and coupler (SNAIL heating) categories plus the mode subharmonics, fills the
-remaining slots with the strongest correctable parasite, and reports everything it did
-not select and why. Run ``--dry-run`` first: it prints that audit for every column and
-solves nothing.
-
-``envelope_m`` is pinned to ``--max-drag-channels`` for the whole grid. The recursion
-needs the base envelope to vanish to order ``len(channels)`` at both gate edges, and
-``n_selected <= max_channels`` by construction, so one grid-wide value covers every
-column -- which also keeps the pulse area, and hence ``t_g``, comparable across the scan.
+DERIVED per column by ``spectator_audit.select_drag_channels`` (leakage, coupler and
+mode-subharmonic categories always; remaining slots to the strongest correctable
+parasite; everything unselected is reported). ``--dry-run`` prints that audit for every
+column and solves nothing. ``envelope_m`` is pinned to ``--max-drag-channels`` grid-wide,
+so the envelope vanishes to enough order for every column and ``t_g`` stays comparable.
 
 Usage
 -----
@@ -71,9 +60,8 @@ One HDF5 file per scan::
       /scan/figures
       /columns/dm0p05        <- that column's COMPLETE tune-up, in tune_up's --out schema
 
-RESUMABLE. Every column is cached under ``--outdir`` the moment it succeeds and re-read
-on the next run, so a scan killed at hour six is resumed by relaunching the identical
-command; only the missing columns solve. ``--overwrite`` forces a re-solve.
+RESUMABLE: every successful column is cached under ``--outdir`` and re-read, so a killed
+scan resumes by relaunching the identical command. ``--overwrite`` forces a re-solve.
 """
 from __future__ import annotations
 
@@ -89,13 +77,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-#: Default offset grid (GHz). Symmetric about the subharmonic and EXCLUDING the origin,
-#: which is not a gate -- see the module docstring.
+#: Default offset grid (GHz): symmetric about the subharmonic, EXCLUDING the origin.
 DEFAULT_OFFSETS = "-0.1:0.1:21"
 
 #: |delta| under which a column is dropped as "the origin". Half the DRAG skip window at
 #: the default 5 MHz, since the A-subharmonic beat is 2 delta.
 ORIGIN_EPS_GHz = 2.5e-3
+
+
+def _opt_float(x: Any) -> Optional[float]:
+    return None if x is None else float(x)
 
 
 # ===========================================================================
@@ -104,9 +95,8 @@ ORIGIN_EPS_GHz = 2.5e-3
 def parse_offsets(spec: str) -> List[float]:
     """Offset grid in GHz: a comma list of scalars and/or ``lo:hi:n`` ranges.
 
-    Shares :func:`subharmonic_convergence.parse_detunings`, so segments COMPOSE and a
-    range reproduces the same floats every time -- which is what lets a refined grid hit
-    the coarse grid's cache files bit-for-bit instead of re-solving them.
+    Shares :func:`subharmonic_convergence.parse_detunings`, so a range reproduces the
+    same floats every time and a refined grid hits the coarse grid's cache files.
     """
     from snail_solver.subharmonic_convergence import parse_detunings
     return parse_detunings(spec)
@@ -114,11 +104,10 @@ def parse_offsets(spec: str) -> List[float]:
 
 def columns_for(config: Dict[str, Any], offsets_GHz: Sequence[float], *,
                 drop_origin: bool = True) -> List[Dict[str, Any]]:
-    """``[{delta_GHz, w_p_GHz, ...}]`` for an offset grid, origin dropped by default.
+    """``[{delta_GHz, w_p_GHz, ...}]`` for an offset grid (``w_p = w_a/2 + delta``).
 
-    ``w_p = w_a/2 + delta``. The origin is excluded because the A-subharmonic channel is
-    exactly resonant there, which is a frequency-allocation failure rather than a hard
-    calibration -- keeping it would put a column in the scan that no pulse can fix.
+    The origin is dropped by default: the A-subharmonic channel is exactly resonant
+    there, which no pulse can fix.
     """
     from snail_solver.subharmonic_convergence import _freqs, detuning_for_wp
     wa, _wb, ws = _freqs(config)
@@ -143,17 +132,12 @@ def column_tag(delta_GHz: float, target_eta: Optional[float] = None) -> str:
 
 
 def channel_labels(chans, audit: Dict[str, Any]) -> list:
-    """Pair played ``DragChannel``s to their audit rows, so a channel can be NAMED.
+    """Pair played ``DragChannel``s with their audit rows, so each channel is NAMED.
 
-    The scan used to record only ``beat_GHz``/``n_pump``, which makes a channel set
-    unreadable: `+0.200/2` says nothing about WHICH parasite is being corrected, and at
-    strong drive the shed-and-retry leaves one channel whose identity differs column to
-    column. The audit already carries ``process``, ``transition``, ``category`` and the
-    verdict per row; this joins them on the same 0.5 MHz beat bucket the selector uses,
-    so no new physics enumeration is involved.
-
-    A channel with no matching audit row is reported as such rather than dropped --
-    that would mean the selector and the audit disagree, which is worth seeing.
+    ``beat_GHz``/``n_pump`` alone do not say which parasite is corrected, and the
+    shed-and-retry leaves a different survivor column to column. Joined on the
+    selector's own 0.5 MHz beat bucket. A channel with no audit row is reported as
+    such (the selector and audit disagreeing is worth seeing).
     """
     from snail_solver.spectator_audit import _audit_beat_key
 
@@ -182,16 +166,10 @@ def shard_columns(cols: Sequence[Dict[str, Any]], shard: int,
                   n_shards: int) -> list:
     """Every ``n_shards``-th column starting at `shard` -- one machine's share.
 
-    STRIDED, not blocked, and that is the point: cost varies enormously along the
-    axis (a column near a collision is refused in milliseconds, one at the edge of
-    the window solves for 40 minutes), so contiguous blocks would leave one machine
-    running hours after the others finished. A stride interleaves cheap and
-    expensive columns into every shard.
-
-    Shards are disjoint and cover the grid exactly, so the per-column caches never
-    race even on a shared filesystem, and the resulting HDF5 files concatenate: the
-    analysis pass keys rows on ``(delta, target_eta)``, which is unique across
-    shards.
+    STRIDED, not blocked: column cost varies from milliseconds (refused) to ~40 min,
+    so a stride interleaves cheap and expensive columns into every shard. Shards are
+    disjoint and cover the grid, so caches never race and the HDF5 files concatenate
+    (rows are keyed on ``(delta, target_eta)``).
     """
     n = int(n_shards)
     i = int(shard)
@@ -206,26 +184,20 @@ def scan_config(config: Dict[str, Any], *, max_drag_channels: int,
                 envelope_m: Optional[int] = None) -> Dict[str, Any]:
     """The grid-wide base config: a sine_power envelope with enough vanishing edges.
 
-    A raised cosine has ``eps''(0) != 0`` and supports exactly ONE derivative
-    correction; a second and third produce a ``t^(-1/2)`` divergence at both gate edges
-    (see :mod:`snail_solver.drag`). Every shipped device is ``raised_cosine``, so a
-    recursive scan must override it.
+    A raised cosine (every shipped device) supports exactly ONE derivative correction;
+    more diverge as ``t^(-1/2)`` at the gate edges (see :mod:`snail_solver.drag`).
+    ``envelope_m`` comes from the CAP, not the per-column channel count, so
+    ``area_factor`` -- and hence ``t_g`` at fixed peak ``|eta|`` -- is the same for
+    every column.
 
-    ``envelope_m`` is set from the CAP, not from the per-column channel count, so it is
-    one number for the whole grid: ``area_factor`` -- and hence ``t_g`` at fixed peak
-    ``|eta|`` -- must not drift column to column, or the fidelities are not comparable.
+    An explicit `envelope_m` exists for an independently calibrated NO-DRAG baseline
+    (``max_drag_channels=0`` would derive m=2 against the DRAG run's 3: same ``t_g``,
+    different pulse SHAPE).
     """
-    # `envelope_m` overrides the cap-derived value, which matters for exactly one
-    # comparison: an independently calibrated NO-DRAG baseline runs with
-    # max_drag_channels = 0, and the derived m would then be 2 against the DRAG run's
-    # 3. `area_factor` is 1 - rise_frac for any m, so t_g would agree -- but the SHAPE
-    # would not (11.6% of the gate within 1% of peak at m = 2 against 15.6% at m = 3),
-    # and a baseline that is a different pulse is not a baseline.
     m = int(envelope_m) if envelope_m is not None else max(int(max_drag_channels), 2)
     if m < 1:
         raise ValueError(f"envelope_m must be >= 1, got {m}")
     return {**config, "envelope": "sine_power", "envelope_m": m}
-
 
 
 # ===========================================================================
@@ -237,23 +209,15 @@ def coherence_penalty(t_g_ns: float, *, t1_us: Optional[float] = None,
                       n_qubits: int = 2) -> Dict[str, Any]:
     """First-order incoherent error for a gate of length `t_g_ns`. NOT a solve.
 
-    The scan's ``F_avg`` is computed with ``sesolve`` -- a CLOSED system -- so
-    decoherence is absent from it entirely. That biases the whole scan toward weak
-    drive: ``t_g = 2A/eta``, so a low ``eta`` buys a converged model and low leakage
-    while its long gate pays no penalty at all. This function supplies the missing
-    term so the two can be weighed against each other.
-
-    Deliberately transparent rather than clever::
+    The scan's ``F_avg`` comes from a CLOSED-system solve, which biases it toward weak
+    drive (``t_g = 2A/eta``: a long gate pays nothing). This supplies the missing term::
 
         1/T_eff  = n_qubits * (1/T1 + 1/T2)          (whichever are given)
         eps      = 1 - exp(-prefactor * t_g / T_eff)
 
-    The exact prefactor depends on the error model (which channels, and the average
-    over the gate's input states), so it is a KNOB, not a constant baked in here, and
-    the raw ``t_g_over_T`` is reported alongside so any other convention can be
-    applied after the fact. What this is good for is RANKING drive strengths, which
-    is monotone in ``t_g`` under every convention. For an absolute number, score the
-    winning points with a real open-system solve.
+    `prefactor` is a KNOB (the exact value depends on the error model), and the raw
+    ``t_g_over_T`` is reported so any other convention can be applied later. Good for
+    RANKING drive strengths; for an absolute number use a real open-system solve.
 
     Parameters
     ----------
@@ -262,7 +226,7 @@ def coherence_penalty(t_g_ns: float, *, t1_us: Optional[float] = None,
     t1_us, t2_us : float, optional
         Relaxation and total dephasing times (us). Either may be omitted.
     prefactor : float, default 1.0
-        Multiplies ``t_g / T_eff``; set it to your own convention's coefficient.
+        Multiplies ``t_g / T_eff``.
     n_qubits : int, default 2
         Qubits exposed for the gate duration.
 
@@ -290,14 +254,9 @@ def coherence_penalty(t_g_ns: float, *, t1_us: Optional[float] = None,
 
 
 def total_infidelity(F_coh: float, eps_incoherent: Optional[float]) -> float:
-    """Combine the coherent infidelity with the incoherent estimate.
+    """``1 - F_coh * (1 - eps_incoherent)`` (independent to first order).
 
-    Independent to first order, so the fidelities multiply::
-
-        1 - F_total = 1 - F_coh * (1 - eps_incoherent)
-
-    With no coherence times given this is just the coherent infidelity, which is what
-    the scan reported before -- so the default behaviour is unchanged.
+    With no incoherent estimate this is just the coherent infidelity.
     """
     if eps_incoherent is None:
         return float(1.0 - F_coh)
@@ -311,13 +270,10 @@ def _settings_for(col: Dict[str, Any], settings: Dict[str, Any],
                   config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """`settings` with ``target_eta`` pinned to this column's point on the eta axis.
 
-    Also sizes the SHARED offset grid a chirp ridge needs, when one was asked for.
-    :func:`tune_up.plot_chirp_ridge` does not interpolate, so every Rabi row has to sit
-    on the same offset axis -- but the scan's default is a per-row ADAPTIVE span
-    (sized to each row's own linewidth, which grows with drive), so a ridge cannot be
-    drawn from a default run at all, then or later. The span has to be fixed at
-    MEASUREMENT time, and it depends on `target_eta`, which is why this is per column
-    rather than a grid-wide setting.
+    With ``ridge_grid`` (and no explicit span) also sizes the SHARED offset grid a
+    chirp ridge needs: :func:`tune_up.plot_chirp_ridge` does not interpolate, so every
+    Rabi row must sit on one offset axis, fixed at measurement time and dependent on
+    `target_eta` -- hence per column.
     """
     out = {**settings, "target_eta": float(col["target_eta"])}
     if settings.get("ridge_grid") and settings.get("wp_span_MHz") is None:
@@ -330,9 +286,7 @@ def _settings_for(col: Dict[str, Any], settings: Dict[str, Any],
             span_linewidths=float(settings["span_linewidths"]),
             wp_points=int(settings["wp_points"]))
         out["wp_span_MHz"] = float(span)
-        # A fixed span UNDERSAMPLES the weakest row unless the point count grows with
-        # it; ridge_span_MHz returns the count it needs, so honour it rather than
-        # drawing a ridge off a grid too coarse to have measured the shift.
+        # A fixed span undersamples the weakest row unless the point count grows.
         out["wp_points"] = max(int(settings["wp_points"]), int(want))
     return out
 
@@ -340,29 +294,13 @@ def _settings_for(col: Dict[str, Any], settings: Dict[str, Any],
 def _stale_chirp_free(got: Dict[str, Any], max_frac: float) -> bool:
     """True if a cached CHIRP-FREE row would not be chirp-free under `max_frac`.
 
-    Deliberately not a `_column_expect` key. That dict is compared key-by-key
-    against the stored record and every key in it must be PRESENT there, so
-    adding one invalidates every column ever cached -- a 30 h re-solve to
-    re-derive numbers the threshold cannot change. The threshold only ever turns
-    a chirp-free fallback into a failure, so a row that did not take that
-    fallback is unaffected by construction, and a row that did can be re-checked
-    from what it already stores: the law it was rejected for is written out even
-    when it was not used.
-
-    A railed ridge stores no k2/k4 at all. Its excursion is unknown, so it can
-    never qualify as chirp-free and is always stale here.
-
-    The threshold governs exactly ONE of the reasons a column can be chirp-free:
-    `no_measurable_shift`, where it decides whether the shift was small enough to
-    zero. The others -- `stark_crossing`, `chirp_not_converged` -- are chirp-free
-    because no trustworthy law EXISTS at eta*, which no threshold can change, and
-    they store no k2/k4 to test. Applying it to them made every one of them stale
-    forever: all 31 crossings of the 2026-09-25 grid would re-solve on any resume,
-    hit the same crossing, store nothing again, and be stale again. `chirp_free`
-    alone is not the question; the reason is.
-
-    A row from before the reasons existed has none, and it could only have been
-    chirp-free for the one reason there was, so the default is that one.
+    Not a `_column_expect` key, because every expect key must be PRESENT in the cached
+    record, so adding one would invalidate every cached column. The threshold can only
+    turn a ``no_measurable_shift`` fallback into a failure, and that can be re-checked
+    from the stored law. Other chirp-free reasons (``stark_crossing``,
+    ``chirp_not_converged``) have no trustworthy law at eta* and are never stale; a row
+    with no reason predates them and can only be ``no_measurable_shift``. A railed ridge
+    stores no k2/k4, so its excursion is unknown and it is always stale.
     """
     op = got.get("operating_point") or {}
     if not op.get("chirp_free"):
@@ -383,8 +321,10 @@ def _stale_chirp_free(got: Dict[str, Any], max_frac: float) -> bool:
 def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     """Physics a cached column must have been solved under to be reused.
 
-    Grid RESOLUTION is deliberately absent: refining the offset grid must reuse the
-    columns it already has. Everything that changes the pulse or the device is present.
+    Grid RESOLUTION is deliberately absent, so refining the offset grid reuses the
+    columns it has. Everything that changes the pulse, the device, or the stored
+    number is present. ``.get`` defaults mirror the CLI so a synthetic settings dict
+    still keys.
     """
     return {"w_p_GHz": float(col["w_p_GHz"]),
             "target_eta": float(col["target_eta"]),
@@ -401,96 +341,68 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             "probe_shape": str(settings["probe_shape"]),
             "moment_weighting": str(settings["moment_weighting"]),
             "envelope_m": int(settings["envelope_m"]),
-            # Unlike the rest of the grid resolution, this one is not a refinement:
-            # it replaces each row's adaptive span with one shared axis, which is a
-            # different measurement of the same column.
+            # Not refinements but different MEASUREMENTS of the same column: one
+            # shared offset axis instead of adaptive spans, and which rows may
+            # re-measure on a wider window (cannot be re-derived from the record).
             "ridge_grid": bool(settings.get("ridge_grid")),
-            # Same category as `ridge_grid` above: which rows are allowed to
-            # re-measure on a wider window is not grid RESOLUTION, it is a
-            # different measurement of the same column. A row widened under
-            # "both" was fitted over a window up to 3x wider, and for rows kept
-            # either way the fitted centre moves by p99 11.4 MHz -- 20x the
-            # ridge's own row-to-row step. Serving one into a run that asked for
-            # "railed" would mix two measurements inside one dataset.
-            #
-            # Unlike `chirp_free_max_frac` (see `_stale_chirp_free`), this cannot
-            # be re-derived from the stored record: nothing in a column says
-            # which rows were widened or why. So it goes here, and the cost is
-            # real -- every column cached before this key existed is now stale.
-            # That is the correct answer rather than a regrettable one, and it is
-            # affordable only because no grid is being re-run over it.
             "span_growth": str(settings.get("span_growth", "both")),
             "max_compound_growths": int(settings.get("max_compound_growths", 3)),
-            # A bigger pass budget turns a column that "diverged" into a solved one,
-            # so a cached failure must not be reused under a larger one. BOTH
-            # relaxations count: the inner fixed point (chirp_max_passes) and the
-            # outer chirp<->length loop (max_drag_iters). Leaving the latter out was
-            # an omission -- it is a convergence budget on exactly the same footing,
-            # and a real 9-column run failed in it.
+            # Convergence budgets for BOTH relaxations: a bigger one can turn a
+            # cached failure into a fit.
             "chirp_max_passes": int(settings.get("chirp_max_passes", 12)),
             "max_drag_iters": int(settings.get("max_drag_iters", 4)),
-            # The length-fit WINDOW is not grid resolution, whatever its neighbours
-            # above suggest: `length_rabi` searches t_g in [tg_lo, tg_hi] * t_g0 and
-            # RETURNS THE BOUNDARY when the optimum lies outside it. 18 of 73 columns
-            # in the 2026-09-16 run sat exactly on tg_hi and were 5.7x worse than the
-            # free ones, so widening the window changes the answer and must re-solve.
-            # Defaults mirror the CLI so a synthetic settings dict still keys, the
-            # same tolerance chirp_max_passes/max_drag_iters use; a real run always
-            # supplies all three.
+            # The length-fit window changes the answer when the optimum is outside it.
             "tg_lo": float(settings.get("tg_lo", 0.7)),
             "tg_hi": float(settings.get("tg_hi", 1.3)),
             "tg_points": int(settings.get("tg_points", 13)),
-            # Not physics, but it changes the stored NUMBER: before 2026-09-16 the two
-            # score_gate calls passed no `drag_channels`, so every cached row holds a
-            # chirped pulse that played NO DRAG. A cached row from then must not be
-            # served as if it were a DRAG-corrected one. Bump this if the scoring
-            # contract changes again.
-            # Changes the pulse: a zeroed chirp is a different gate.
+            # Change the pulse: a zeroed chirp or decoupled DRAG is a different gate.
             "zero_chirp_frac": float(settings.get("zero_chirp_frac", 0.0)),
             "chirp_free_fallback": bool(settings.get("chirp_free_fallback", False)),
             "couple_drag": bool(settings.get("couple_drag", True)),
             "drag_decouple_fallback": bool(
                 settings.get("drag_decouple_fallback", False)),
+            # Contract versions. score_drag: rows before 2026-09-16 scored a pulse
+            # that played NO DRAG. length_extend: rows before 2026-09-17 report a
+            # length-window BOUNDARY rather than a bracketed optimum. Bump either if
+            # its contract changes again.
             "score_drag": 1,
-            # Likewise for the LENGTH contract: columns solved before 2026-09-17 ran a
-            # length_rabi that returned its search-window BOUNDARY when the optimum lay
-            # outside, instead of extending the grid to bracket it. Their t_g -- and so
-            # their fidelity -- is a bound, not a calibration, and must not be served to
-            # a run that expects the bracketed value.
             "length_extend": 1}
 
 
-def _failure_type(exc: BaseException) -> str:
-    """Name the failure so a row says WHICH relaxation gave up, not just that one did.
+#: (message fragment, failure type, stage) for the two relaxations a tune-up runs.
+#: Named apart because different knobs fix them: the chirp<->DRAG fixed point wants
+#: ``--chirp-max-passes``, the chirp<->length loop wants ``--max-drag-iters``.
+_DIVERGENCES = (("fixed point did not settle", "DragFixedPointDiverged", "chirp"),
+                ("did not converge", "ChirpLengthLoopDiverged", "length"))
 
-    The two are fixed by different knobs, so collapsing them into one label sends
-    someone to the wrong one: the fixed point wants ``--chirp-max-passes``, the
-    chirp<->length loop wants ``--max-drag-iters``.
-    """
+
+def _divergence(exc: BaseException) -> Optional[Tuple[str, str]]:
+    """``(type, stage)`` if `exc` is a relaxation failing to converge, else None."""
     m = str(exc)
-    if "fixed point did not settle" in m:
-        return "DragFixedPointDiverged"
-    if "did not converge" in m:
-        return "ChirpLengthLoopDiverged"
-    return type(exc).__name__
+    for needle, kind, stage in _DIVERGENCES:
+        if needle in m:
+            return kind, stage
+    return None
+
+
+def _failure_type(exc: BaseException) -> str:
+    """Name the failure so a row says WHICH relaxation gave up, not just that one did."""
+    d = _divergence(exc)
+    return d[0] if d else type(exc).__name__
 
 
 def _failure_stage(exc: BaseException) -> str:
     """Which tune-up stage owns the failure, for the row's ``error.stage``."""
-    m = str(exc)
-    if "fixed point did not settle" in m:
-        return "chirp"
-    if "did not converge" in m:
-        return "length"
-    return "tune_up"
+    d = _divergence(exc)
+    return d[1] if d else "tune_up"
 
 
 def audit_column(config: Dict[str, Any], col: Dict[str, Any],
                  settings: Dict[str, Any]) -> Tuple[tuple, Dict[str, Any]]:
     """The DRAG channels and the full audit for one column. No propagation.
 
-    Algebraic only (``expand_terms`` plus one coupler build), which is what makes
-    ``--dry-run`` able to report every column's channel set before anything is solved.
+    Algebraic only (``expand_terms`` plus one coupler build), which is what lets
+    ``--dry-run`` report every column's channel set before anything is solved.
     """
     from snail_solver.spectator_audit import select_drag_channels
     from snail_solver.subharmonic_convergence import config_at_wp
@@ -507,24 +419,33 @@ def audit_column(config: Dict[str, Any], col: Dict[str, Any],
     return channels, audit
 
 
+def _fail(row: Dict[str, Any], t0: float, kind: str, stage: str,
+          message: str) -> Dict[str, Any]:
+    row.update({"ok": False, "seconds": time.perf_counter() - t0,
+                "error": {"type": kind, "stage": stage, "message": message}})
+    return row
+
+
 def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                  settings: Dict[str, Any], *,
                  solver: Optional[Dict[str, Any]] = None,
                  jobs: int = 0, force: bool = False,
                  logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """Calibrate and score ONE column. Returns ``(row, run_doc)`` merged as a dict.
-
-    The order matters and is the whole point of the module:
+    """Calibrate and score ONE column. Returns the row (with its ``run_doc``).
 
     1. move ``w_b`` so the pump is ``w_p`` (``config_at_wp``, which also strips any
-       device chirp -- one calibrated at a different pump must not survive the move);
+       device chirp calibrated at a different pump);
     2. derive the DRAG channels and audit them;
-    3. ``run_tune_up`` -- the Rabi amplitude scan happens HERE, and its only output is
-       the chirp, ``wp_offset`` and ``t_g``;
+    3. ``run_tune_up`` -- the Rabi amplitude scan happens HERE, and its only outputs
+       are the chirp, ``wp_offset`` and ``t_g``;
     4. score ONCE at the resulting operating point.
 
-    Step 3 consumes the eta axis; step 4 produces a scalar. That is what keeps drive
-    strength off the reported fidelity.
+    Step 3 consumes the eta axis; step 4 produces a scalar.
+
+    A column that cannot be calibrated is a RESULT, not an outage: a ``RabiFitError``
+    keeps its chevrons, and a relaxation that fails to converge sheds the weakest DRAG
+    channel and retries (up to ``drag_retries``) before the column is recorded as
+    failed.
     """
     from snail_solver.subharmonic_convergence import config_at_wp, coupler_occupation
     from snail_solver.tune_up import RabiFitError, run_tune_up
@@ -542,16 +463,13 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                 "total_error": audit["total_error"]})
 
     if audit["blocking"] and not force:
-        row.update({"ok": False, "seconds": time.perf_counter() - t0,
-                    "error": {"type": "NonPerturbativeChannel", "stage": "audit",
-                              "message": "; ".join(
-                                  f"{b['name']} g={b['g_MHz']:.3f} MHz "
-                                  f"det={b['detuning_MHz']:.3f} MHz"
-                                  for b in audit["blocking"])}})
-        return row
+        return _fail(row, t0, "NonPerturbativeChannel", "audit", "; ".join(
+            f"{b['name']} g={b['g_MHz']:.3f} MHz det={b['detuning_MHz']:.3f} MHz"
+            for b in audit["blocking"]))
 
     cfg = config_at_wp(config, col["w_p_GHz"], branch=settings["branch"],
                        levels=settings["coupler_levels"])
+
     def _tune(chans):
         return run_tune_up(
             cfg, settings["target_eta"], drag_channels=list(chans),
@@ -581,49 +499,21 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             do_time_rabi=False, jobs=jobs, solver=solver, logger=logger,
             **settings.get("map_kw", {}))
 
-    def _diverged(exc):
-        """Did this column fail to CONVERGE (vs. fail unexpectedly)?
-
-        There are TWO relaxations and they raise different messages, so matching only
-        the inner one let the outer one escape the retry below and kill the whole scan
-        -- a 9-column run died on its first bad column, which is exactly the contract
-        this module is supposed to keep ("a column that cannot be calibrated at high
-        drive is a RESULT").
-
-        * inner, `chirp_from_measured_shift`: the chirp <-> DRAG-quadrature fixed
-          point, "... fixed point did not settle in N passes" (`--chirp-max-passes`).
-        * outer, `run_tune_up`: the chirp <-> length loop, "... did not converge in N
-          passes" (`--max-drag-iters`). With DRAG on, the quadrature scales as 1/t_g,
-          so the chirp and the fitted length are genuinely coupled and this one
-          oscillates in t_g at strong drive.
-
-        Both mean "shed a channel and retry, and if that fails record the column as
-        uncalibrated". Anything else is a bug and still propagates.
-        """
-        m = str(exc)
-        return ("fixed point did not settle" in m or "did not converge" in m)
-
     used = list(channels)
     try:
         out = _tune(used)
     except RabiFitError as exc:
-        # A calibration that stops being measurable is a RESULT about this column, not
-        # an outage: keep the chevrons that were measured and carry on down the axis.
-        row.update({"ok": False, "seconds": time.perf_counter() - t0,
-                    "error": {"type": "RabiFitError", "stage": "rabi",
-                              "message": str(exc)},
-                    "run_doc": {"stages": {"rabi": exc.table}, "device": dict(cfg)}})
+        _fail(row, t0, "RabiFitError", "rabi", str(exc))
+        row["run_doc"] = {"stages": {"rabi": exc.table}, "device": dict(cfg)}
         return row
     except Exception as exc:                      # noqa: BLE001 - recorded, not raised
-        # Composing one correction too many does not merely help less: the
-        # chirp<->DRAG fixed point RUNS AWAY and the column is lost. Whether a given
-        # depth is well posed depends on the operating point (the edge behaviour of
-        # F^(n) against the envelope's vanishing order), so shed the weakest channel
-        # and retry instead of discarding the column. envelope_m is untouched -- it is
-        # the grid-wide cap, and m >= len(channels) still holds as channels are shed.
+        # One correction too many makes the chirp<->DRAG fixed point RUN AWAY, and
+        # whether a depth is well posed depends on the operating point -- so shed the
+        # weakest channel and retry. envelope_m (the grid-wide cap) is untouched;
+        # m >= len(channels) still holds as channels are shed.
         retries = min(int(settings.get("drag_retries", 2)), max(len(used) - 1, 0))
         out = None
-        if _diverged(exc) and retries:
+        if _divergence(exc) and retries:
             for _ in range(retries):
                 used = used[:-1]
                 log.info(f"  chirp<->DRAG fixed point diverged at {len(used) + 1} "
@@ -632,18 +522,12 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                     out = _tune(used)
                     break
                 except RabiFitError:
-                    out = None
                     break
                 except Exception as exc2:         # noqa: BLE001
-                    if not _diverged(exc2):
+                    if not _divergence(exc2):
                         raise
-                    out = None
         if out is None:
-            row.update({"ok": False, "seconds": time.perf_counter() - t0,
-                        "error": {"type": _failure_type(exc),
-                                  "stage": _failure_stage(exc),
-                                  "message": str(exc)}})
-            return row
+            return _fail(row, t0, _failure_type(exc), _failure_stage(exc), str(exc))
         row["drag_channels"] = channel_labels(used, audit)
         row["n_drag_channels"] = len(used)
         row["drag_shed"] = len(channels) - len(used)
@@ -652,25 +536,17 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
     chirp = [float(c) for c in (rec.get("chirp_coeffs_GHz") or ())]
     scfg = config_at_wp(config, col["w_p_GHz"], branch=settings["branch"],
                         levels=settings["coupler_levels"], chirp_coeffs_GHz=chirp)
-    # `[]` and never None for the flat reference: None means "inherit the config chirp".
-    #
-    # `drag_channels=used` is LOAD-BEARING. Multi-channel DRAG does not travel through
-    # `rec["drag_beat_GHz"]` -- that field is the one-channel legacy path and is None
-    # whenever channels were passed -- so omitting it scores an UN-DRAGGED pulse while
-    # the calibration spends its whole time selecting channels and converging the
-    # chirp<->DRAG fixed point. That was the state of every scan in results/ until
-    # 2026-09-15; it hid because the chirp IS DRAG-aware, so the coefficients moved
-    # with the channel set even though nothing was played. `used` is the post-shed set.
-    #
-    # The flat reference passes None, not `[]`: `[]` is FALSY at device_utils.py:317
-    # and so is indistinguishable from None there -- unlike `chirp_coeffs_GHz`, where
-    # the distinction is enforced by a raise. Do not mirror the chirp convention here.
+    # `drag_channels=used` (the post-shed set) is LOAD-BEARING: multi-channel DRAG
+    # does not travel via rec["drag_beat_GHz"], so omitting it scores an UN-DRAGGED
+    # pulse. The flat reference passes chirp `[]` (None would inherit the config
+    # chirp) but drag_channels None -- `[]` and None are equivalent there.
     chirped = score_gate(scfg, rec, chirp, solver=solver, drag_channels=used)
     flat = score_gate(scfg, rec, [], solver=solver, drag_channels=None)
 
     stages = out["stages"]
     fit = (stages.get("rabi") or {}).get("fit") or {}
     chirp_stage = stages.get("chirp") or {}
+    scored = ("F_avg", "leakage", "transfer", "t_g_ns", "n_drag_channels")
     row.update({
         "ok": True, "error": None, "seconds": time.perf_counter() - t0,
         "operating_point": rec,
@@ -680,18 +556,11 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                   "quartic_fraction": chirp_stage.get("quartic_fraction"),
                   "drag_correction_ratio": chirp_stage.get("drag_correction_ratio"),
                   "min_abs_detuning_GHz": chirp_stage.get("min_abs_detuning_GHz")},
-        # t_g_ns and n_drag_channels are kept because a scored number that silently
-        # dropped its DRAG is otherwise indistinguishable from one that kept it, and
-        # because the gate LENGTH of each trace is a reported quantity.
-        "fidelity": {k: chirped.get(k) for k in
-                     ("F_avg", "leakage", "transfer", "t_g_ns", "n_drag_channels")},
-        "flat": {k: flat.get(k) for k in
-                 ("F_avg", "leakage", "transfer", "t_g_ns", "n_drag_channels")},
+        # t_g_ns / n_drag_channels: each trace's length, and whether it kept its DRAG.
+        "fidelity": {k: chirped.get(k) for k in scored},
+        "flat": {k: flat.get(k) for k in scored},
         "delta_F": ((chirped.get("F_avg") or 0.0) - (flat.get("F_avg") or 0.0)),
-        # The scan solves a CLOSED system, so this is the only place gate LENGTH is
-        # charged for. Without it the scan is biased toward weak drive: t_g = 2A/eta,
-        # so a low eta buys convergence and low leakage and pays nothing for a gate
-        # five times longer.
+        # The only place gate LENGTH is charged for in a closed-system scan.
         "coherence": coherence_penalty(
             float(rec["t_g_ns"]), t1_us=settings.get("t1_us"),
             t2_us=settings.get("t2_us"),
@@ -700,20 +569,18 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
         "run_doc": {"operating_point": rec, "t_g0_ns": out["t_g0_ns"],
                     "stages": stages, "device": dict(scfg)},
     })
-    # `length_rabi` now EXTENDS its grid to bracket the maximum, and reports
-    # `railed` only when no interior optimum exists out to its cap -- a result about
-    # the operating point rather than a boundary masquerading as a calibration. Take
-    # its word for it; re-deriving this from tg_lo/tg_hi would miss the extension.
-    _t_g0 = float(out["t_g0_ns"])
-    _t_g = float(rec["t_g_ns"])
-    _rail = bool(rec.get("t_g_railed"))
-    row["t_g_railed"] = ("hi" if _rail and _t_g > _t_g0 else
-                         "lo" if _rail else None)
-    row["t_g_over_t_g0"] = float(rec.get("t_g_over_t_g0", _t_g / _t_g0))
+    # length_rabi extends its grid to bracket the maximum and reports `railed` only
+    # when no interior optimum exists out to its cap; take its word for it.
+    t_g0 = float(out["t_g0_ns"])
+    t_g = float(rec["t_g_ns"])
+    railed = bool(rec.get("t_g_railed"))
+    row["t_g_railed"] = ("hi" if railed and t_g > t_g0 else
+                         "lo" if railed else None)
+    row["t_g_over_t_g0"] = float(rec.get("t_g_over_t_g0", t_g / t_g0))
     row["t_g_grid_span_t_g0"] = rec.get("t_g_grid_span_t_g0")
     row["t_g_extensions"] = int(rec.get("t_g_extensions", 0))
-    if _rail:
-        log.info(f"  WARNING: t_g={_t_g:.2f} ns ({_t_g / _t_g0:.2f} t_g0) is still on "
+    if railed:
+        log.info(f"  WARNING: t_g={t_g:.2f} ns ({t_g / t_g0:.2f} t_g0) is still on "
                  f"an edge after {row['t_g_extensions']} grid extension(s) over "
                  f"{row['t_g_grid_span_t_g0']} x t_g0 -- no interior full swap exists "
                  f"here, so this length is a bound, not a calibration")
@@ -727,32 +594,15 @@ def save_column_rabi(cache_path: str, row: Dict[str, Any],
                      logger: Optional[logging.Logger] = None) -> Optional[str]:
     """Write this column's Rabi stage beside its JSON cache, from the WORKER.
 
-    The chevrons are the column: `amp_points x wp_points` exact propagations,
-    91% of a pass-A column's wall time and 69% of a pass-B column's on the
-    2026-09-25 grid. Every question about the FIT policy -- which rows to keep,
-    which law to fit, whether a chirp is measurable -- is answerable from them
-    in seconds, and unanswerable without them at any price short of re-solving.
+    The chevrons are most of a column's cost, and every question about the FIT policy
+    is answerable from them without re-solving. The parent's `_write_run` alone is not
+    enough: the pool's results are consumed in submission order (so nothing is written
+    until the first-submitted column returns), and a column served from cache is never
+    re-written into a resumed run's output file. Writing here puts the arrays on disk
+    before the row is returned.
 
-    Until this existed they reached disk only through the parent's `_write_run`,
-    and that has two holes, both of which fired on real runs:
-
-    * `_run_pool` is `list(ex.map(...))`, consumed IN SUBMISSION ORDER, so the
-      parent writes nothing until the first-submitted column returns. The 2 GHz
-      pass B submitted its expensive tail first and sat at 6144 bytes for 43
-      hours with 116 columns finished. A kill in that window would have cost
-      116 x 615 propagations with no way to get them back.
-    * `_write_run` is skipped entirely for a column served from CACHE, and a
-      resumed run rewrites its output file. The 5 MHz eta=1.3 grid was resumed
-      with 55 of 61 columns cached and its HDF5 now holds 6 of them -- so the
-      grid carrying that comparison's headline numbers cannot be re-fitted at
-      all, while eta=1.5, never resumed, is intact.
-
-    Writing from the worker closes both: the arrays are on disk before the row
-    is even returned, and a cache hit means the file is already there.
-
-    Compressed `.npz` beside the cache, a few MB a column. Never fatal -- a
-    column that solved is worth keeping even if its measurement cannot be
-    saved, and the parent may still write it.
+    Compressed ``<cache>_rabi.npz`` with flat keys (``chevrons/00007/metric``), readable
+    without this module. Never fatal: returns None on failure.
     """
     stages = ((row.get("run_doc") or {}).get("stages") or {})
     rabi = stages.get("rabi")
@@ -760,13 +610,9 @@ def save_column_rabi(cache_path: str, row: Dict[str, Any],
         return None
     out = os.path.splitext(cache_path)[0] + "_rabi.npz"
     try:
-        import numpy as _np
         flat: Dict[str, Any] = {}
 
         def _put(prefix: str, obj: Any) -> None:
-            # A chevron list becomes `chevrons/00007/metric` and so on. Flat keys
-            # rather than a pickled object graph, so the file stays readable by
-            # anything that speaks npz and does not need this module to load.
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     _put(f"{prefix}/{k}" if prefix else str(k), v)
@@ -774,13 +620,13 @@ def save_column_rabi(cache_path: str, row: Dict[str, Any],
                 for i, v in enumerate(obj):
                     _put(f"{prefix}/{i:05d}", v)
             elif obj is None:
-                flat[prefix] = _np.array(_np.nan)
+                flat[prefix] = np.array(np.nan)
             else:
-                flat[prefix] = _np.asarray(obj)
+                flat[prefix] = np.asarray(obj)
 
         _put("", rabi)
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        _np.savez_compressed(out, **flat)
+        np.savez_compressed(out, **flat)
         return out
     except Exception as exc:                          # never lose a solved column
         if logger:
@@ -790,21 +636,15 @@ def save_column_rabi(cache_path: str, row: Dict[str, Any],
 
 
 def _column_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """One column, in a worker process. Module level so it is picklable.
+    """One column, in a worker process (module level so it is picklable).
 
-    Returns the row, including its ``run_doc``; the PARENT does the HDF5 write, since
-    several processes appending to one file would corrupt it. The per-column JSON
-    cache is written here, so a pooled run is still resumable if it dies.
-
-    The MEASUREMENT is written here too, and that is not a duplicate of the HDF5
-    write -- it is the only copy that exists until the parent gets round to its
-    own. See :func:`save_column_rabi`.
+    Returns the row with its ``run_doc``; the PARENT does the HDF5 write, since several
+    processes appending to one file would corrupt it. The JSON cache (success only)
+    and the Rabi arrays (always -- a failed column's chevrons say why) are written
+    here, so a pooled run is resumable if it dies.
     """
     col, settings = payload["col"], payload["settings"]
-    # A log PER COLUMN. Without this a pooled run is silent for hours: the parent only
-    # prints a line as each column lands, and a column is 2*n_channels outer passes
-    # each containing a serial length scan. `tail -f` on one of these is how you see
-    # that a scan is progressing rather than wedged.
+    # A log PER COLUMN (`tail -f`), since the parent is silent until a column lands.
     logger = None
     if payload.get("log_path"):
         from snail_solver.log_utils import setup_run_logger
@@ -818,10 +658,6 @@ def _column_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
                        force=payload["force"], logger=logger)
     row.update(payload["expect"])
     row["cached"] = False
-    # The JSON cache is for RESUMING and so is written only for a column that
-    # produced a result. The Rabi arrays are written for BOTH, because a failed
-    # column's chevrons are the only way to see why it failed -- and because
-    # re-deriving them costs what the column cost.
     if payload.get("cache_path"):
         save_column_rabi(payload["cache_path"], row, logger=logger)
         if row.get("ok"):
@@ -834,6 +670,21 @@ def _column_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ===========================================================================
 # The scan
 # ===========================================================================
+def _load_cached(path: Optional[str], expect: Dict[str, Any],
+                 settings: Dict[str, Any], overwrite: bool,
+                 log: logging.Logger) -> Optional[Dict[str, Any]]:
+    """A reusable cached column, or None (overwrite, mismatch, or stale chirp-free)."""
+    from snail_solver.subharmonic_convergence import _cache_load
+    cached = None if overwrite else _cache_load(path, expect, log)
+    if cached is not None and _stale_chirp_free(
+            cached, settings.get("chirp_free_max_frac", 0.10)):
+        log.info("  cached CHIRP-FREE row sweeps more than "
+                 "--chirp-free-max-frac of a half-linewidth, so a chirp "
+                 "was measurable and was discarded -- re-solving")
+        return None
+    return cached
+
+
 def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 target_etas: Sequence[float], *,
                 device_path: Optional[str] = None,
@@ -872,22 +723,16 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Tune up a chirped recursive-DRAG pulse at every offset from A's subharmonic.
 
-    Two ways to spend cores, and the right one is not obvious:
+    Two ways to spend cores:
 
-    * ``column_workers = 1`` (default): columns run one at a time with `jobs` inside.
-      Step 1's Rabi table is ``amp_points x wp_points`` independent chevron solves, so
-      it saturates a machine on its own.
-    * ``column_workers > 1``: columns run in a pool. This is what a long scan wants,
-      because ``tune_up`` step 4 (``length_rabi``) takes NO jobs -- it is an optimizer
-      over gate length and runs single-threaded, for minutes per column once the pulse
-      carries a multi-channel recursion. During that step a `jobs`-parallel run leaves
-      almost every core idle, and only a pool over columns can fill them.
+    * ``column_workers = 1`` (default): columns run one at a time with `jobs` inside;
+      step 1's ``amp_points x wp_points`` chevron solves saturate a machine alone.
+    * ``column_workers > 1``: columns run in a pool. What a long scan wants, because
+      ``tune_up`` step 4 (``length_rabi``) is serial and runs for minutes per column,
+      leaving a `jobs`-parallel run's cores idle.
 
-    Each column is cached under ``outdir`` and re-read unless `overwrite`; a file is
-    written only on success, so an interrupted scan resumes either way.
-
-    Each column is cached under ``outdir`` and re-read unless `overwrite`; a file is
-    written only on success, so an interrupted scan resumes.
+    Each column is cached under ``outdir`` on success and re-read unless `overwrite`,
+    so an interrupted scan resumes.
 
     Returns
     -------
@@ -896,9 +741,8 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         ``settings``, ``rows`` (one per column, each with ``ok`` and either scores or an
         ``error``), ``landmarks`` and ``summary``.
     """
-    from snail_solver.h5_io import (attach_figures, save_doc,
-                                    split_address)
-    from snail_solver.subharmonic_convergence import (_cache_load, collision_landmarks,
+    from snail_solver.h5_io import attach_figures, save_doc, split_address
+    from snail_solver.subharmonic_convergence import (collision_landmarks,
                                                       nearest_landmark)
 
     log = logger or logging.getLogger("wp_scan")
@@ -914,7 +758,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "min_ratio": float(min_ratio), "max_ratio": float(max_ratio),
         "envelope_m": int(base["envelope_m"]),
         "wp_points": int(wp_points),
-        "wp_span_MHz": (None if wp_span_MHz is None else float(wp_span_MHz)),
+        "wp_span_MHz": _opt_float(wp_span_MHz),
         "ridge_grid": bool(ridge_grid),
         "span_linewidths": float(span_linewidths), "n_time": int(n_time),
         "window_tg": float(window_tg), "tg_points": int(tg_points),
@@ -922,11 +766,6 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "chirp_degree": int(chirp_degree), "max_drag_iters": int(max_drag_iters),
         "chirp_max_passes": int(chirp_max_passes),
         "contrast_min": float(contrast_min), "quartic_warn": float(quartic_warn),
-        # The shaped probe is what makes strong drive measurable at all: a flat pump
-        # at |eta| = 1.2 leaks 0.245 (four fifths into the coupler) and destroys the
-        # chevron the shift fit needs, while the shaped pulse at the same peak leaks
-        # 4e-3. Its rungs are deconvolved back to a pointwise law by the envelope
-        # moments, so nothing downstream changes.
         "zero_chirp_frac": float(zero_chirp_frac),
         "chirp_free_fallback": bool(chirp_free_fallback),
         "chirp_free_max_frac": float(chirp_free_max_frac),
@@ -936,32 +775,29 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "max_compound_growths": int(max_compound_growths),
         "couple_drag": bool(couple_drag),
         "drag_decouple_fallback": bool(drag_decouple_fallback),
+        # The shaped ("gate") probe is what makes strong drive measurable: a flat pump
+        # at |eta| = 1.2 leaks 0.245 and destroys the chevron, the shaped one 4e-3.
         "probe_shape": str(probe_shape),
         "moment_weighting": str(moment_weighting),
-        # A Rabi row is a CONSTANT-probe chevron, so at strong drive it leaks far more
-        # than the shaped pulse does -- and tune_up's own default only rejects a row
-        # past 35% leakage, which is no longer measuring the gate's Stark shift at all.
-        # Tighten this whenever target_eta pushes probes past the leakage knee.
-        "leak_max": (None if leak_max is None else float(leak_max)),
+        # A constant-probe row leaks far more than the gate at strong drive, and
+        # tune_up's default only rejects past 35%: tighten this past the leakage knee.
+        "leak_max": _opt_float(leak_max),
         "map_kw": ({} if leak_max is None else {"leak_max": float(leak_max)}),
         "drop_origin": bool(drop_origin), "envelope": base["envelope"],
-        # A sharded file holds PART of the grid; say which part, or a merged
-        # analysis cannot tell an incomplete run from a complete one.
+        # A sharded file holds PART of the grid; say which part.
         "shard": int(shard), "n_shards": int(n_shards),
         "drag_retries": int(drag_retries),
-        "t1_us": (None if t1_us is None else float(t1_us)),
-        "t2_us": (None if t2_us is None else float(t2_us)),
+        "t1_us": _opt_float(t1_us),
+        "t2_us": _opt_float(t2_us),
         "decoh_prefactor": float(decoh_prefactor),
-        # The Rabi amplitude ladder is a FRACTION of each target_eta, so it differs
-        # per eta -- it is the calibration input that builds that eta's chirp, not a
-        # shared axis. Recorded per eta so a run says exactly what it measured.
+        # The Rabi amplitude ladder is a FRACTION of each target_eta, so it is
+        # recorded per eta.
         "eta_scan_by_target": {f"{e:g}": [float(x) for x in
                                           np.linspace(eta_lo, eta_hi,
                                                       int(amp_points)) * e]
                                for e in etas},
     }
-    # (delta, target_eta) grid. delta is the outer loop so a killed run leaves whole
-    # eta slices comparable rather than a ragged edge.
+    # (delta, target_eta) grid; delta outermost so a killed run leaves whole eta slices.
     base_cols = columns_for(base, offsets_GHz, drop_origin=drop_origin)
     cols = [{**c, "target_eta": e} for c in base_cols for e in etas]
     n_all = len(cols)
@@ -977,48 +813,45 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
     rows: List[Dict[str, Any]] = []
     t_start = time.perf_counter()
 
+    def _paths(col):
+        tag = column_tag(col["delta_GHz"], col["target_eta"])
+        path = os.path.join(cache_dir, f"col_{tag}.json") if cache_dir else None
+        return tag, path
+
     def _write_run(row, col, tag):
         """Move a row's tune-up document into the scan file (parent process only)."""
         run_doc = row.pop("run_doc", None)
         if run_doc is not None and sweep_path:
+            h5 = split_address(sweep_path)[0]
             row["run"] = save_doc(
-                split_address(sweep_path)[0], run_doc,
+                h5, run_doc,
                 attrs={"delta_GHz": float(col["delta_GHz"]),
                        "w_p_GHz": float(col["w_p_GHz"]),
                        "status": "ok" if row.get("ok") else "failed"},
                 group=f"columns/{tag}")
-            # The chevrons ARE the column's cost and the only way to read a failed
-            # one, so the picture goes in beside the arrays it was drawn from. Done
-            # in the parent, after the write, and never allowed to fail the row.
+            # The chevron picture goes in beside its arrays; never fails the row.
             if column_figures:
                 figs = render_column_figures(
                     {**run_doc, "delta_GHz": col["delta_GHz"],
                      "w_p_GHz": col["w_p_GHz"], "target_eta": col.get("target_eta")},
                     tag, figdir=(os.path.join(outdir, "column_figs") if outdir
-                                 else os.path.join(os.path.dirname(
-                                     split_address(sweep_path)[0]) or ".",
-                                     "column_figs")),
+                                 else os.path.join(os.path.dirname(h5) or ".",
+                                                   "column_figs")),
                     ridge=True, logger=log)
                 if figs:
-                    attach_figures(f"{split_address(sweep_path)[0]}:/columns/{tag}",
-                                   figs)
+                    attach_figures(f"{h5}:/columns/{tag}", figs)
+
+    def _done():
+        return _scan_doc(base, device_path, settings, base_cols, etas, landmarks,
+                         rows, time.perf_counter() - t_start)
 
     if int(column_workers) > 1 and len(cols) > 1:
-        # Pooled over COLUMNS: see the note in the docstring -- step 4 is serial, so
-        # this is the only thing that keeps the cores busy on a long scan.
         from snail_solver.subharmonic_convergence import _run_pool
         pending, payloads = [], []
         for col in cols:
-            tag = column_tag(col["delta_GHz"], col["target_eta"])
-            path = os.path.join(cache_dir, f"col_{tag}.json") if cache_dir else None
+            tag, path = _paths(col)
             expect = _column_expect(col, settings)
-            cached = None if overwrite else _cache_load(path, expect, log)
-            if cached is not None and _stale_chirp_free(
-                    cached, settings.get("chirp_free_max_frac", 0.10)):
-                log.info("  cached CHIRP-FREE row sweeps more than "
-                         "--chirp-free-max-frac of a half-linewidth, so a chirp "
-                         "was measurable and was discarded -- re-solving")
-                cached = None
+            cached = _load_cached(path, expect, settings, overwrite, log)
             if cached is not None:
                 cached["cached"] = True
                 cached["nearest_landmark"] = nearest_landmark(landmarks,
@@ -1050,25 +883,17 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                         else f"FAILED {row.get('error', {}).get('stage', '?')}")
                      + ("  (cached)" if cached is not None else ""))
             rows.append(row)
-        return _scan_doc(base, device_path, settings, base_cols, etas, landmarks,
-                         rows, time.perf_counter() - t_start)
+        return _done()
 
     for i, col in enumerate(cols):
-        tag = column_tag(col["delta_GHz"], col["target_eta"])
-        path = os.path.join(cache_dir, f"col_{tag}.json") if cache_dir else None
+        tag, path = _paths(col)
         log.info(f"=== [{i + 1}/{len(cols)}] delta={col['delta_GHz']:+.4f} GHz  "
                  f"eta*={col['target_eta']:g}  w_p={col['w_p_GHz']:.4f}  "
                  f"Delta_sub={col['delta_sub_GHz']:+.4f}  "
                  f"A-subharm beat={col['subharm_beat_MHz']:+.1f} MHz")
 
         expect = _column_expect(col, settings)
-        cached = None if overwrite else _cache_load(path, expect, log)
-        if cached is not None and _stale_chirp_free(
-                cached, settings.get("chirp_free_max_frac", 0.10)):
-            log.info("  cached CHIRP-FREE row sweeps more than "
-                     "--chirp-free-max-frac of a half-linewidth, so a chirp "
-                     "was measurable and was discarded -- re-solving")
-            cached = None
+        cached = _load_cached(path, expect, settings, overwrite, log)
         if cached is not None:
             log.info("  cached")
             cached["cached"] = True
@@ -1079,9 +904,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                            jobs=jobs, force=force, logger=log)
         row.update(expect)
         row["cached"] = False
-        lm = nearest_landmark(landmarks, col["delta_sub_GHz"])
-        row["nearest_landmark"] = lm
-
+        row["nearest_landmark"] = nearest_landmark(landmarks, col["delta_sub_GHz"])
         _write_run(row, col, tag)
 
         if row.get("ok"):
@@ -1092,9 +915,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                         if row['coherence']['eps_incoherent'] is not None else "")
                      + f"n_s={row['n_coupler']:.2e}  "
                      f"{row['n_drag_channels']} chan  {row['seconds']:.1f}s")
-            # Name the channels that were actually PLAYED. A bare count hides which
-            # parasite is being corrected, and the shed-and-retry leaves a different
-            # survivor column to column at strong drive.
+            # Name the channels actually PLAYED (the survivor set varies by column).
             for ch in (row.get("drag_channels") or ()):
                 log.info(f"    drag: {ch['beat_GHz']:+.4f} GHz k={ch['n_pump']} "
                          f"[{ch.get('category') or '?'}] {ch.get('label')}"
@@ -1107,14 +928,11 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                     json.dump(row, fh, default=float)
         else:
             log.info(f"  FAILED [{row['error']['stage']}] {row['error']['message'][:120]}")
-            if stop_on_error:
-                rows.append(row)
-                break
         rows.append(row)
+        if stop_on_error and not row.get("ok"):
+            break
 
-    return _scan_doc(base, device_path, settings, base_cols, etas, landmarks, rows,
-                     time.perf_counter() - t_start)
-
+    return _done()
 
 
 def column_figure_title(row_or_doc: Dict[str, Any], tag: str) -> str:
@@ -1139,28 +957,13 @@ def render_column_figures(run_doc: Dict[str, Any], tag: str, figdir: str, *,
                           logger: Optional[logging.Logger] = None) -> Dict[str, str]:
     """Render ONE column's chevron map and chirp ridge from its stored stages.
 
-    The chevrons are the expensive part of a column -- `amp_points x wp_points` exact
-    trajectories -- and they are what a failed or suspicious column has to be read
-    from. They are already saved as arrays under ``stages.rabi.chevrons``; this draws
-    them so the picture travels in the same file, the way ``tune_up --plot`` does for
-    a single run.
+    Best-effort: the chevron figure needs only ``stages.rabi`` (so a column whose FIT
+    failed still gets one -- the column whose chevrons matter most); the ridge also
+    needs the chirp and a fitted length and is skipped without them; a rendering error
+    is logged and swallowed.
 
-    Deliberately best-effort and order-independent:
-
-    - A column whose FIT failed still has a Rabi table, and that is exactly the
-      column whose chevrons someone needs, so the chevron figure is rendered from
-      ``stages.rabi`` alone and does not depend on there being an operating point.
-    - The ridge additionally needs the chirp projection and the fitted length, so it
-      is skipped (not failed) for a column that never got that far.
-    - A rendering error is logged and swallowed. A finished scan is never worth
-      losing to matplotlib, which is the rule :func:`h5_io.attach_figures` already
-      applies to STORING one.
-
-    Returns
-    -------
-    dict
-        ``{"rabi": path}`` plus ``{"chirp_ridge": path}`` when it could be drawn --
-        ready to hand straight to :func:`h5_io.attach_figures`.
+    Returns ``{"rabi": path}`` plus ``{"chirp_ridge": path}`` when drawn, ready for
+    :func:`h5_io.attach_figures`.
     """
     log = logger or logging.getLogger("wp_scan")
     stages = ((run_doc or {}).get("stages")) or {}
@@ -1192,16 +995,10 @@ def render_column_figures(run_doc: Dict[str, Any], tag: str, figdir: str, *,
 def attach_all_column_figures(path: str, *, figdir: Optional[str] = None,
                               ridge: bool = True, only: Optional[Sequence[str]] = None,
                               logger: Optional[logging.Logger] = None) -> int:
-    """Render and embed every column's figures in an EXISTING scan file.
+    """Render and embed every column's figures in an EXISTING scan file. No solves.
 
-    Backfills a file written before the figures were wired in, and re-renders one
-    after a plotting-code change -- the same job ``tune_up --replot`` does for a
-    single run. Reads the arrays already in the file, so it solves nothing.
-
-    Returns
-    -------
-    int
-        How many figures were embedded across all columns.
+    Backfills an older file or re-renders after a plotting change. Returns how many
+    figures were embedded.
     """
     from snail_solver.h5_io import attach_figures, load_doc
     log = logger or logging.getLogger("wp_scan")
@@ -1216,11 +1013,8 @@ def attach_all_column_figures(path: str, *, figdir: Optional[str] = None,
             rows[column_tag(float(r["delta_GHz"]), float(r["target_eta"]))] = r
         except (KeyError, TypeError, ValueError):
             continue
-    # Per-FILE subdirectory. Two scans of the same grid live side by side (a constant-
-    # probe run and a shaped-probe one, say) and their column TAGS are identical, so a
-    # shared directory means the second replot silently overwrites the first's PNGs.
-    # The embedded copies are safe either way -- each is inside its own file -- but the
-    # loose ones are what someone opens.
+    # Per-FILE subdirectory: two scans of the same grid share column tags, and would
+    # overwrite each other's loose PNGs.
     stem = os.path.splitext(os.path.basename(os.path.abspath(path)))[0]
     figdir = figdir or os.path.join(os.path.dirname(os.path.abspath(path)) or ".",
                                     "column_figs", stem)
@@ -1229,8 +1023,7 @@ def attach_all_column_figures(path: str, *, figdir: Optional[str] = None,
         if only and tag not in set(only):
             continue
         run_doc = dict(columns[tag])
-        # The per-column document does not repeat the grid coordinates; the scan row
-        # does, so merge them in for the title.
+        # The grid coordinates live on the scan row; merge them in for the title.
         for k in ("delta_GHz", "w_p_GHz", "target_eta"):
             if k not in run_doc and k in rows.get(tag, {}):
                 run_doc[k] = rows[tag][k]
@@ -1249,19 +1042,16 @@ def _scan_doc(base, device_path, settings, base_cols, etas, landmarks, rows,
               seconds: float) -> Dict[str, Any]:
     """Assemble the scan document, ranking the best point on TOTAL infidelity.
 
-    Ranking on ``F_avg`` alone would always prefer the weakest drive: the coherent
-    score improves as the gate lengthens and the closed-system solve never charges for
-    the extra time. When coherence times are given, the best point is chosen on
-    ``infidelity_total`` instead, which is the whole reason that column exists.
+    Ranking on ``F_avg`` alone always prefers the weakest drive (the closed-system
+    solve never charges for a longer gate), so ``infidelity_total`` is used when
+    coherence times were given.
     """
     def _coh_inf(r):
-        """Coherent infidelity, tolerant of a row written before this column existed."""
         if r.get("infidelity_coherent") is not None:
             return float(r["infidelity_coherent"])
         return 1.0 - float((r.get("fidelity") or {}).get("F_avg") or 0.0)
 
     def _rank(r):
-        """Total when the incoherent term is available, else coherent."""
         return (r["infidelity_total"] if r.get("infidelity_total") is not None
                 else _coh_inf(r))
 
@@ -1302,7 +1092,6 @@ def _scan_doc(base, device_path, settings, base_cols, etas, landmarks, rows,
     }
 
 
-
 def rescore_open_system(doc: Dict[str, Any], *, t1_us: float,
                         t2_us: Optional[float] = None,
                         coupler_t1_us: Optional[float] = None,
@@ -1311,14 +1100,9 @@ def rescore_open_system(doc: Dict[str, Any], *, t1_us: float,
                         logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Re-score the best `top` columns of a finished scan with a real open-system solve.
 
-    Stage B of the drive-strength question. The scan itself ranks on the coherent
-    fidelity plus a first-order incoherent ESTIMATE, which is enough to order the eta
-    values; this replaces the estimate with ``mesolve`` on the handful of points that
-    ordering actually picked out. 16 solves per point on a ``dim^2`` density matrix, so
-    it is deliberately not something the scan does everywhere.
-
-    Mutates and returns `doc`: each rescored row gains an ``open_system`` block, and
-    the document gains ``open_system`` with the settings used.
+    Replaces the first-order incoherent ESTIMATE with ``mesolve`` (16 solves per point
+    on a ``dim^2`` density matrix) on the few points the ranking picked out. Mutates
+    and returns `doc`: each rescored row gains ``open_system``, as does the document.
     """
     from snail_solver.device_utils import build_coupler
     from snail_solver.open_system import collapse_ops, open_iswap_fidelity
@@ -1329,6 +1113,8 @@ def rescore_open_system(doc: Dict[str, Any], *, t1_us: float,
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     base = doc["device"]
     settings = doc["settings"]
+    times = {"t1_us": float(t1_us), "t2_us": _opt_float(t2_us),
+             "coupler_t1_us": _opt_float(coupler_t1_us)}
 
     def _rank(r):
         v = r.get("infidelity_total")
@@ -1343,8 +1129,8 @@ def rescore_open_system(doc: Dict[str, Any], *, t1_us: float,
         cfg = config_at_wp(base, r["w_p_GHz"], branch=settings["branch"],
                            levels=settings["coupler_levels"], chirp_coeffs_GHz=chirp)
         t_g = float(rec["t_g_ns"])
-        # amp_scale is re-derived, never read back off the record: the fixed-|eta|
-        # algebra is what keeps the pulse the one that was calibrated.
+        # amp_scale re-derived, never read off the record, so the pulse is the
+        # calibrated one.
         amp = fixed_eta_amp_scale(cfg, t_g, float(r["target_eta"]))
         cpl, _w_p, _peak = build_coupler(cfg, t_g, amp,
                                          float(rec["wp_offset_GHz"]),
@@ -1353,21 +1139,14 @@ def rescore_open_system(doc: Dict[str, Any], *, t1_us: float,
                            coupler_t1_us=coupler_t1_us)
         out = open_iswap_fidelity(cpl, 0, 1, t_g, c_ops=ops,
                                   fit_virtual_z=fit_virtual_z, **solver)
-        r["open_system"] = {**out, "t1_us": float(t1_us),
-                            "t2_us": (None if t2_us is None else float(t2_us)),
-                            "coupler_t1_us": (None if coupler_t1_us is None
-                                              else float(coupler_t1_us)),
+        r["open_system"] = {**out, **times,
                             "infidelity": float(1.0 - out["F_avg"]),
                             "estimate_infidelity": r.get("infidelity_total")}
         est = r.get("infidelity_total")
         log.info(f"  delta={r['delta_GHz']:+.4f} eta*={r['target_eta']:g} "
                  f"t_g={t_g:.1f}ns  1-F_open={1 - out['F_avg']:.3e}"
                  + (f"  (estimate was {est:.3e})" if est is not None else ""))
-    doc["open_system"] = {"t1_us": float(t1_us),
-                          "t2_us": (None if t2_us is None else float(t2_us)),
-                          "coupler_t1_us": (None if coupler_t1_us is None
-                                            else float(coupler_t1_us)),
-                          "n_rescored": len(ok), "top": int(top)}
+    doc["open_system"] = {**times, "n_rescored": len(ok), "top": int(top)}
     return doc
 
 
@@ -1378,16 +1157,12 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
                   max_ratio: float = 0.3,
                   eta_lo: float = 0.2, eta_hi: float = 1.0, amp_points: int = 41,
                   wp_points: int = 25, drop_origin: bool = True,
-                  # Referenced in the body since the envelope-m derivation landed,
-                  # but never added here, so --dry-run raised NameError for every
-                  # invocation: the one command whose whole job is to be run BEFORE
-                  # spending anything. Default mirrors scan_config's own derivation.
                   envelope_m: Optional[int] = None,
                   audit: bool = True) -> str:
     """The ``--dry-run`` report: geometry, cost, and every column's channel audit.
 
-    Solves nothing. This is the "point out any other relevant channel before running"
-    step -- read it before spending anything.
+    Solves nothing -- read it before spending anything. With `audit` the report is
+    printed as it streams and ``""`` is returned; without, the geometry is returned.
     """
     from snail_solver.spectator_audit import (print_channel_audit,
                                               select_drag_channels)
@@ -1410,6 +1185,7 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
     base_cols = columns_for(base, offsets_GHz, drop_origin=drop_origin)
     cols = [{**c, "target_eta": e} for c in base_cols for e in tetas]
     etas = np.linspace(eta_lo, eta_hi, int(amp_points)) * tetas[0]
+    landmarks = collision_landmarks(base, branch=branch)
 
     lines = [
         "subharmonic gate scan -- dry run (nothing is solved)",
@@ -1434,7 +1210,7 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "",
         "  landmarks on this axis (other processes that go resonant):",
     ]
-    for lm in collision_landmarks(base, branch=branch):
+    for lm in landmarks:
         w_p_off = lm["w_p_GHz"] - 0.5 * wa
         lines.append(f"    Delta_sub={lm['delta_sub_GHz']:+8.4f}  w_p={lm['w_p_GHz']:.4f} "
                      f"(delta={w_p_off:+.4f})  k={lm['n_pump']}  "
@@ -1446,25 +1222,22 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
                  "perturbative -> refused)")
     hdr = "".join(f"{c['delta_GHz'] * 1e3:>8.0f}" for c in base_cols)
     lines.append(f"    {'eta*':>5} {'t_g(ns)':>8}  {hdr}   MHz offset")
-    from snail_solver.tune_up import nominal_t_g as _ntg
     for e in tetas:
         vals = []
         for c in base_cols:
             try:
                 cfg = config_at_wp(base, c["w_p_GHz"], branch=branch, levels=levels)
-                _ch, au = select_drag_channels(cfg, _ntg(cfg, e),
+                _ch, au = select_drag_channels(cfg, nominal_t_g(cfg, e),
                                                max_channels=max_drag_channels,
                                                min_ratio=min_ratio,
                                                max_ratio=max_ratio)
-                # NOT filtered on isfinite: a channel exactly on resonance has
-                # ratio = inf and IS the worst case. Dropping it as "not a number"
-                # reported a resonant column as clean -- the one reading that would
-                # send someone to an operating point the scan then refuses.
+                # NOT filtered on isfinite: an exactly resonant channel (ratio = inf)
+                # IS the worst case, and dropping it would report the column clean.
                 vals.append(max((r["ratio"] for r in au["rows"]
                                  if r["category"] != "target"), default=0.0))
             except Exception:                        # noqa: BLE001
                 vals.append(float("nan"))
-        lines.append(f"    {e:>5g} {_ntg(base, e):>8.1f}  "
+        lines.append(f"    {e:>5g} {nominal_t_g(base, e):>8.1f}  "
                      + "".join(("     inf" if not np.isfinite(v) else f"{v:8.2f}")
                                for v in vals))
         lines.append(f"    {'':>5} {'':>8}  "
@@ -1484,8 +1257,7 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
         except Exception as exc:                  # noqa: BLE001 - report, keep going
             print(f"  delta={col['delta_GHz']:+.4f}: audit failed: {exc}")
             continue
-        lm = nearest_landmark(collision_landmarks(base, branch=branch),
-                              col["delta_sub_GHz"])
+        lm = nearest_landmark(landmarks, col["delta_sub_GHz"])
         print(f"\n  --- delta={col['delta_GHz']:+.4f} GHz  "
               f"eta*={col['target_eta']:g}  w_p={col['w_p_GHz']:.4f}  "
               f"Delta_sub={col['delta_sub_GHz']:+.4f}  "
@@ -1506,11 +1278,9 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
 def plot_wp_scan(doc: Dict[str, Any], out: str = "figs/wp_scan.png") -> str:
     """Infidelity, leakage, coupler occupation and chirp residual vs offset, per eta.
 
-    The top panel is the one that answers the question the scan exists for: coherent
-    infidelity (solid) against the TOTAL including the incoherent estimate (dashed),
-    for each drive strength. Ranking on the coherent curve alone always favours the
-    weakest drive -- the closed-system solve never charges for the longer gate -- so
-    the two are drawn together, and the coherence floor of each eta is marked.
+    The top panel draws coherent infidelity (solid) with the TOTAL including the
+    incoherent estimate (dashed) and each eta's coherence floor (dotted): the coherent
+    curve alone always favours the weakest drive.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1583,19 +1353,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog="python -m snail_solver.subharmonic_gate_scan", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Not required for the --replot* paths: they read a finished scan, which carries
-    # its own device copy, and demanding the JSON again invites replotting a run
-    # against a device file that has been edited since.
+    # Not required for --replot*: a finished scan carries its own device copy.
     ap.add_argument("--device", default=None,
                     help="device JSON (bare name resolves under devices/); not "
                          "needed with --replot or --replot-columns")
     ap.add_argument("--target-etas", default=None,
                     help="peak |eta| values to scan, as \"0.6,0.8,1.0,1.2\" or "
-                         "\"0.6:1.2:4\". Each sets its own t_g = 2A/eta*, so this is "
-                         "the drive/speed axis. NOTE the perturbative ceiling: the "
-                         "subharmonic coupling grows as eta^2 while its detuning is "
-                         "set by delta, so past eta ~ 1 a +/-100 MHz scan goes "
-                         "NON-perturbative and DRAG has nothing to correct. Check "
+                         "\"0.6:1.2:4\"; each sets t_g = 2A/eta*. The subharmonic "
+                         "coupling grows as eta^2 at a detuning set by delta, so past "
+                         "eta ~ 1 a +/-100 MHz scan goes NON-perturbative. Check "
                          "with --dry-run first.")
     ap.add_argument("--target-eta", type=float, default=None,
                     help="a single peak |eta| (shorthand for --target-etas with one "
@@ -1633,10 +1399,8 @@ def main() -> None:
                          "0.50..2.50 in 0.05 steps [41]")
     ap.add_argument("--max-drag-channels", type=int, default=3,
                     help="cap on the recursion depth, and the grid-wide sine_power m. "
-                         "3 is the deepest composition this codebase has measured as "
-                         "well-posed (drag.py: SinePowerRamp(m=3) under a 3-channel "
-                         "recursion); at 4 the chirp<->DRAG fixed point was observed to "
-                         "diverge on 4Gate4.5SNAIL [3]")
+                         "3 is the deepest measured as well-posed; at 4 the "
+                         "chirp<->DRAG fixed point diverged on 4Gate4.5SNAIL [3]")
     ap.add_argument("--drag-retries", type=int, default=2,
                     help="if the chirp<->DRAG fixed point diverges, shed the weakest "
                          "channel and retry, up to this many times, rather than losing "
@@ -1645,11 +1409,9 @@ def main() -> None:
                     help="g/|det| under which a channel is negligible and stops being "
                          "mandatory [0.02]")
     ap.add_argument("--max-ratio", type=float, default=0.3,
-                    help="g/|det| at or above which a channel is left UNCORRECTED: the "
-                         "DRAG quadrature would be a third or more of the pulse it "
-                         "corrects, and composing such channels makes the chirp<->DRAG "
-                         "fixed point diverge rather than settle. Reported in the "
-                         "audit, never silently dropped [0.3]")
+                    help="g/|det| at or above which a channel is left UNCORRECTED "
+                         "(its quadrature would make the chirp<->DRAG fixed point "
+                         "diverge). Reported in the audit [0.3]")
     ap.add_argument("--force", action="store_true",
                     help="solve columns that carry a non-perturbative channel anyway")
     ap.add_argument("--coupler-levels", type=int, default=None,
@@ -1672,21 +1434,16 @@ def main() -> None:
     ap.add_argument("--contrast-min", type=float, default=0.35,
                     help="drop Rabi rows whose chevron contrast falls below this [0.35]")
     ap.add_argument("--leak-max", type=float, default=None,
-                    help="drop Rabi rows leaking more than this. tune_up's default is "
-                         "0.35, which is FAR too permissive for the shift-curve fit: a "
-                         "constant-probe row leaking 25%% is not measuring the gate's "
-                         "Stark shift, and feeding it in wrecks the chirp (observed at "
-                         "target_eta 1.2: resid 0.219 MHz vs 0.016 at 0.6). Past the "
-                         "leakage knee (|eta| ~ 0.85 on 4Gate4.5SNAIL) tighten this to "
-                         "~0.05 and expect the fit to EXTRAPOLATE to the pulse peak -- "
+                    help="drop Rabi rows leaking more than this. tune_up's default "
+                         "0.35 is far too permissive for the shift-curve fit: a row "
+                         "leaking 25%% is not measuring the Stark shift. Past the "
+                         "leakage knee (|eta| ~ 0.85 on 4Gate4.5SNAIL) use ~0.05 and "
                          "watch extrapolation_ratio and quartic_fraction")
     ap.add_argument("--probe-shape", choices=("constant", "gate"), default="constant",
                     help="step 1's probe per column. 'gate' plays the configured "
-                         "envelope at each PEAK |eta| instead of a flat pump, leaking "
-                         "~50x less and removing the fit's extrapolation, at the cost "
-                         "of a moment deconvolution. This is what makes target_eta > 1 "
-                         "measurable: a flat pump there leaks 20-25%% and the shift "
-                         "fit is then reading leakage, not the Stark shift")
+                         "envelope at each PEAK |eta| instead of a flat pump: ~50x "
+                         "less leakage and no extrapolation, at the cost of a moment "
+                         "deconvolution. Needed for target_eta > 1")
     ap.add_argument("--moment-weighting", choices=MOMENT_WEIGHTINGS,
                     default="rabi",
                     help="deconvolution convention for --probe-shape gate; a 2x lever "
@@ -1698,11 +1455,9 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=0, help="0 = all cores")
     ap.add_argument("--column-workers", type=int, default=1,
                     help="solve this many COLUMNS at once, each with --jobs inside "
-                         "[1]. Worth raising for a long scan: tune_up step 4 "
-                         "(length_rabi) takes no jobs and runs single-threaded for "
-                         "minutes per column once the pulse carries a multi-channel "
-                         "recursion, so a --jobs-only run leaves most cores idle "
-                         "through it. Try --column-workers 8 --jobs 8 on 72 cores.")
+                         "[1]. tune_up step 4 (length_rabi) is single-threaded, so a "
+                         "--jobs-only run idles most cores through it. Try "
+                         "--column-workers 8 --jobs 8 on 72 cores.")
     ap.add_argument("--gpu", action="store_true",
                     help="qutip-jax/diffrax (forces --jobs 1). Usually a LOSS here: "
                          "this Hilbert space is ~10^2 states, far below the CPU/GPU "
@@ -1723,120 +1478,69 @@ def main() -> None:
                          "after a plotting change")
     ap.add_argument("--ridge-grid", action="store_true",
                     help="measure every Rabi row on ONE shared offset axis so each "
-                         "column's chirp RIDGE can be drawn. Off by default because "
-                         "it is a different measurement, not a refinement: the "
-                         "default per-row adaptive span samples each drive's own "
-                         "linewidth better, while a fixed span needs more "
-                         "--wp-points (sized automatically) to avoid undersampling "
-                         "the weakest row. A ridge cannot be added afterwards")
+                         "column's chirp RIDGE can be drawn (--wp-points grows "
+                         "automatically). A different measurement from the default "
+                         "per-row adaptive span, and cannot be added afterwards")
     ap.add_argument("--no-column-figures", action="store_true",
                     help="do not store each column's chevron/ridge figures in the "
-                         "scan file. They are on by default: the chevrons are the "
-                         "column's whole cost and the only way to read a failed one")
+                         "scan file")
     ap.add_argument("--chirp-free-fallback", action="store_true",
                     help="when the shift law cannot be fitted, calibrate a CHIRP-FREE "
-                         "gate instead of discarding the column: delta0 sets the "
-                         "carrier, step 3 measures the rest, and the length scan "
-                         "never needed the law. The columns that fail are the "
-                         "near-zero-shift ones -- exactly where a chirp has least to "
-                         "do -- so excluding them biases any measurement of what "
-                         "chirping buys (1.69x over the fitted columns vs ~1.50x "
-                         "including the rest). GATED on --chirp-free-max-frac: a "
-                         "column whose law still sweeps a real fraction of a "
-                         "linewidth is NOT near-zero-shift, and zeroing its chirp "
-                         "reports a 1.00x gain that is an artefact of the fit.")
+                         "gate (delta0 sets the carrier) instead of discarding the "
+                         "column. Excluding these near-zero-shift columns biases what "
+                         "chirping appears to buy. GATED on --chirp-free-max-frac.")
     ap.add_argument("--chirp-free-max-frac", type=float, default=0.10,
                     help="largest chirp excursion, as a fraction of the resonance "
                          "half-width 1/(2 t_g), that --chirp-free-fallback may treat "
-                         "as no chirp at all. On the 2026-09-22 grid the two "
-                         "populations separate cleanly here: below 10%% the fit "
-                         "residual is 1.0-16.7x the excursion (no signal), above 20%% "
-                         "it is 0.21-0.58x (a real law that merely missed r2_min). "
-                         "Columns above the threshold RAISE so the measurement gets "
-                         "fixed -- wider --span-linewidths for a railed ridge, finer "
-                         "--wp-points/--amp-points for a noisy one -- rather than "
-                         "being absorbed as chirp-free.")
+                         "as no chirp. Below 10%% the fit residual exceeds the "
+                         "excursion (no signal); above 20%% the law is real. Columns "
+                         "above the threshold RAISE so the measurement gets fixed.")
     ap.add_argument("--span-growth", choices=("railed", "both", "off"),
                     default="railed",
                     help="WHICH Rabi rows may re-measure on a wider pump-offset "
-                         "window. 'railed' (default): only a row whose fitted "
-                         "centre sits at the window edge, where the peak really is "
-                         "outside and without the retry 99.4%% of those rows rail "
-                         "and take the column down with them. 'both' adds the old "
-                         "too-wide trigger (hwhm > 0.4*span, x3), which measurement "
-                         "over the 2026-09-25 grid shows LOSES rows -- 54.0%% kept "
-                         "against 62.1%% for the same rows un-widened, centres "
-                         "moved by up to 11 MHz, multi_peak 9x enriched, and 28.8%% "
-                         "of every offset-solve in the run spent on it. A broad "
-                         "line is not an unmeasured line. 'off' disables both and "
-                         "reproduces a fixed window.")
+                         "window. 'railed' (default): only a row whose fitted centre "
+                         "sits at the window edge. 'both' adds the too-wide trigger "
+                         "(hwhm > 0.4*span, x3), measured to LOSE rows (a broad line "
+                         "is not an unmeasured line). 'off' keeps a fixed window.")
     ap.add_argument("--max-compound-growths", type=int, default=1,
-                    help="how many times ONE row may grow in a row (default 1). "
-                         "Rows that grew twice or more kept 4.1%% of themselves on "
-                         "the 2026-09-25 grid; compounding buys a coarser grid and "
-                         "a rail test slack enough to stop reporting itself.")
+                    help="how many times ONE row may grow in a row (default 1); "
+                         "rows that grew twice or more were rarely kept.")
     ap.add_argument("--max-span-growths", type=int, default=3,
                     help="how many times a Rabi row may GROW its pump-offset window "
-                         "when the ridge rails against the edge (x2 each, with the "
-                         "offset count grown to match so the step stays put). A "
-                         "railed ridge is not a measurement, and the old behaviour "
-                         "was to abort the column with 'raise --span-linewidths' in "
-                         "the message -- which is the same remedy, applied by hand, "
-                         "a run later. 0 restores that. Ignored under an explicit "
-                         "--wp-span-MHz, which is taken as deliberate.")
+                         "when the ridge rails against the edge (x2 each, offset count "
+                         "grown to keep the step). 0 aborts the column instead. "
+                         "Ignored under an explicit --wp-span-MHz.")
     ap.add_argument("--max-wp-points", type=int, default=121,
-                    help="ceiling on the grown offset count per Rabi row, since each "
-                         "offset is a solve. Only reached by rows that rail several "
-                         "times.")
+                    help="ceiling on the grown offset count per Rabi row (each "
+                         "offset is a solve).")
     ap.add_argument("--zero-chirp-frac", type=float, default=0.0,
                     help="when the shift-law fit fails r2 BUT the chirp would sweep "
                          "less than this fraction of the resonance half-width "
-                         "1/(2 t_g), proceed with ZERO chirp instead of discarding "
-                         "the column. r2 is relative, so a column whose Stark shift "
-                         "is near zero fails it on a small denominator even with "
-                         "pristine chevrons. Keep it small: at 48%% of a half-width "
-                         "the chirp was measured to be worth 2.8x, so 0.15 is "
-                         "already generous. 0 means DEFAULT TO --chirp-free-max-frac, "
-                         "not disabled: a chirp that does not move is a static "
-                         "detuning and the carrier already has a knob for it, so the "
-                         "shift is absorbed into delta0 and the column is solved "
-                         "rather than routed into the chirp-free fallback. (Until "
-                         "2026-09-25 this flag reached no code at all -- run_tune_up "
-                         "accepted it and never passed it to rabi_shift_table.)")
+                         "1/(2 t_g), proceed with ZERO chirp (the shift is absorbed "
+                         "into delta0) instead of discarding the column. r2 is "
+                         "relative, so a near-zero shift fails it even with pristine "
+                         "chevrons. Keep it small (0.15 is generous). 0 means "
+                         "DEFAULT TO --chirp-free-max-frac, not disabled.")
     ap.add_argument("--drag-decouple-fallback", action="store_true",
-                    help="keep the coupled chirp<->DRAG fixed point, but when it "
-                         "DIVERGES at a column, fall back to decoupled DRAG there "
-                         "instead of losing the column. Every column that can be "
-                         "solved coupled still is, so the series stays calibrated "
-                         "the same way wherever the loop converges; the fallback "
-                         "columns are flagged by operating_point.drag_decoupled "
-                         "and report neglected_shift_frac.")
+                    help="when the coupled chirp<->DRAG fixed point DIVERGES at a "
+                         "column, fall back to decoupled DRAG there instead of losing "
+                         "it; flagged by operating_point.drag_decoupled.")
     ap.add_argument("--decouple-drag", action="store_true",
-                    help="build the chirp from the bare envelope and apply DRAG "
-                         "on top of it, instead of iterating the two to a fixed "
-                         "point. This is the first Picard iterate: it cannot "
-                         "diverge, it makes the chirp IDENTICAL to the DRAG-off "
-                         "chirp so chirp+DRAG is a clean ablation of chirp-only, "
-                         "and it restores length-independence (the coupled "
-                         "quadrature scales as 1/t_g). It does not cancel the "
-                         "Stark shift of the added quadrature power; "
-                         "neglected_shift_frac reports how big that term is.")
+                    help="build the chirp from the bare envelope and apply DRAG on "
+                         "top (the first Picard iterate) instead of iterating to a "
+                         "fixed point: cannot diverge, and the chirp is IDENTICAL to "
+                         "the DRAG-off one. Leaves the quadrature's own Stark shift "
+                         "uncancelled (see neglected_shift_frac).")
     ap.add_argument("--envelope-m", type=int, default=None,
-                    help="override the sine_power vanishing order, which otherwise "
-                         "comes from --max-drag-channels. Needed for an independently "
-                         "calibrated NO-DRAG baseline: --max-drag-channels 0 would "
-                         "derive m=2 against a DRAG run's m=3, and a baseline that is "
-                         "a different pulse shape is not a baseline.")
+                    help="override the sine_power vanishing order (else from "
+                         "--max-drag-channels), e.g. so a NO-DRAG baseline plays the "
+                         "same pulse shape as the DRAG run.")
     ap.add_argument("--shard", metavar="I/N", default=None,
                     help="run only this machine's share of the grid, e.g. --shard "
-                         "0/4. Columns are taken with a STRIDE (every N-th), not in "
-                         "blocks: cost varies hugely along the axis, so contiguous "
-                         "blocks would leave one machine hours behind. Shards are "
-                         "disjoint and cover the grid exactly, so the per-column "
-                         "caches cannot race and the HDF5 files concatenate (the "
-                         "analysis keys rows on (delta, eta)). Give each shard its "
-                         "own --out, and its own --outdir unless the machines share "
-                         "a filesystem.")
+                         "0/4 (every N-th column, so cheap and expensive columns "
+                         "interleave). Shards are disjoint and their HDF5 files "
+                         "concatenate. Give each shard its own --out, and its own "
+                         "--outdir unless the machines share a filesystem.")
     ap.add_argument("--overwrite", action="store_true",
                     help="ignore cached columns and re-solve")
     ap.add_argument("--dry-run", action="store_true",
@@ -1847,10 +1551,8 @@ def main() -> None:
     ap.add_argument("--open-system", type=int, nargs="?", const=3, default=None,
                     metavar="TOP",
                     help="after the scan, re-score the best TOP points (default 3) "
-                         "with a REAL open-system solve (mesolve with collapse "
-                         "operators) instead of the first-order estimate. Needs "
-                         "--t1-us. 16 solves per point on a dim^2 density matrix, so "
-                         "it is for confirming a winner, not for scanning")
+                         "with a REAL open-system solve (mesolve, 16 per point). "
+                         "Needs --t1-us")
     ap.add_argument("--coupler-t1-us", type=float, default=None,
                     help="coupler/SNAIL loss for --open-system. Worth including near "
                          "a subharmonic, where the coupler carries real population")
@@ -1860,8 +1562,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.replot_columns:
-        # Reads a finished scan and needs no grid, no device and no drive: bail out
-        # before every argument check that only makes sense for a real run.
+        # Needs no grid, device or drive: bail out before those checks.
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         attach_all_column_figures(args.replot_columns)
         return
@@ -1879,7 +1580,7 @@ def main() -> None:
     else:
         target_etas = [float(args.target_eta)]
 
-    from snail_solver.h5_io import attach_figures, load_doc, save_doc, save_tree
+    from snail_solver.h5_io import attach_figures, save_doc, save_tree
     from snail_solver.log_utils import setup_run_logger
     from snail_solver.paths import in_results, resolve_device
 
@@ -1896,10 +1597,8 @@ def main() -> None:
     config = load_device(device_path)
     offsets = parse_offsets(args.offsets)
 
-    # fit_shift_curve needs >= 4 usable rows (tune_up.py:539), and rows are DROPPED for
-    # low contrast or leakage -- which is exactly what happens at high drive, where this
-    # scan is aimed. Refusing here costs a second; discovering it costs the whole Rabi
-    # table of every column.
+    # fit_shift_curve needs >= 4 usable rows, and rows are DROPPED (contrast/leakage)
+    # at the high drive this scan targets: refuse now, not after every Rabi table.
     if args.amp_points < 4:
         ap.error(f"--amp-points {args.amp_points} cannot fit a shift curve: it needs "
                  f">= 4 usable rows, and rows are dropped for low contrast or leakage. "
@@ -1908,14 +1607,14 @@ def main() -> None:
         print(f"note: --amp-points {args.amp_points} leaves no margin -- the shift-curve "
               f"fit needs 4 usable rows and drops them for contrast/leakage.")
 
-    _shard, _n_shards = 0, 1
+    shard, n_shards = 0, 1
     if args.shard:
         try:
             _a, _b = str(args.shard).split("/")
-            _shard, _n_shards = int(_a), int(_b)
+            shard, n_shards = int(_a), int(_b)
         except Exception:
             ap.error(f"--shard wants I/N (e.g. 0/4), got {args.shard!r}")
-        if not (_n_shards >= 1 and 0 <= _shard < _n_shards):
+        if not (n_shards >= 1 and 0 <= shard < n_shards):
             ap.error(f"--shard {args.shard}: need 0 <= I < N and N >= 1")
 
     if args.dry_run:
@@ -1929,25 +1628,22 @@ def main() -> None:
                              envelope_m=args.envelope_m,
                              drop_origin=not args.keep_origin,
                              audit=not args.no_audit)
-        # With the per-column audit on, describe_grid streams and returns ""; with
-        # --no-audit it returns the geometry instead, which still has to be shown.
-        if text:
+        if text:                    # --no-audit returns the geometry unprinted
             print(text)
-        if _n_shards > 1:
-            _n_cols = len(columns_for(config, offsets,
-                                      drop_origin=not args.keep_origin))
-            _mine = len(shard_columns(
-                [(c, e) for c in range(_n_cols) for e in target_etas],
-                _shard, _n_shards))
-            print(f"  shard       {_shard}/{_n_shards} would solve {_mine} of "
-                  f"{_n_cols * len(target_etas)} columns (strided)")
+        if n_shards > 1:
+            n_cols = len(columns_for(config, offsets,
+                                     drop_origin=not args.keep_origin))
+            mine = len(shard_columns(
+                [(c, e) for c in range(n_cols) for e in target_etas],
+                shard, n_shards))
+            print(f"  shard       {shard}/{n_shards} would solve {mine} of "
+                  f"{n_cols * len(target_etas)} columns (strided)")
         return
 
     stem = os.path.splitext(os.path.basename(device_path))[0]
     outdir = args.outdir or in_results(f"wpscan_{stem}")
     os.makedirs(outdir, exist_ok=True)
-    # A log FILE, and a logger name derived from it, so two scans into different
-    # outdirs do not share handlers and duplicate each other's lines.
+    # Logger name derived from the log FILE, so two scans never share handlers.
     log_path = args.log or os.path.join(outdir, "wp_scan.log")
     logger = setup_run_logger(log_path, f"wp_scan:{log_path}")
 
@@ -1959,10 +1655,10 @@ def main() -> None:
                         + " ".join(shlex.quote(a) for a in sys.argv[1:]),
              "device_path": str(device_path), "host": platform.node()}
     if holds_runs:
-        # Truncate ONCE, up front, so a rerun into the same name cannot inherit the
-        # previous scan's per-column runs for columns this one never reaches.
+        # Truncate ONCE, up front, so a rerun cannot inherit a previous scan's columns.
         save_tree(out_path, {}, attrs=attrs)
 
+    solver = {"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps}
     doc = run_wp_scan(
         config, offsets, target_etas, device_path=device_path,
         branch=args.branch, coupler_levels=args.coupler_levels,
@@ -1974,7 +1670,7 @@ def main() -> None:
         moment_weighting=args.moment_weighting,
         column_figures=not args.no_column_figures,
         ridge_grid=args.ridge_grid,
-        shard=_shard, n_shards=_n_shards, envelope_m=args.envelope_m,
+        shard=shard, n_shards=n_shards, envelope_m=args.envelope_m,
         zero_chirp_frac=args.zero_chirp_frac,
         chirp_free_fallback=args.chirp_free_fallback,
         chirp_free_max_frac=args.chirp_free_max_frac,
@@ -1996,8 +1692,7 @@ def main() -> None:
         drop_origin=not args.keep_origin, outdir=outdir,
         sweep_path=(out_path if holds_runs else None),
         overwrite=args.overwrite, force=args.force, jobs=args.jobs,
-        solver={"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps},
-        stop_on_error=args.stop_on_error, logger=logger)
+        solver=solver, stop_on_error=args.stop_on_error, logger=logger)
 
     s = doc["summary"]
     print(f"\n{s['n_ok']}/{s['n_columns']} columns calibrated in {s['seconds']:.0f}s")
@@ -2020,22 +1715,16 @@ def main() -> None:
     if args.open_system is not None:
         if args.t1_us is None:
             ap.error("--open-system needs --t1-us (and usually --t2-us)")
-        # Save FIRST. The rescore is a handful of mesolve runs on the full
-        # Liouvillian and has twice taken longer than the entire scan that produced
-        # it -- once for 2 days -- and because save_doc ran after it, both of those
-        # runs lost their /scan group entirely and had to be rebuilt from the column
-        # caches by hand. The rescore only ADDS an `open_system` block, so writing
-        # now and rewriting after costs one file write and makes the summary
-        # unlosable.
+        # Save FIRST: the rescore can outlast the scan itself (once 2 days), and it
+        # only ADDS an `open_system` block, so the summary must not wait on it.
         if out_path:
             pre = save_doc(out_path, doc, attrs=attrs,
                            group=("scan" if holds_runs else None))
             print(f"  written {pre} (before the open-system rescore)")
         doc = rescore_open_system(doc, t1_us=args.t1_us, t2_us=args.t2_us,
                                   coupler_t1_us=args.coupler_t1_us,
-                                  top=args.open_system,
-                                  solver={"atol": args.atol, "rtol": args.rtol,
-                                          "nsteps": args.nsteps}, logger=logger)
+                                  top=args.open_system, solver=solver,
+                                  logger=logger)
 
     figures: Dict[str, str] = {}
     if args.plot and s["n_ok"]:

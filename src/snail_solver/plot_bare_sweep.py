@@ -40,18 +40,8 @@ def _f(x: str) -> Optional[float]:
 
 
 def load_rows(path: str) -> List[Dict[str, object]]:
-    """Load integrated target rows (those with a numeric F_avg) from summary.csv.
-
-    Parameters
-    ----------
-    path : str
-        Path to a summary.csv written by ``collect``.
-
-    Returns
-    -------
-    list of dict
-        One entry per integrated row with keys wb, beat, F, ncpl, ptr, drag.
-    """
+    """Integrated rows (numeric F_avg) of a ``collect`` summary.csv, as dicts with
+    keys wb, beat, F, ncpl, ptr, drag."""
     rows: List[Dict[str, object]] = []
     with open(path) as fh:
         for r in csv.DictReader(fh):
@@ -92,24 +82,21 @@ def plot_bare_sweep(rows: List[Dict[str, object]], xaxis: str = "beat",
                             gridspec_kw=dict(height_ratios=[2, 1]) if have_ncpl else None)
     ax = list(np.atleast_1d(axl))
 
-    for series, color, lab, mfc in ((off, BLUE, "no DRAG", "white"),
-                                    (on, RED, "with DRAG", RED)):
-        if not series:
-            continue
-        x = [r[xkey] * xscale for r in series]
-        ax[0].plot(x, [1.0 - r["F"] for r in series], color=color, lw=2.2,
-                   marker="o", ms=5, mfc=mfc, mec=color, label=lab)
+    def _curves(a, yfun, labelled):
+        for series, color, lab, mfc in ((off, BLUE, "no DRAG", "white"),
+                                        (on, RED, "with DRAG", RED)):
+            if series:
+                a.plot([r[xkey] * xscale for r in series], [yfun(r) for r in series],
+                       color=color, lw=2.2, marker="o", ms=5, mfc=mfc, mec=color,
+                       **({"label": lab} if labelled else {}))
+
+    _curves(ax[0], lambda r: 1.0 - r["F"], True)
     ax[0].set_yscale("log")
     ax[0].set_ylabel(r"infidelity  $1-F$")
     ax[0].legend(frameon=False, fontsize=11)
 
     if have_ncpl:
-        for series, color, mfc in ((off, BLUE, "white"), (on, RED, RED)):
-            if not series:
-                continue
-            x = [r[xkey] * xscale for r in series]
-            ax[1].plot(x, [r["ncpl"] for r in series], color=color, lw=2.2,
-                       marker="o", ms=5, mfc=mfc, mec=color)
+        _curves(ax[1], lambda r: r["ncpl"], False)
         ax[1].set_ylabel(r"coupler occ.  $n_c$")
 
     ax[-1].set_xlabel(xlabel)
@@ -126,9 +113,10 @@ def plot_bare_sweep(rows: List[Dict[str, object]], xaxis: str = "beat",
 
     fig.tight_layout()
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    fig.savefig(out, bbox_inches="tight", facecolor="white")
-    fig.savefig(out.rsplit(".", 1)[0] + ".pdf", bbox_inches="tight", facecolor="white")
-    print("wrote", out, "and", out.rsplit(".", 1)[0] + ".pdf")
+    pdf = out.rsplit(".", 1)[0] + ".pdf"
+    for path in (out, pdf):
+        fig.savefig(path, bbox_inches="tight", facecolor="white")
+    print("wrote", out, "and", pdf)
 
 
 def main() -> None:

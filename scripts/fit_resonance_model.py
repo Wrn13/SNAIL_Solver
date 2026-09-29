@@ -1,9 +1,8 @@
 """Fit 1-F(delta) to a sum of resonance tails at frequency-determined positions.
 
-The model is physical, not a curve through points. A parasitic channel excites with
-``P ~ 2 (g/Delta)^2``, and every channel's ``Delta`` is linear in ``delta``, so each
-contributes a squared-Lorentzian tail whose POSITION is fixed by a frequency
-condition and is not fitted:
+A parasitic channel excites with ``P ~ 2 (g/Delta)^2`` and every ``Delta`` is linear
+in ``delta``, so each contributes a squared-Lorentzian tail whose POSITION is fixed by
+a frequency condition, not fitted:
 
     delta = 0                   2 w_p = w_a            A subharmonic
     delta = alpha/2             2 w_p = w_a + alpha    A |1>->|2> ladder
@@ -11,34 +10,24 @@ condition and is not fitted:
     delta = w_s - 1.5 w_a         w_p = w_s - w_a      A-SNAIL spectator
     delta = w_s/3 - w_a/2       3 w_p = w_s            third harmonic on the SNAIL
 
-Only amplitudes and widths are free. The last one is SECOND ORDER in g3 -- driving
-the coupler with three pump photons needs four letters (3 pump + 1 coupler) while
-``expand_terms`` expands ``g3 X^3`` -- so `spectator_audit` is structurally blind to
-it, yet it sits at -183 MHz on the 4.7 GHz device and coincides with a band of poor
-columns the first-order audit cannot explain.
+Only amplitudes and widths are free. The last one is SECOND ORDER in g3 (3 pump + 1
+coupler is four letters; ``expand_terms`` expands ``g3 X^3``), so `spectator_audit` is
+blind to it -- yet it sits at -183 MHz on the 4.7 GHz device, on a band of poor columns
+the first-order audit cannot explain.
 
-Errors from independent channels compose rather than add, so the total saturates:
+Independent errors compose, so the total saturates; fitted in log space (the data
+spans three decades):
 
     1 - F = 1 - exp(-[f0 + sum_j A_j / ((delta - delta_j)^2 + w_j^2)])
 
-fitted in log space because the data spans three decades.
-
-WHAT THIS MODEL CANNOT DO, measured rather than supposed
---------------------------------------------------------
-Over the full axis it fits badly -- R^2(log) ~ 0.29-0.35 on the 2026-09-17 grid --
-and the reason is not the functional form. The columns that dominate the figure are
-exactly where the premise fails: at ``delta = +200`` the SNAIL subharmonic reaches
-``g/|Delta| = 0.38`` and the coupler holds 0.85 photons, so a 14% change in the ratio
-produces a 35x change in infidelity. That is a THRESHOLD, not a tail, and no smooth
-function with fixed poles reproduces it (the fit under-predicts that column by 11x).
-
-Restricted to the perturbative subset (``--max-infidelity 0.05``) the bare series
-fits at R^2 ~ 0.68 and the amplitudes become meaningful: the SNAIL subharmonic comes
-out ~12x the A subharmonic, independently confirming which channel dominates.
-
-So: use it as a DIAGNOSTIC on the perturbative columns, not as a curve for
-presentation, and never across drives -- the 3 w_p = w_s feature moves with eta
-(-170 MHz at 1.2, -180 at 1.3, -190 at 1.5), so a fit at one drive does not transport.
+LIMITS (measured). Over the full axis R^2(log) ~ 0.29-0.35 (2026-09-17 grid), because
+the dominant columns break the premise: at ``delta = +200`` the SNAIL subharmonic has
+``g/|Delta| = 0.38`` and the coupler holds 0.85 photons, so a 14% ratio change gives a
+35x infidelity change -- a THRESHOLD no fixed-pole model reproduces (11x under). On the
+perturbative subset (``--max-infidelity 0.05``) the bare series fits at R^2 ~ 0.68 and
+the SNAIL subharmonic comes out ~12x the A subharmonic. So: a DIAGNOSTIC on perturbative
+columns, not a presentation curve, and never across drives -- the 3 w_p = w_s feature
+moves with eta (-170 MHz at 1.2, -180 at 1.3, -190 at 1.5).
 
 Usage:
     fit_resonance_model.py CURVES.json [--baseline BASE.json] [--device D.json]
@@ -82,25 +71,28 @@ def _series(rows, base, eta, name):
     return np.array(d, float), np.array(y, float)
 
 
+def _amp_width(p, j, n, shared_width):
+    """(A_j, w_j) from the log-parameter vector of an `n`-channel model."""
+    if shared_width:
+        return np.exp(p[1 + j]), np.exp(p[1 + n])
+    return np.exp(p[1 + 2 * j]), np.exp(p[2 + 2 * j])
+
+
 def model(p, d, pos, shared_width=False):
     S = np.full_like(d, np.exp(p[0]))
     for j, x0 in enumerate(pos):
-        if shared_width:
-            A, w = np.exp(p[1 + j]), np.exp(p[1 + len(pos)])
-        else:
-            A, w = np.exp(p[1 + 2 * j]), np.exp(p[2 + 2 * j])
+        A, w = _amp_width(p, j, len(pos), shared_width)
         S = S + A / ((d - x0) ** 2 + w ** 2)
     return 1.0 - np.exp(-S)
 
 
 def fit(d, y, pos, min_width=5.0, max_width=400.0, shared_width=False):
-    """Widths bounded below by roughly the pulse bandwidth: an unbounded width runs
-    to zero, which makes the amplitude meaningless and the fit degenerate.
+    """Widths are bounded below by ~the pulse bandwidth: unbounded, a width runs to
+    zero and the fit degenerates.
 
-    `shared_width` ties every channel to ONE width, cutting the free parameters from
-    ``2n+1`` to ``n+2``. That matters on the perturbative subset, which has only
-    ~11 usable columns: with a width per channel the fit is exactly determined and
-    its R^2 means nothing.
+    `shared_width` ties every channel to ONE width (``n+2`` parameters, not ``2n+1``):
+    the perturbative subset has only ~11 columns, where a width each would leave the
+    fit exactly determined and its R^2 meaningless.
     """
     if shared_width:
         lo = [np.log(1e-8)] + [np.log(1e-3)] * len(pos) + [np.log(min_width)]
@@ -146,7 +138,7 @@ def main():
                 for r in json.load(open(args.baseline))}
     res = resonances(args.device)
     pos = [x for x, _n, _o in res]
-    print(f"resonances (MHz), positions FIXED by frequency conditions:")
+    print("resonances (MHz), positions FIXED by frequency conditions:")
     for x, nm, order in res:
         print(f"  {x:+8.1f}   {nm}" + ("   [invisible to the audit]" if order > 1
                                        else ""))
@@ -166,10 +158,7 @@ def main():
         print(f"    floor 1-F = {np.exp(p[0]):.3e}")
         amps = {}
         for j, (x0, nm, _o) in enumerate(res):
-            if args.shared_width:
-                A, w = float(np.exp(p[1 + j])), float(np.exp(p[1 + len(pos)]))
-            else:
-                A, w = float(np.exp(p[1 + 2 * j])), float(np.exp(p[2 + 2 * j]))
+            A, w = map(float, _amp_width(p, j, len(pos), args.shared_width))
             amps[nm] = {"delta_MHz": x0, "A_MHz2": A, "width_MHz": w}
             print(f"    {nm:<26} A = {A:>10.1f} MHz^2   w = {w:>6.1f} MHz")
         k = np.argsort(-np.abs(np.log(pred) - np.log(y)))[:3]

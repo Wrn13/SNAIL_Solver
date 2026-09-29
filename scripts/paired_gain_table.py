@@ -3,13 +3,10 @@
 
     paired_gain_table.py CURVES_NODRAG.json CURVES_DRAG.json [--csv OUT.csv]
 
-Every ratio is computed over the columns where BOTH series in that ratio exist.
-That is the whole point of this script: a median of `bare/chirp` over the columns
-chirp solved, set beside a median of `bare/chirp+DRAG` over the columns DRAG solved,
-is not a comparison -- the two medians land on different columns, and DRAG failing
-on the columns where chirp helped most makes DRAG look worse than it is. Medians of
-ratios also do not compose, so the third ratio is measured, never inferred from the
-first two.
+Every ratio is computed over the columns where BOTH its series exist: medians over
+different column sets are not a comparison (DRAG failing where chirp helped most would
+make DRAG look worse than it is). Medians of ratios do not compose either, so the
+third ratio is measured, never inferred from the first two.
 
 Series, and which file each comes from:
 
@@ -18,8 +15,8 @@ Series, and which file each comes from:
                                                   channels, so the flag is a no-op)
     chirp+DRAG  drag file,   "chirp+DRAG" trace   the real thing
 
-Infidelity is the COHERENT one throughout: the open-system numbers exist to show
-what slow gates cost, not to rank calibrations.
+Infidelity is the COHERENT one throughout (open-system numbers show what slow gates
+cost; they do not rank calibrations).
 """
 import json
 import sys
@@ -28,19 +25,22 @@ from statistics import median, geometric_mean
 USAGE = __doc__.strip().splitlines()[2].strip()
 
 
+def _eta(r):
+    return round(float(r["target_eta"]), 2)
+
+
+def _dmhz(r):
+    return round(float(r["delta_GHz"]) * 1e3)
+
+
 def load(path, variant, drop_excluded=False):
     """{(eta, delta_mhz): infidelity_coherent} for one variant of one curves file.
 
-    `drop_excluded` removes the columns where a chirp could not be MEASURED -- the
-    ridge changed transition inside the drive sweep, so the calibration fell back to
-    a chirp-free gate. Their "chirp" trace is the bare gate by construction, and
-    counting it as a 1.00x gain is not a measurement of the chirp being useless; it
-    is the absence of a measurement, biasing the chirp's benefit downwards precisely
-    at the detunings where the device is hardest. On the 2026-09-22 grid 14 of 31
-    chirp-free columns were of this kind and every one was reported at 1.00x.
-
-    Columns that are chirp-free because there was NO SHIFT TO CHIRP are kept: there
-    the 1.00x is the result.
+    `drop_excluded` removes the columns where a chirp could not be MEASURED: their
+    "chirp" trace is the bare gate by construction, and a 1.00x there is the absence
+    of a measurement, biasing the chirp's benefit down where the device is hardest
+    (14 of 31 chirp-free columns on the 2026-09-22 grid). Columns chirp-free because
+    there was NO SHIFT TO CHIRP are kept: there the 1.00x is the result.
     """
     try:
         rows = json.load(open(path))
@@ -53,24 +53,19 @@ def load(path, variant, drop_excluded=False):
         tr = (r.get("traces") or {}).get(variant) or {}
         v = tr.get("infidelity_coherent")
         if v is not None and v > 0:
-            out[(round(float(r["target_eta"]), 2),
-                 round(float(r["delta_GHz"]) * 1e3))] = float(v)
+            out[(_eta(r), _dmhz(r))] = float(v)
     return out
 
 
-#: reason code -> how to say it. The reason MATTERS: these are three different
-#: failures to measure a chirp, and a reader deciding whether to trust the figure
+#: reason code -> how to say it: different failures to measure a chirp, and a reader
 #: needs to know which one hit their detuning.
 _WHY = {
     "stark_crossing": "the ridge changed transition inside the drive sweep",
     "unmeasurable_chirp": "the fit failed while the law still swept a real shift",
     "railed_ridge": "the ridge railed; no shift law was fitted at all",
-    # The pipeline's own name for the same thing, set by run_tune_up when the
-    # excursion says a shift is there but the law does not describe it. The two
-    # names above are the BACK-FILL classifier's (backfill_chirp_exclusions.py),
-    # applied to runs made before the reason was recorded; this one comes from
-    # the run itself. Both must resolve, or a re-analysed grid and a fresh one
-    # print different things about the same column.
+    # run_tune_up's own name for what the back-fill classifier
+    # (backfill_chirp_exclusions.py) calls the two above; both must resolve, or a
+    # re-analysed grid and a fresh one describe the same column differently.
     "chirp_not_converged": "delta0 + k2|eta|^2 + k4|eta|^4 does not describe the "
                            "measured ridge, though a real shift is there",
 }
@@ -87,21 +82,17 @@ def excluded_columns(path):
         detail = (f"crossing at |eta| = {float(ce):.3f}" if ce is not None else
                   f"excursion {float(frac):.1%} of a half-linewidth"
                   if frac is not None else "")
-        out.setdefault(round(float(r["target_eta"]), 2), []).append(
-            (round(float(r["delta_GHz"]) * 1e3),
-             r.get("chirp_free_reason") or "unknown", detail))
+        out.setdefault(_eta(r), []).append(
+            (_dmhz(r), r.get("chirp_free_reason") or "unknown", detail))
     return out
 
 
 def best_gate(path, variant):
     """{eta: (delta_mhz, infidelity, chirp_excluded)} over EVERY scored column.
 
-    Deliberately not restricted to the ratio set. A column whose chirp could not be
-    measured is excluded from the GAIN because `chirp == bare` there is an artefact
-    -- but the pulse that was played is a real pulse with a real scored fidelity, and
-    dropping it from "best gate" would hide the best result the run actually found.
-    At eta = 1.3 that is exactly what happened: the best gate is delta = -100 at
-    2.382e-03, a DRAG-only gate whose chirp is unmeasurable.
+    Deliberately not restricted to the ratio set: a chirp-excluded column still played
+    a real pulse with a real fidelity (at eta = 1.3 the best gate, delta = -100 at
+    2.382e-03, is such a DRAG-only gate).
     """
     out = {}
     for r in json.load(open(path)):
@@ -109,8 +100,8 @@ def best_gate(path, variant):
         v = tr.get("infidelity_coherent")
         if v is None or v <= 0:
             continue
-        eta = round(float(r["target_eta"]), 2)
-        d = round(float(r["delta_GHz"]) * 1e3)
+        eta = _eta(r)
+        d = _dmhz(r)
         cur = out.get(eta)
         if cur is None or float(v) < cur[1]:
             out[eta] = (d, float(v), bool(r.get("chirp_excluded")))
@@ -123,11 +114,8 @@ def errors_by_stage(path):
     for r in json.load(open(path)):
         if r.get("ok"):
             continue
-        err = r.get("error") or {}
-        kind = err.get("type") or "unknown"
-        eta = round(float(r["target_eta"]), 2)
-        out.setdefault(eta, {}).setdefault(kind, []).append(
-            round(float(r["delta_GHz"]) * 1e3))
+        kind = (r.get("error") or {}).get("type") or "unknown"
+        out.setdefault(_eta(r), {}).setdefault(kind, []).append(_dmhz(r))
     return out
 
 
@@ -204,12 +192,11 @@ def main(argv):
             note = "   [chirp unmeasurable here -- DRAG-only gate]" if was_excl else ""
             print(f"    {label:<11} delta={d:+5d} MHz  1-F={v:.3e}{note}")
 
-        # A chirp built on a law that did not converge is not evidence either
-        # way. Report those columns rather than averaging them into the gain.
+        # A chirp from a non-converged law is not evidence either way: list them.
         for path, label in ((nodrag_path, "chirp"), (drag_path, "chirp+DRAG")):
-            bad = [(round(float(r["delta_GHz"]) * 1e3), r.get("quartic_fraction"))
+            bad = [(_dmhz(r), r.get("quartic_fraction"))
                    for r in json.load(open(path))
-                   if round(float(r["target_eta"]), 2) == eta and r.get("ok")
+                   if _eta(r) == eta and r.get("ok")
                    and r.get("perturbative_ok") is False]
             if bad:
                 print(f"\n  {label}: shift law NOT converged (quartic fraction "

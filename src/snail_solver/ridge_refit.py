@@ -1,21 +1,13 @@
 """Re-interpret a measured Stark ridge without re-measuring it.
 
-A column's cost is its Rabi sweep: ``amp_points x wp_points`` independent chevron
-solves, measured at 91% of a pass-A column's wall time and 69% of a pass-B
-column's on the 2026-09-25 grid. Everything after it -- gating the rows, fitting
-``delta(|eta|)``, and deciding whether the law is good enough to chirp with -- is
-pure numpy over arrays the run already wrote to its HDF5 file under
-``columns/<tag>/stages/rabi``.
+A column's cost is its Rabi sweep (``amp_points x wp_points`` chevron solves, most of
+its wall time). Everything after it -- gating rows, fitting ``delta(|eta|)``, judging
+whether the law is good enough to chirp with -- is pure numpy over arrays the run
+already wrote under ``columns/<tag>/stages/rabi``. So fit-policy questions are
+settled here, in seconds, against every column of a real grid.
 
-That asymmetry is the whole point of this module. A question about the FIT
-policy costs seconds and answers itself from 2.3 GB already on disk; a question
-about the MEASUREMENT costs days. So every fit-policy change is settled here,
-against every column of a real grid, before anything is edited in the pipeline.
-
-What is stored, for all 189 columns of the 2 GHz grid INCLUDING the 68 that
-failed (a failed column attaches its partial table to the exception, and
-``_write_run`` stores it anyway -- that is why the chevron figures rendered for
-189 of 189 while only 121 produced a fidelity):
+Stored for every column, INCLUDING failed ones (a failed column attaches its partial
+table to the exception and ``_write_run`` stores it anyway):
 
     stages/rabi/
       eta delta_MHz contrast quality leakage windows_ns spans_MHz held
@@ -32,39 +24,25 @@ failed (a failed column attaches its partial table to the exception, and
                  attrs: eta, window_ns, span_MHz, norm_defect_max, and
                         `dropped` only on a rejected row
 
-THREE THINGS A RE-FIT MUST NOT GET WRONG, each found by reading the real file
-rather than the code:
+Three pitfalls a re-fit must avoid:
 
-* ``delta_MHz`` and ``quality`` are stored POST-HOLD. The held-row rescue at
-  ``tune_up.py:1230-1251`` mutates them in place before the table is written, so
-  a failed column's flat held tail is already baked into them. Re-derive the
-  ridge from ``chevrons[i]["fit"]["center_GHz"]`` and a fresh gate; reuse those
-  arrays and a held tail gets held twice.
-* ``n_offsets`` is not stored, and the rail check needs
-  ``step = spans / (n_offsets - 1)``. Re-derive it per row as
-  ``len(chevrons[i]["offsets_GHz"])`` -- which is exactly why the per-row
-  adaptive span, and its 15/29/43 point counts, matter here.
-* The stored ``k2`` is ALREADY ``K2_measured / M2``. The shaped-probe moment
-  de-convolution at ``tune_up.py:1277-1285`` has been applied. Discard the
-  stored ``fit`` and rebuild from the rows; refining it applies the moments
-  twice.
+* ``delta_MHz`` and ``quality`` are stored POST-HOLD (tune_up's held-row rescue
+  mutates them before writing). Re-derive the ridge from
+  ``chevrons[i]["fit"]["center_GHz"]`` and a fresh gate, or a held tail is held twice.
+* ``n_offsets`` is not stored; the rail check's ``step = spans / (n_offsets - 1)``
+  needs ``len(chevrons[i]["offsets_GHz"])`` per row (the adaptive span varies it).
+* The stored ``k2`` is ALREADY ``K2_measured / M2``. Rebuild the fit from the rows;
+  refining the stored one applies the moments twice.
 """
 from __future__ import annotations
 
-import os
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-#: Powers of ``|eta|`` in the shift law the pipeline fits today. ``0`` is the
-#: static ``delta0`` that a chirp must NOT track (see `tune_up.fit_shift_curve`).
+#: Powers of ``|eta|`` in the pipeline's shift law. ``0`` is the static ``delta0``
+#: that a chirp must NOT track (see `tune_up.fit_shift_curve`).
 DEFAULT_POWERS: Tuple[int, ...] = (0, 2, 4)
-
-#: The peak-detection floor `chevron_quality` uses for its `secondary` measure
-#: (`tune_up.py:801`). Repeated rather than imported so a reader can see what a
-#: "peak" means here without chasing it, and asserted against the source in the
-#: test suite.
-PEAK_FRAC = 0.3
 
 
 # --------------------------------------------------------------------------
@@ -74,24 +52,12 @@ PEAK_FRAC = 0.3
 def load_column_rabi(path: str, tag: str) -> Dict[str, Any]:
     """One column's stored Rabi table, in the shape `rabi_shift_table` returns.
 
-    Deliberately thin. :func:`h5_io.load_tree` already reverses the entire
-    encoding -- the ``_container: "list"`` convention, ``h5py.Empty`` back to
-    ``None``, dtypes -- and reads ONLY the addressed group, so pulling one
-    column out of a 2.3 GB file costs about a quarter of a second rather than
-    the whole file. Writing a second deserializer here would be a second
-    encoding to keep in step with `h5_io`.
-
-    What is left is the two schema differences a re-fit must not trip over:
-
-    * ``held``/``n_held``/``stark_crossing_eta`` exist only on a column whose
-      table was stored from a ``RabiFitError`` partial (``tune_up.py:1117``); a
-      column that succeeded stored the ``:1387`` return, which has none of them.
-    * ``delta_MHz``/``quality``/``fit`` are post-hold or post-moment (see the
-      module docstring), so they are DROPPED rather than handed on as if they
-      were raw measurements.
-
-    The dropped keys are returned separately by :func:`load_column_stored_fit`
-    for anyone who wants to compare against them.
+    :func:`h5_io.load_tree` reverses the whole encoding and reads only the addressed
+    group, so this stays thin. Two schema quirks are handled: ``held``/``n_held``/
+    ``stark_crossing_eta`` exist only on a column stored from a ``RabiFitError``
+    partial, and ``delta_MHz``/``quality``/``fit`` are post-hold or post-moment (see
+    the module docstring). All are DROPPED; :func:`load_column_stored_fit` returns
+    the stored fit for comparison.
     """
     from snail_solver.h5_io import load_tree, split_address
 
@@ -108,40 +74,27 @@ def load_column_rabi(path: str, tag: str) -> Dict[str, Any]:
 def load_npz_rabi(path: str) -> Dict[str, Any]:
     """A Rabi table from the ``*_rabi.npz`` a column worker writes beside its cache.
 
-    The counterpart of :func:`subharmonic_gate_scan.save_column_rabi`, which
-    flattens the table to keys like ``chevrons/00037/metric``. Rebuilt here into
-    the same nested shape :func:`load_column_rabi` returns, so a re-fit does not
-    care which of the two it was handed.
-
-    Prefer this over the HDF5 when it exists: it is written by the worker before
-    the row is returned, so it survives a run that is killed, and it is present
-    for a column served from cache, whose stages the parent never writes at all.
+    Inverts :func:`subharmonic_gate_scan.save_column_rabi` (flat keys like
+    ``chevrons/00037/metric``) into the nested shape :func:`load_column_rabi`
+    returns. Prefer it when present: the worker writes it before returning, so it
+    survives a killed run and exists for cache-served columns the parent never stores.
     """
-    import numpy as _np
-
-    with _np.load(path, allow_pickle=False) as z:
-        keys = list(z.keys())
+    with np.load(path, allow_pickle=False) as z:
         table: Dict[str, Any] = {}
         rows: Dict[int, Dict[str, Any]] = {}
-        for k in keys:
+        for k in list(z.keys()):
             v = z[k]
             val = v.item() if v.ndim == 0 else v
             if isinstance(val, bytes):
                 val = val.decode()
             parts = k.split("/")
             if parts[0] == "chevrons" and len(parts) >= 3:
-                row = rows.setdefault(int(parts[1]), {})
-                node = row
-                for seg in parts[2:-1]:
-                    node = node.setdefault(seg, {})
-                node[parts[-1]] = val
-            elif len(parts) == 1:
-                table[k] = val
+                node, parts = rows.setdefault(int(parts[1]), {}), parts[2:]
             else:
                 node = table
-                for seg in parts[:-1]:
-                    node = node.setdefault(seg, {})
-                node[parts[-1]] = val
+            for seg in parts[:-1]:
+                node = node.setdefault(seg, {})
+            node[parts[-1]] = val
     table["chevrons"] = [rows[i] for i in sorted(rows)]
     for key in ("fit", "stability", "held", "n_held", "stark_crossing_eta",
                 "delta_MHz", "quality"):
@@ -152,9 +105,8 @@ def load_npz_rabi(path: str) -> Dict[str, Any]:
 def load_column_stored_fit(path: str, tag: str) -> Dict[str, Any]:
     """The ``fit`` dict the run itself recorded, for before/after comparison.
 
-    Returns ``{}`` when the column stored none -- a ridge that railed never
-    reached `fit_shift_curve`, which is the case `_stale_chirp_free` also has to
-    treat as "the excursion is unknown" rather than "the excursion is small".
+    ``{}`` when the column stored none (a railed ridge never reached
+    `fit_shift_curve`): the excursion is unknown, not small.
     """
     from snail_solver.h5_io import load_tree, split_address
 
@@ -168,10 +120,8 @@ def load_column_stored_fit(path: str, tag: str) -> Dict[str, Any]:
 def iter_columns(path: str) -> Iterator[Tuple[str, str, float]]:
     """``(tag, status, delta_GHz)`` for every column in a scan file.
 
-    ``status`` is the attribute `_write_run` stamps on the column group
-    (``subharmonic_gate_scan.py:872``): ``"ok"`` when the column produced a
-    fidelity, ``"failed"`` when it did not. Both kinds carry their chevrons,
-    which is what makes a failed column re-analysable at all.
+    ``status`` is the group attribute `_write_run` stamps: ``"ok"`` or ``"failed"``.
+    Both kinds carry their chevrons, so failed columns are re-analysable too.
     """
     import h5py
 
@@ -195,16 +145,10 @@ def iter_columns(path: str) -> Iterator[Tuple[str, str, float]]:
 def narrow_slice(offsets_GHz: np.ndarray, n_narrow: int) -> slice:
     """The central `n_narrow` points -- a widened row's ORIGINAL grid.
 
-    A span growth re-samples at the same step: ``rabi_shift_table`` grows
-    ``n_off`` by the same factor as the span (``tune_up.py:1056-1059``), so a
-    3x-widened 43-point row is the original 15-point grid with 14 points added
-    on each side, at the same offsets. That makes the "what if this row had
-    never been widened" counterfactual an exact re-read of stored data rather
-    than a model -- which is the only reason the widening policy could be
-    settled without re-solving anything.
-
-    Raises when the arithmetic does not line up, because a silent off-by-one
-    here would quietly compare two different measurements.
+    ``rabi_shift_table`` grows ``n_off`` by the same factor as the span, so a
+    widened row is the original grid plus equal padding on each side at the same
+    step; the "never widened" counterfactual is an exact re-read. Raises ValueError
+    when the counts do not line up, rather than silently comparing different data.
     """
     n = len(offsets_GHz)
     if n_narrow > n or (n - n_narrow) % 2:
@@ -222,21 +166,12 @@ def gate_rows(chevrons: Sequence[Dict[str, Any]], *,
               **quality_kw) -> Tuple[np.ndarray, np.ndarray, List[Optional[str]]]:
     """Re-run the per-row quality gate over stored chevrons.
 
-    Returns ``(ridge_MHz, weights, rejects)``, with ``nan`` in the ridge
-    wherever the row was rejected -- the same convention `rabi_shift_table` uses
-    (``tune_up.py:991``, ``:1090-1103``).
-
-    By default this calls `chevron_quality` on each row's STORED Lorentzian fit,
-    so re-gating under the original thresholds returns the ridge the run already
-    recorded. Pass ``refit_centers=True`` to re-run `fit_chevron_center` as
-    well, which is what a policy that changes the FITTING (rather than the
-    accept/reject decision) needs.
-
-    `n_narrow` emulates a run made without the ``_too_wide`` span growth: each
-    row is cropped to its original central grid before being fitted and gated.
-    Measured over the 2 GHz grid, cropping the 834 ``_too_wide`` rows this way
-    KEEPS MORE of them (62.1% vs 54.0%) -- the widening was losing the rows it
-    was meant to save.
+    Returns ``(ridge_MHz, weights, rejects)`` with ``nan`` in the ridge for rejected
+    rows (as `rabi_shift_table` does). By default `chevron_quality` is applied to each
+    row's STORED Lorentzian fit, so the original thresholds reproduce the recorded
+    ridge; ``refit_centers=True`` re-runs `fit_chevron_center` too. `n_narrow` emulates
+    a run without the ``_too_wide`` span growth by cropping each row to its original
+    central grid (and span) before fitting and gating.
     """
     from snail_solver.tune_up import chevron_quality, fit_chevron_center
 
@@ -251,7 +186,7 @@ def gate_rows(chevrons: Sequence[Dict[str, Any]], *,
         span = float(ch.get("span_MHz", np.nan))
         if n_narrow is not None and len(off) > n_narrow:
             sl = narrow_slice(off, n_narrow)
-            # The span shrinks with the grid; the gate compares hwhm against it.
+            # the span shrinks with the grid; the gate compares hwhm against it
             span *= (n_narrow - 1) / (len(off) - 1)
             off, met = off[sl], met[sl]
             cen = fit_chevron_center(off, met)
@@ -282,23 +217,13 @@ def fit_law(eta: np.ndarray, delta_MHz: np.ndarray,
             eta_max: Optional[float] = None) -> Dict[str, Any]:
     """Weighted least squares of ``delta = sum_p c_p |eta|^p``.
 
-    A generalization of `tune_up.fit_shift_curve`, which hardwires
-    ``(0, 2, 4)``. Two knobs, and they answer different questions:
+    Generalizes `tune_up.fit_shift_curve` (hardwired to ``(0, 2, 4)``):
+    `powers` keeps more orders of the Stark expansion; `eta_max` fits only rows below
+    a drive and EXTRAPOLATES to eta* -- better r2, but read outside the measured rows,
+    which `law_diagnostics`' ``extrapolation_ratio`` exposes.
 
-    * `powers` -- keep another order of the Stark expansion. Costs nothing in
-      extrapolation, since the fit still spans every measured row.
-    * `eta_max` -- fit only the rows below a drive and EXTRAPOLATE to eta*.
-      Measured over the 64 fittable failed columns of the 2 GHz grid, capping
-      at ``0.6 eta*`` lifts median r2 from 0.732 to 0.999 -- but a law fitted to
-      eta <= 0.78 and evaluated at 1.3 is a bigger leap than one fitted
-      throughout, and r2 cannot see that. `extrapolation_ratio` can, and is
-      returned here so the trade is visible rather than implied.
-
-    r2 is computed WEIGHTED, unlike `fit_shift_curve`, which solves the least
-    squares weighted and then scores it unweighted (``tune_up.py:572``). That
-    inconsistency is in the pipeline and is not this function's to change
-    silently, so `r2_unweighted` is returned alongside for direct comparison
-    against a stored `fit`.
+    ``r2`` is WEIGHTED; `fit_shift_curve` scores its weighted fit unweighted, so
+    ``r2_unweighted`` is returned too for comparison against a stored `fit`.
     """
     eta = np.asarray(eta, dtype=float)
     y = np.asarray(delta_MHz, dtype=float)
@@ -343,23 +268,12 @@ def probe_moments_general(config: Dict[str, Any], powers: Sequence[int], *,
                           weighting: str = "rabi", n_quad: int = 4001) -> Dict[int, float]:
     """``{power: M_power}`` for this device's envelope, at ANY even order.
 
-    `stark_chirp.stark_moments` returns exactly ``(M2, M4)`` because those are
-    the two orders the pipeline's law has. Its derivation is not limited to
-    them: a shaped probe of peak ``eta*`` reports
-    ``<delta>(eta*) = sum_n k_2n M_2n eta*^2n`` with ``M_2n = <f^n>_w``,
-    ``f(u) = |eta(u)|^2 / eta*^2``, diagonal in the even powers because the law
-    is an even polynomial. So ``M6 = <f^3>_w`` and the rest follows.
-
-    Written here rather than in `stark_chirp` because extending the law is a
-    decision this module exists to inform, not one it should presume. The
-    orders it shares with `stark_moments` must agree to round-off, which the
-    test suite asserts -- if they ever diverge, this is the copy that is wrong.
-
-    ``M0 = 1`` by construction: the static term is not drive-dependent and no
-    envelope averages it away.
+    `stark_chirp.stark_moments` returns only ``(M2, M4)``, but its derivation is
+    general: a shaped probe of peak ``eta*`` reports ``<delta>(eta*) = sum_n k_2n
+    M_2n eta*^2n`` with ``M_2n = <f^n>_w``, ``f(u) = |eta(u)|^2 / eta*^2`` (diagonal
+    because the law is even). Shared orders must agree with `stark_moments` to
+    round-off (tested). ``M0 = 1``: the static term is not drive-dependent.
     """
-    import numpy as _np
-
     from snail_solver.stark_chirp import rabi_angle, shape_mean_factor
     from snail_solver.tune_up import _shape_envelope, shape_config
 
@@ -367,8 +281,8 @@ def probe_moments_general(config: Dict[str, Any], powers: Sequence[int], *,
     env = _shape_envelope(shape, shape_kw)
 
     def shape_fn(u):
-        s = _np.abs(_np.asarray(env.value_at(_np.asarray(u, dtype=float) + 1.0, _np),
-                                dtype=complex))
+        s = np.abs(np.asarray(env.value_at(np.asarray(u, dtype=float) + 1.0, np),
+                              dtype=complex))
         return s ** 2
 
     orders = sorted({int(p) for p in powers if int(p) != 0})
@@ -381,39 +295,34 @@ def probe_moments_general(config: Dict[str, Any], powers: Sequence[int], *,
     if str(weighting) == "uniform":
         for p in orders:
             out[p] = shape_mean_factor(
-                lambda u, n=p // 2: _np.asarray(shape_fn(u), float) ** n)
+                lambda u, n=p // 2: np.asarray(shape_fn(u), float) ** n)
         return out
     if str(weighting) == "coupling":
-        norm = shape_mean_factor(lambda u: _np.sqrt(_np.asarray(shape_fn(u), float)))
-        if not _np.isfinite(norm) or norm <= 0.0:
+        norm = shape_mean_factor(lambda u: np.sqrt(np.asarray(shape_fn(u), float)))
+        if not np.isfinite(norm) or norm <= 0.0:
             raise ValueError("coupling weighting needs a positive <|eta|>")
         for p in orders:
             out[p] = shape_mean_factor(
-                lambda u, n=p // 2: _np.asarray(shape_fn(u), float) ** (n + 0.5)) / norm
+                lambda u, n=p // 2: np.asarray(shape_fn(u), float) ** (n + 0.5)) / norm
         return out
 
-    u = _np.linspace(-1.0, 1.0, max(int(n_quad), 101))
-    f = _np.clip(_np.asarray(shape_fn(u), dtype=float), 0.0, None)
-    w = _np.sin(rabi_angle(shape_fn, u))
-    norm = _np.trapz(w, u)
-    if not _np.isfinite(norm) or norm <= 0.0:
+    u = np.linspace(-1.0, 1.0, max(int(n_quad), 101))
+    f = np.clip(np.asarray(shape_fn(u), dtype=float), 0.0, None)
+    w = np.sin(rabi_angle(shape_fn, u))
+    norm = np.trapz(w, u)
+    if not np.isfinite(norm) or norm <= 0.0:
         raise ValueError("rabi weighting needs a positive sin(theta) normalization")
     for p in orders:
-        out[p] = float(_np.trapz(w * f ** (p // 2), u) / norm)
+        out[p] = float(np.trapz(w * f ** (p // 2), u) / norm)
     return out
 
 
 def deconvolve_moments(fit: Dict[str, Any],
                        moments: Dict[int, float]) -> Dict[str, Any]:
-    """Divide a SHAPED-probe law by its moments to get the pointwise one.
+    """Divide a SHAPED-probe law by its moments: ``k_2n = K_2n / M_2n``.
 
-    ``k_2n = K_2n / M_2n`` (`stark_chirp.stark_moments`). A constant probe needs
-    none of this; a shaped one measures ``K`` and the chirp needs ``k``.
-
-    This is the step that makes a stored ``fit`` unusable as an input: the run
-    already applied it, so the stored ``k2`` IS ``K2_measured / M2``. Applying
-    it to a stored law would divide twice. Only ever call this on a law fitted
-    here, from the rows.
+    Only call this on a law fitted here from the rows: a stored ``fit`` already had
+    it applied, and dividing twice is wrong.
     """
     out = dict(fit)
     out["coeffs"] = {}
@@ -432,14 +341,13 @@ def evaluate_law(fit: Dict[str, Any], eta: float, *,
                  drop_static: bool = True) -> float:
     """The law's drive-dependent shift at `eta`, in MHz.
 
-    ``delta0`` is excluded by default: it survives at zero drive, comes from the
-    static Hamiltonian rather than the pump, and belongs in ``wp_offset_GHz``
-    rather than in the chirp (``tune_up.fit_shift_curve``, ``:522``). Every
-    excursion and quartic-fraction number downstream means the drive-dependent
-    part, so getting this wrong would flatter or damn a law by a constant.
+    ``delta0`` is excluded by default: it is static, belongs in ``wp_offset_GHz``
+    rather than the chirp, and every downstream excursion number means the
+    drive-dependent part only.
     """
+    coeffs = [fit["coeffs"][f"k{p}"] for p in fit["powers"]]
     total = 0.0
-    for p, c in zip(fit["powers"], [fit["coeffs"][f"k{p}"] for p in fit["powers"]]):
+    for p, c in zip(fit["powers"], coeffs):
         if drop_static and p == 0:
             continue
         total += c * float(eta) ** p
@@ -448,19 +356,14 @@ def evaluate_law(fit: Dict[str, Any], eta: float, *,
 
 def law_diagnostics(fit: Dict[str, Any], target_eta: float,
                     t_g_ns: float) -> Dict[str, Any]:
-    """Whether this law may be chirped with -- the three questions that matter.
+    """Whether this law may be chirped with.
 
-    * ``excursion_frac_linewidth`` -- would a chirp DO anything? The excursion
-      against the resonance half-width ``1/(2 t_g)``. This is the discriminator
-      `tune_up.py:1298-1303` uses to tell "no shift to chirp" from "a shift we
-      failed to measure", and the two want opposite treatment.
-    * ``last_term_fraction`` -- is the series converged? The magnitude of the
-      HIGHEST kept term against the lowest drive-dependent one, at eta*. The
-      generalization of ``quartic_fraction`` (``:1808``), whose warn threshold
-      is 0.25. A law whose last term is not small is a truncation that has not
-      settled, whatever its r2.
-    * ``extrapolation_ratio`` -- is eta* inside the measurement? Above 1 the law
-      is being read outside the rows that produced it, which no r2 can detect.
+    * ``excursion_frac_linewidth`` -- would a chirp do anything? The excursion over
+      the resonance half-width ``1/(2 t_g)``.
+    * ``last_term_fraction`` -- is the series converged? |highest kept term| over
+      |lowest drive-dependent term| at eta* (generalizes ``quartic_fraction``).
+    * ``extrapolation_ratio`` -- eta* over the largest fitted eta; above 1 the law is
+      read outside its rows, which no r2 can detect.
     """
     eta = float(target_eta)
     drive = [p for p in fit["powers"] if p != 0]
@@ -500,16 +403,10 @@ def refit_column(table: Dict[str, Any], target_eta: float, *,
                  **quality_kw) -> Dict[str, Any]:
     """Gate, fit and diagnose one stored column. No solves.
 
-    Returns the law, its diagnostics and the row census. Raises `ValueError`
-    when too few rows survive to fit the requested law -- the offline mirror of
-    the ``"need >= 4 usable rows"`` failure, which is 2 of the 2 GHz grid's 68.
-
-    `config` and `probe_shape` are needed only for a SHAPED probe, where the
-    fitted coefficients are the law's scaled by the envelope moments and have
-    to be divided back out (``tune_up.py:1272-1283``). Without them a shaped
-    column's excursion is reported in measured rather than pointwise units,
-    which understates it by ~1/M2 -- so the report says so rather than
-    guessing.
+    Returns the law, its diagnostics and the row census; raises ValueError when too
+    few rows survive (see `fit_law`). A SHAPED probe needs `config` to divide the
+    envelope moments back out; without it the fit is flagged ``moments_unavailable``
+    and stays in measured (not pointwise) units.
     """
     chevrons = list(table["chevrons"])
     eta = np.asarray(table["eta"], dtype=float)
@@ -540,22 +437,17 @@ def refit_column(table: Dict[str, Any], target_eta: float, *,
             "rejects": rejects, "eta": eta, "t_g_ref_ns": t_g}
 
 
-#: Named policies, so a policy travels through a report (or, later, a worker
-#: payload) as a string. A closure cannot be pickled; a name can.
+#: Named policies, so a policy travels through a report or worker payload as a
+#: picklable string.
 POLICIES: Dict[str, Dict[str, Any]] = {
-    # Exactly what the pipeline does today, and the baseline every other policy
-    # is measured against.
-    "stored": {},
-    # One more order of the Stark expansion, fitted over every measured row --
-    # no extrapolation penalty.
+    "stored": {},                                   # the pipeline today (baseline)
+    # more orders of the Stark expansion, fitted over every row (no extrapolation)
     "k6": {"powers": (0, 2, 4, 6)},
     "k8": {"powers": (0, 2, 4, 6, 8)},
-    # Better conditioned, at the cost of reading the law outside the rows that
-    # produced it. `extrapolation_ratio` is what makes that cost visible.
+    # better conditioned, but read outside the fitted rows (see extrapolation_ratio)
     "narrow_fit_0.8": {"eta_max_frac": 0.8},
     "narrow_fit_0.6": {"eta_max_frac": 0.6},
-    # A run made without the `_too_wide` span growth, reconstructed exactly from
-    # the widened rows' central grids.
+    # a run without the `_too_wide` span growth, reconstructed from central grids
     "no_widen": {"n_narrow": 15, "refit_centers": True},
     "no_widen_k6": {"n_narrow": 15, "refit_centers": True,
                     "powers": (0, 2, 4, 6)},
@@ -563,11 +455,8 @@ POLICIES: Dict[str, Dict[str, Any]] = {
 
 
 def policy_kwargs(name: str, target_eta: float) -> Dict[str, Any]:
-    """Resolve a named policy against a column's eta*.
-
-    ``eta_max_frac`` is stored as a FRACTION of eta* rather than an absolute
-    drive so one policy name means the same thing at eta* = 1.3 and 1.5.
-    """
+    """Resolve a named policy against a column's eta*; ``eta_max_frac`` is a
+    FRACTION of eta* so one name means the same thing at every eta*."""
     if name not in POLICIES:
         raise KeyError(f"unknown policy {name!r}; have {sorted(POLICIES)}")
     kw = dict(POLICIES[name])

@@ -1,34 +1,25 @@
 #!/usr/bin/env python3
 r"""Spectator channel audit: which parasitic processes exist, and how STRONG they are.
 
-``plot_allocation.py`` answers "WHERE are the collisions" -- it draws the curated
-analytic centres (direct exchange, one-pump sidebands, subharmonics) as forbidden
-zones on the frequency axis. This tool answers "HOW BAD is each one", by reading
-the strengths out of the MODEL instead of a table:
-
-For a spectator placed at w_spec, build the real 4-mode system [a, b, coupler,
-spec] and walk every term of ``ZhouCoupler.expand_terms``. Each term carries a
-carrier detuning Omega_j (the channel's beat) and an operator O_j; the matrix
-elements of O_j that EXCITE the spectator out of |0>, starting from the low-lying
-computational states, are the parasitic couplings. That enumeration is complete by
-construction -- it cannot miss a channel the way a hand-written list can, and it
-automatically includes eta^2 / eta^3 processes (the two-pump subharmonics), the
-|2>-involving and anharmonicity-shifted channels, and coupler-mediated
-combinations.
+``plot_allocation.py`` shows WHERE the curated collision centres are; this tool reads
+HOW BAD each one is out of the model. For a spectator at w_spec it builds the 4-mode
+system [a, b, coupler, spec] and walks every term of ``ZhouCoupler.expand_terms``:
+each carries a carrier detuning Omega_j (the channel's beat) and an operator O_j,
+whose matrix elements exciting the spectator from the low-lying computational
+states are the parasitic couplings. The enumeration is complete by construction,
+including eta^2 / eta^3 (two-pump subharmonic), |2>-involving, anharmonicity-shifted
+and coupler-mediated channels.
 
 Per channel it reports
 
     g            coupling matrix element (MHz), weighted by |eta|^n_pump
     detuning     signed Omega_j / 2 pi (MHz) -- the DRAG beat for that channel
-    g/|detuning| dimensionless first-order excitation amplitude. >= 1 means the
-                 channel is NOT perturbative: no DRAG/virtual-Z correction fixes
-                 it, and the placement has to move.
-    P_exc        off-resonant excitation estimate min(1, 2 (g/detuning)^2), the
-                 population parked in the spectator during the gate
+    g/|detuning| first-order excitation amplitude. >= 1: NOT perturbative, no
+                 DRAG/virtual-Z fixes it, the placement has to move.
+    P_exc        off-resonant excitation estimate min(1, 2 (g/detuning)^2)
     transition    which modes change occupation, and the pump order
 
-and a band scan sweeps the spectator across [w_a, w_b] to show total estimated
-error vs placement, i.e. where the quiet windows actually are.
+and a band scan sweeps the spectator across [w_a, w_b] to find the quiet windows.
 
 CLI
 ---
@@ -61,32 +52,18 @@ A, B, COUPLER, SPEC = 0, 1, 2, 3        # mode order, matching sweep_target.py
 SPEC_MARKERS = ["o", "v", "P", "X", "h", "<"]      # one per spectator, cycled
 
 
-def build_with_spectators(config: Dict[str, Any], w_specs_GHz: Sequence[float],
-                          t_g_ns: float, *, coupler_levels: Optional[int] = None,
-                          spec_levels: Optional[int] = None):
-    """Same as :func:`build_with_spectator` but with an arbitrary number of spectators.
+def _build(config: Dict[str, Any], specs: List[float], t_g_ns: float,
+           coupler_levels: Optional[int], s_lv: int):
+    """[a, b, coupler, spec_1, ...] with the gate pump set and iSWAP-normalized.
 
-    Mode order is [a, b, coupler, spec_1, spec_2, ...] so the spectator indices are
-    ``3, 4, ...``; each takes participation ``lam_b`` and ``anharm_spec_GHz``, matching
-    the single-spectator convention in ``sweep_target.py``.
-
-    Note the Hilbert dimension multiplies by ``spec_levels`` per spectator, and
-    ``expand_terms`` slows accordingly -- with two or more spectators use
-    ``spec_levels=2`` (enough to see |0> -> |1> excitation) unless you specifically
-    need spectator |2> channels.
-
-    Returns
-    -------
-    (ZhouCoupler, float, list of int)
-        Coupler, peak |eta|, and the spectator mode indices.
+    Each spectator takes participation ``lam_b`` and ``anharm_spec_GHz`` (the
+    ``sweep_target.py`` convention). Returns ``(cpl, peak_eta, spec_indices)``.
     """
     from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, make_chirp
     wa, wb = (float(f) for f in config["qubit_freqs_GHz"])
     ws = float(config["coupler_freq_GHz"])
-    specs = [float(w) for w in w_specs_GHz]
     q_lv = int(config.get("qubit_levels", 3))
     c_lv = int(coupler_levels or config.get("coupler_levels", 5))
-    s_lv = int(spec_levels or (3 if len(specs) <= 1 else 2))
     aq = float(config.get("anharm_qubit_GHz", 0.0))
     a_sp = float(config.get("anharm_spec_GHz", 0.0))
     nonlin = {3: float(config["g3_GHz"])}
@@ -101,8 +78,7 @@ def build_with_spectators(config: Dict[str, Any], w_specs_GHz: Sequence[float],
                       participations=part, nonlinearities=nonlin,
                       levels=[q_lv, q_lv, c_lv] + [s_lv] * len(specs),
                       anharmonicities_GHz=anh)
-    # the GATE pump, so it carries the device's chirp; make_chirp -> None when unset,
-    # leaving the un-chirped audit byte-identical
+    # the GATE pump, so it carries the device's chirp (make_chirp -> None when unset)
     cpl.set_pump(PumpTone(w_p_GHz=abs(wb - wa),
                           envelope=RaisedCosine(amp=1.0, t_g=float(t_g_ns)),
                           is_eta=True,
@@ -110,6 +86,20 @@ def build_with_spectators(config: Dict[str, Any], w_specs_GHz: Sequence[float],
                                            float(t_g_ns))),
                  normalize_iswap=(A, B))
     return cpl, float(cpl.peak_eta()), idxs
+
+
+def build_with_spectators(config: Dict[str, Any], w_specs_GHz: Sequence[float],
+                          t_g_ns: float, *, coupler_levels: Optional[int] = None,
+                          spec_levels: Optional[int] = None):
+    """:func:`build_with_spectator` for any number of spectators (modes 3, 4, ...).
+
+    The Hilbert dimension multiplies by ``spec_levels`` per spectator, so with two or
+    more the default is 2 (enough for |0> -> |1>). Returns
+    ``(ZhouCoupler, peak |eta|, spectator mode indices)``.
+    """
+    specs = [float(w) for w in w_specs_GHz]
+    s_lv = int(spec_levels or (3 if len(specs) <= 1 else 2))
+    return _build(config, specs, t_g_ns, coupler_levels, s_lv)
 
 
 def mode_tags(cpl, spec_indices: Sequence[int]) -> Dict[int, Dict[str, Any]]:
@@ -132,54 +122,12 @@ def mode_tags(cpl, spec_indices: Sequence[int]) -> Dict[int, Dict[str, Any]]:
 def build_with_spectator(config: Dict[str, Any], w_spec_GHz: float, t_g_ns: float,
                          *, coupler_levels: Optional[int] = None,
                          spec_levels: Optional[int] = None):
-    """4-mode [a, b, coupler, spec] system with the iSWAP pump set and normalized.
-
-    Follows the sweep convention: mode order a=0, b=1, coupler=2, spectator=3, and
-    the spectator participation equals ``lam_b`` (see ``sweep_target.py``).
-
-    Parameters
-    ----------
-    config : dict
-        Device configuration (``qubit_freqs_GHz``, ``coupler_freq_GHz``, ``g3_GHz``,
-        ``lam_a``, ``lam_b``, levels, anharmonicities).
-    w_spec_GHz : float
-        Absolute spectator frequency (GHz).
-    t_g_ns : float
-        Gate duration, which fixes |eta| through the pi/2 normalization.
-    coupler_levels, spec_levels : int, optional
-        Truncation overrides.
-
-    Returns
-    -------
-    (ZhouCoupler, float)
-        The coupler and its peak |eta|.
+    """4-mode [a, b, coupler, spec] system (spectator at ABSOLUTE `w_spec_GHz`) with
+    the iSWAP pump set and normalized; t_g fixes |eta|. Returns ``(cpl, peak |eta|)``.
     """
-    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, make_chirp
-    wa, wb = (float(f) for f in config["qubit_freqs_GHz"])
-    ws = float(config["coupler_freq_GHz"])
-    q_lv = int(config.get("qubit_levels", 3))
-    c_lv = int(coupler_levels or config.get("coupler_levels", 5))
     s_lv = int(spec_levels or config.get("qubit_levels", 3))
-    aq = float(config.get("anharm_qubit_GHz", 0.0))
-    nonlin = {3: float(config["g3_GHz"])}
-    if float(config.get("g4_GHz", 0.0)) != 0.0:
-        nonlin[4] = float(config["g4_GHz"])
-    cpl = ZhouCoupler(
-        mode_freqs_GHz=[wa, wb, ws, float(w_spec_GHz)], coupler_index=COUPLER,
-        participations={A: float(config["lam_a"]), B: float(config["lam_b"]),
-                        SPEC: float(config["lam_b"])},        # = lam_b, per sweeps
-        nonlinearities=nonlin, levels=[q_lv, q_lv, c_lv, s_lv],
-        anharmonicities_GHz={A: aq, B: aq,
-                             SPEC: float(config.get("anharm_spec_GHz", 0.0))})
-    # the GATE pump, so it carries the device's chirp; make_chirp -> None when unset,
-    # leaving the un-chirped audit byte-identical
-    cpl.set_pump(PumpTone(w_p_GHz=abs(wb - wa),
-                          envelope=RaisedCosine(amp=1.0, t_g=float(t_g_ns)),
-                          is_eta=True,
-                          chirp=make_chirp(config.get("chirp_coeffs_GHz") or None,
-                                           float(t_g_ns))),
-                 normalize_iswap=(A, B))
-    return cpl, float(cpl.peak_eta())
+    cpl, eta, _idxs = _build(config, [float(w_spec_GHz)], t_g_ns, coupler_levels, s_lv)
+    return cpl, eta
 
 
 def t_g_for_eta(config: Dict[str, Any], eta: float) -> float:
@@ -191,6 +139,17 @@ def t_g_for_eta(config: Dict[str, Any], eta: float) -> float:
 # --------------------------------------------------------------------------- #
 # Channel enumeration                                                         #
 # --------------------------------------------------------------------------- #
+def _computational_starts(cpl) -> List[int]:
+    """Fock indices of the low-lying states: qubits in {0, 1}, everything else |0>."""
+    starts = []
+    for na in range(min(2, cpl.dims[A])):
+        for nb in range(min(2, cpl.dims[B])):
+            occ = [0] * cpl.n_modes
+            occ[A], occ[B] = na, nb
+            starts.append(cpl.fock_index(occ))
+    return starts
+
+
 def _label(cpl, i_from: int, i_to: int, n_pump: int,
            info: Optional[Dict[int, Dict[str, Any]]] = None) -> str:
     """Compact transition label, e.g. 'a1->0 sp1 0->1 (2 pump)'."""
@@ -206,18 +165,11 @@ def _label(cpl, i_from: int, i_to: int, n_pump: int,
 
 def _process_name(cpl, i_from: int, i_to: int, n_pump: int,
                   info: Dict[int, Dict[str, Any]], is_target: bool = False) -> str:
-    """Physics name for a process, e.g. 'SNAIL subharmonic', 'qubit A subharmonic',
-    'A-SNAIL spectator', 'A-B |11>->|02> leakage'.
+    """Physics name for a process, e.g. 'qubit A subharmonic', 'A-SNAIL spectator'.
 
-    The taxonomy follows what the process actually does:
-
-    * ONE mode gains a quantum, driven by n pump photons -> a SUBHARMONIC of that
-      mode (``n w_p = w_i``): n=2 is the usual one, n=1 is a direct drive.
-    * TWO modes exchange a quantum (one up, one down) -> a SPECTATOR interaction
-      between them, pump-assisted when n >= 1. The a<->b version at n=1 is the
-      wanted gate, not a parasite.
-    * A mode driven into |2> -> LEAKAGE, named by the partner it exchanged with.
-    * Two modes both gaining -> PAIR CREATION.
+    One mode gains alone -> SUBHARMONIC (``n w_p = w_i``; n=1 is a direct drive);
+    one up / one down -> SPECTATOR exchange (pump-assisted for n >= 1); a mode into
+    |2> -> LEAKAGE via its partner; two up -> PAIR CREATION.
     """
     o_f, o_t = cpl.decode_index(i_from), cpl.decode_index(i_to)
     delta = {m: o_t[m] - o_f[m] for m in range(cpl.n_modes) if o_t[m] != o_f[m]}
@@ -285,35 +237,14 @@ def spectator_channels(cpl, *, window_GHz: float = 1.0, min_g_MHz: float = 1e-3,
                        dedupe_MHz: float = 0.5) -> List[Dict[str, Any]]:
     """Every near-resonant process that EXCITES the spectator, with its strength.
 
-    Walks ``expand_terms`` and, for each term, finds the matrix elements that take a
-    low-lying computational state (qubits in {0,1}, coupler and spectator in |0>) to
-    a state with the spectator excited. The element is weighted by ``|eta|^n_pump``,
-    so a two-pump channel is correctly suppressed (or not) by the drive strength.
-
-    Parameters
-    ----------
-    cpl : ZhouCoupler
-        4-mode system from :func:`build_with_spectator`.
-    window_GHz : float
-        Keep channels detuned by less than this.
-    min_g_MHz : float
-        Discard channels weaker than this.
-    dedupe_MHz : float
-        Merge channels whose detunings agree to within this, keeping the strongest.
-
-    Returns
-    -------
-    list of dict
-        Sorted by descending ``ratio``; keys g_MHz, detuning_MHz, ratio, P_exc,
-        n_pump, transition, perturbative.
+    Matrix elements of each ``expand_terms`` term from a low-lying computational state
+    to one with the spectator excited, weighted by ``|eta|^n_pump``. Channels detuned
+    beyond `window_GHz` or weaker than `min_g_MHz` are dropped; detunings within
+    `dedupe_MHz` merge, keeping the strongest. Sorted by descending ``ratio``; keys
+    g_MHz, detuning_MHz, ratio, P_exc, n_pump, transition, perturbative, resonant.
     """
     eta = float(cpl.peak_eta())
-    starts = []
-    for na in range(min(2, cpl.dims[A])):
-        for nb in range(min(2, cpl.dims[B])):
-            occ = [0] * cpl.n_modes
-            occ[A], occ[B] = na, nb
-            starts.append(cpl.fock_index(occ))
+    starts = _computational_starts(cpl)
 
     best: Dict[int, Dict[str, Any]] = {}
     for Omega, pump_sig, O in cpl.expand_terms(cutoff_GHz=window_GHz):
@@ -329,9 +260,7 @@ def spectator_channels(cpl, *, window_GHz: float = 1.0, min_g_MHz: float = 1e-3,
                 g = abs(col[f]) * scale / TWO_PI                # GHz
                 if g * 1e3 < min_g_MHz:
                     continue
-                # ON resonance the first-order ratio diverges: flag it rather than
-                # printing a meaningless huge number. Resonant means full exchange,
-                # so the excitation estimate saturates.
+                # on resonance the ratio diverges: flag it, saturate P_exc
                 resonant = abs(det) * 1e3 < 1e-3           # within 1 kHz
                 ratio = np.inf if resonant else g / abs(det)
                 key = int(round(det * 1e3 / max(dedupe_MHz, 1e-6)))
@@ -349,40 +278,15 @@ def spectator_channels(cpl, *, window_GHz: float = 1.0, min_g_MHz: float = 1e-3,
 def drag_verdict(g_MHz: float, det_MHz: float, t_g_ns: float) -> Dict[str, Any]:
     r"""How well first-order DRAG can suppress a channel at (g, detuning).
 
-    First-order DRAG (Motzoi et al. 2009) adds the quadrature
-    :math:`-i\,\dot\eta/(2\pi\delta)`, which cancels the ADIABATIC (transient)
-    excitation of a process detuned by :math:`\delta`. That transient has amplitude
-    :math:`A_0 \simeq g/|\delta|`; once the leading term is cancelled what remains is
-    the next order, :math:`\sim (g/|\delta|)^2`. So the DRAG suppression factor is
-    itself :math:`\simeq g/|\delta|`:
+    First-order DRAG (Motzoi et al. 2009) cancels the adiabatic transient of
+    amplitude :math:`\simeq g/|\delta|`, leaving :math:`\sim (g/|\delta|)^2`, so the
+    suppression factor is itself :math:`\simeq g/|\delta|` -- DRAG works best where
+    it is needed least. It fails outright when :math:`g/|\delta| \geq 1` (not
+    perturbative: reallocate) or :math:`|\delta| \lesssim 1/t_g` (inside the pulse
+    bandwidth: not adiabatic).
 
-        **DRAG works best exactly where you need it least** -- far-detuned, weakly
-        coupled channels get suppressed hard, while near-resonant strong ones barely
-        improve.
-
-    Two hard failure modes:
-
-    * :math:`g/|\delta| \geq 1` -- the channel is not perturbative at all, so there is
-      no leading term to cancel. Frequency allocation, not pulse shaping.
-    * :math:`|\delta| \lesssim 1/t_g` -- the detuning is inside the pulse's own
-      spectral width, so the drive has real weight ON the transition; the excitation
-      is not adiabatic and the DRAG quadrature (which goes as :math:`1/\delta`) is
-      both huge and ineffective.
-
-    Parameters
-    ----------
-    g_MHz : float
-        Channel coupling matrix element (MHz).
-    det_MHz : float
-        Signed channel detuning (MHz); 0 means exactly resonant.
-    t_g_ns : float
-        Gate duration (ns), which sets the pulse bandwidth ``1/t_g``.
-
-    Returns
-    -------
-    dict
-        ratio (g/|det|), bandwidth_MHz, adiabaticity (|det| * t_g), suppression
-        (post/pre amplitude ratio, <1 is good), suppression_dB, verdict, colour.
+    Returns ratio (g/|det|), bandwidth_MHz, adiabaticity (|det| * t_g), suppression
+    (post/pre amplitude, <1 is good), suppression_dB, verdict, colour.
     """
     bw_MHz = 1e3 / float(t_g_ns)                    # pulse spectral width (MHz)
     ad = abs(float(det_MHz)) / bw_MHz               # |det| * t_g, adiabaticity
@@ -411,9 +315,7 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                          has_spectator: bool = True) -> List[Dict[str, Any]]:
     """EVERY near-resonant process, classified, with strength, detuning and DRAG verdict.
 
-    Unlike :func:`spectator_channels` (which keeps only spectator excitation), this
-    enumerates the full set so the desired gate and its parasites appear on one
-    footing. Categories:
+    Unlike :func:`spectator_channels`, the gate and all parasites appear together:
 
     ``target``     the wanted a<->b exchange, |01> <-> |10> (detuning ~ 0)
     ``spectator``  excites the spectator mode
@@ -421,12 +323,8 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
     ``leakage``    drives a or b into |2>
     ``other``      remaining off-diagonal processes in the low-lying manifold
 
-    Each channel also carries ``f_p_res_GHz``, the pump frequency at which it would
-    become resonant: for an ``n``-pump process with detuning ``det``, that is
-    ``f_p + det/n``. This is what puts the parasites on a common frequency axis with
-    the gate -- the distance from ``f_p`` is how far the pump would have to move to
-    land on that resonance. Static (0-pump) channels have no such mapping and get
-    ``nan``; they are not pump-tunable.
+    ``f_p_res_GHz = f_p + det/n`` is the pump frequency at which an ``n``-pump
+    channel becomes resonant (``nan`` for static channels).
     """
     eta = float(cpl.peak_eta())
     f_p = float(cpl._pump_tones[0].w_p_GHz)
@@ -435,36 +333,17 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
         spec_indices = ([SPEC] if (has_spectator and n_modes > SPEC) else [])
     spec_indices = list(spec_indices)
     info = mode_tags(cpl, spec_indices)
-    # expand_terms carries the HARMONIC carrier only: the transmon anharmonicity is a
-    # separate static diagonal operator, so it has to be folded in by hand here.
-    #
-    # SIGN, because it was wrong until 2026-09-17 and the error was a factor of 3 on a
-    # real channel. `Omega` is (pump) MINUS (harmonic transition): a two-pump drive on
-    # qubit a reports Omega = 2 w_p - w_a, verified against stored audits. A detuning
-    # is therefore (pump) - (FULL transition), and the full transition is the harmonic
-    # one PLUS the anharmonic energy difference, so that difference is SUBTRACTED:
+    # expand_terms carries the HARMONIC carrier only; the anharmonicity is a separate
+    # diagonal operator, folded in here. SIGN: Omega is (pump) - (harmonic transition)
+    # (a two-pump drive on qubit a gives Omega = 2 w_p - w_a), so the detuning from the
+    # FULL transition SUBTRACTS the anharmonic difference:
     #
     #     det = Omega - (E_anh[f] - E_anh[i])
     #
-    # Adding it instead placed the two-pump a |1>->|2> resonance at delta = -alpha/2
-    # rather than +alpha/2 -- mirrored about the subharmonic. Concretely, at
-    # delta = -120 MHz it reported that channel 360 MHz off resonance (ratio 0.120,
-    # "DRAG effective", selected as mandatory) when it is 120 MHz off (ratio 0.359,
-    # past max_ratio, i.e. too strong to correct).
-    #
-    # The check that settles it needs no code: E(n) = n w_a + alpha n(n-1)/2, so the
-    # |1>->|2> transition sits at w_a + alpha and two pumps are resonant with it when
-    # 2 (w_a/2 + delta) = w_a + alpha, i.e. at delta = alpha/2. For |11> -> |02>,
-    # resonant in the harmonic expansion, the true detuning from a gate-resonant pump
-    # is -alpha, not +alpha.
+    # Check: E(n) = n w_a + alpha n(n-1)/2, so two pumps hit a |1>->|2> at
+    # delta = +alpha/2 (adding would mirror it to -alpha/2, a 3x error in g/|det|).
     E_anh = np.real(np.diag(np.asarray(cpl._anharm_op)))
-
-    starts = []
-    for na in range(min(2, cpl.dims[A])):
-        for nb in range(min(2, cpl.dims[B])):
-            occ = [0] * n_modes
-            occ[A], occ[B] = na, nb
-            starts.append(cpl.fock_index(occ))
+    starts = _computational_starts(cpl)
 
     best: Dict[Tuple, Dict[str, Any]] = {}
     for Omega, pump_sig, O in cpl.expand_terms(cutoff_GHz=window_GHz + 0.5):
@@ -504,11 +383,7 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                 spec_id = (spec_indices.index(victim) + 1
                            if victim is not None and victim in spec_indices else 0)
                 rec = dict(g_MHz=g * 1e3, detuning_MHz=det * 1e3, n_pump=n_pump,
-                           # The Fock indices this process connects. Recorded because
-                           # `transition`/`process` are DISPLAY strings, and pairing a
-                           # channel back to its (i, f) is what any level-resolved
-                           # quantity needs -- the AC-Stark shift of the channel's own
-                           # levels above all (see `stark_scales`).
+                           # Fock indices, for level-resolved use (see `stark_scales`)
                            i_index=int(i), f_index=int(f),
                            category=cat, transition=_label(cpl, i, f, n_pump, info),
                            name=_process_name(cpl, i, f, n_pump, info,
@@ -520,12 +395,10 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                                             else info[victim]["freq"]),
                            spectator_id=int(spec_id),
                            f_p_res_GHz=(f_p + det / n_pump if n_pump else np.nan))
+                rec.update(drag_verdict(rec["g_MHz"], rec["detuning_MHz"], t_g_ns))
                 if cat == "target":
-                    rec.update(drag_verdict(rec["g_MHz"], rec["detuning_MHz"], t_g_ns))
                     rec.update(verdict="resonant by design (the gate)",
                                colour="#111111", suppression=1.0, suppression_dB=0.0)
-                else:
-                    rec.update(drag_verdict(rec["g_MHz"], rec["detuning_MHz"], t_g_ns))
                 key = (cat, rec["victim"],
                        int(round(det * 1e3 / max(dedupe_MHz, 1e-6))))
                 prev = best.get(key)
@@ -541,34 +414,14 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
 def level_stark_shifts(cpl, eta: float, window_GHz: float = 2.0) -> np.ndarray:
     r"""Second-order AC-Stark shift of EVERY level, in GHz, at peak drive `eta`.
 
-    :func:`interaction_channels` keeps only the OFF-diagonal matrix elements (they are
-    the couplings `g`) and skips the diagonal with the comment "diagonal -> Stark
-    shift". This is the piece it skips, computed the standard way: every level is
-    pushed by the couplings that leave it,
+    The diagonal piece :func:`interaction_channels` skips: every level is pushed by
+    the couplings that leave it, summed over pump sidebands with ``eta**n_pump``::
 
         dE_i = - sum_{k != i} |g_ik|^2 / Delta_ik ,   Delta_ik = Omega + E_k - E_i
 
-    summed over pump sidebands, with each coupling scaled by ``eta**n_pump`` because a
-    process carrying `n` pump quanta is `n`-th order in the drive.
-
-    This is what makes a channel's detuning DRIVE-DEPENDENT. It is second order in
-    `eta`, i.e. the same `eta^2` leading order as the target transition's measured
-    Stark law -- which is why :func:`stark_scales` can express it as a MULTIPLE of the
-    chirp rather than as an independent curve.
-
-    Parameters
-    ----------
-    cpl : ZhouCoupler
-        Built coupler, as :func:`interaction_channels` uses.
-    eta : float
-        Peak drive.
-    window_GHz : float, default 2.0
-        Sideband cutoff, matching the audit's own enumeration window.
-
-    Returns
-    -------
-    ndarray
-        Shift per Fock index, in GHz.
+    Same ``eta^2`` leading order as the target's Stark law, which is why
+    :func:`stark_scales` can express it as a multiple of the chirp. Returns the shift
+    per Fock index (GHz).
     """
     E_anh = np.real(np.diag(np.asarray(cpl._anharm_op)))
     n = len(E_anh)
@@ -593,41 +446,18 @@ def stark_scales(config: Dict[str, Any], t_g_ns: float, rows: Sequence[Dict[str,
                  window_GHz: float = 2.0) -> Dict[int, float]:
     r"""``kappa`` per channel: its Stark shift as a MULTIPLE of the chirp.
 
-    The chirp IS the target transition's measured Stark curve --
-    ``tune_up.chirp_from_measured_shift`` builds it as ``k2 |eta(t)|^2 + k4
-    |eta(t)|^4``. Every other transition shifts at the same leading order in the same
-    envelope, so to lowest order its shift is PROPORTIONAL to the chirp::
+    The chirp is the target's measured Stark curve ``k2 |eta|^2 + k4 |eta|^4``
+    (``tune_up.chirp_from_measured_shift``). Other transitions shift at the same
+    leading order, so::
 
         dDelta_j(t) ~ kappa_j * delta_chirp(t),
         kappa_j = [dE(f) - dE(i)] / [k2 eta^2 + k4 eta^4]
 
-    That proportionality is the whole point: a channel's detuning can then be tracked
-    in time for free, by reusing the chirp the pulse already carries, instead of
-    integrating a second curve (:attr:`envelope.DragChannel.stark_scale`).
-
-    It is a LEADING-ORDER model. The numerator is second order in `eta` while the
-    denominator carries the measured quartic, so `kappa` drifts with drive; measured
-    against a wide chevron survey it held to ~30% over ``eta = 0.6..1.0``, which is
-    what matters against channel detunings of 100-200 MHz.
-
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration.
-    t_g_ns : float
-        Gate length, for building the coupler.
-    rows : sequence of dict
-        Audit rows from :func:`interaction_channels`, carrying ``i_index``/``f_index``.
-    k2_MHz, k4_MHz : float
-        The MEASURED target Stark law -- the same coefficients the chirp is built
-        from, so that `kappa` is a ratio against the curve actually being played.
-    eta : float, default 1.0
-        Drive at which to evaluate both shift and reference.
-
-    Returns
-    -------
-    dict
-        ``{_audit_beat_key(beat): kappa}``, keyed so a channel can look itself up.
+    letting a channel track its detuning by reusing the chirp
+    (:attr:`envelope.DragChannel.stark_scale`). Leading-order only: `kappa` drifts
+    with drive (~30% over ``eta = 0.6..1.0`` against a chevron survey). `rows` are
+    :func:`interaction_channels` rows; `k2_MHz`/`k4_MHz` the MEASURED law the chirp
+    uses. Returns ``{_audit_beat_key(beat): kappa}``.
     """
     from snail_solver.device_utils import build_coupler
     cpl, _w_p, _eta_pk = build_coupler(config, float(t_g_ns), float(amp_scale),
@@ -664,75 +494,31 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
                          quotient_rule: bool = True) -> Tuple[tuple, Dict[str, Any]]:
     """Audit every near-resonant channel; pick the ones recursive DRAG should correct.
 
-    Two enumerations are unioned, because neither alone is the right set:
+    Unions two enumerations: :func:`interaction_channels` (every Hamiltonian process;
+    `require` categories -- the ``|2>`` ladder and SNAIL heating -- are mandatory)
+    and ``sweep_common.collision_drag_channels``'s MODE SUBHARMONICS (``w_i = 2 w_p``),
+    also mandatory: a subharmonic exciting qubit A |0>->|1> classifies as ``other``
+    and would otherwise be missed.
 
-    * :func:`interaction_channels` finds every process the Hamiltonian actually
-      contains, with a coupling ``g_MHz``, a detuning and a :func:`drag_verdict`. Its
-      ``leakage`` category means specifically the ``|2>`` ladder and its ``coupler``
-      category the SNAIL heating -- the two that must always be corrected.
-    * ``sweep_common.collision_drag_channels`` supplies the MODE SUBHARMONICS
-      (``w_i = 2 w_p``, two pump quanta). These are not optional either, and they do
-      NOT all fall in a ``require`` category: a subharmonic that excites qubit A from
-      ``|0>`` to ``|1>`` leaves both qubits under ``|2>``, so the classifier calls it
-      ``other``. Requiring only the categories would silently miss it, which is
-      precisely the channel a scan across ``2 w_p = w_a`` is about.
+    Mandatory channels come first, then the strongest correctable parasites by
+    ``g/|det|``, up to `max_channels` (each channel costs a unit of ``envelope_m``,
+    hence pulse area and ``t_g``). Channels at ``g/|det| >= max_ratio`` are left
+    uncorrected (the chirp<->DRAG fixed point diverges); below `min_ratio` a channel
+    is negligible and not mandatory. Channels a chirp would sweep through their
+    collision are dropped by ``sweep_common._drag_channels_filtered``; every drop is
+    reported with a reason.
 
-    Everything mandatory is kept; the remaining slots go to the strongest correctable
-    parasites, ranked by pre-DRAG excitation amplitude ``g/|det|`` (the same ordering
-    :func:`interaction_channels` itself returns). The cap exists because channel count
-    is not free: :mod:`snail_solver.drag` needs the base envelope to vanish to order
-    ``len(channels)`` at both gate edges, which sets ``envelope_m`` and hence the pulse
-    area and ``t_g``.
-
-    Channels a chirp would sweep onto their own collision, or that sit inside the skip
-    window, are dropped by ``sweep_common._drag_channels_filtered`` -- reported, not
-    silently absent.
-
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration. Read-only.
-    t_g_ns : float
-        Gate duration (ns). Sets the pulse bandwidth every verdict is judged against.
-    max_channels : int, default 4
-        Hard cap on the recursion depth.
-    require : sequence of str, default ("leakage", "coupler")
-        Categories that are always corrected when present.
-    min_g_MHz : float, default 1e-3
-        Floor on channel coupling for the audit.
-    max_ratio : float, default 0.3
-        Above this ``g/|det|`` a channel is NOT correctable perturbatively and is
-        excluded from the recursion (still reported). ``drag_verdict`` already calls
-        ``ratio >= 0.3`` "marginal: weak suppression", and it is the same threshold
-        ``device_utils.drag_correction_ratio`` warns at -- the DRAG quadrature is then
-        a third of the pulse it corrects, so the composition is a guess rather than a
-        correction. Composing several such channels does not merely help less, it
-        DIVERGES: the chirp<->DRAG fixed point runs away instead of settling.
-    min_ratio : float, default 0.02
-        Below this pre-DRAG excitation amplitude ``g/|det|`` a channel is NEGLIGIBLE
-        and stops being mandatory, however its category classifies. A parasite at
-        ``ratio = 0.01`` contributes ``P_exc ~ 2e-4``; spending a recursion order on it
-        costs a unit of ``envelope_m`` -- and hence pulse area and gate length -- to buy
-        nothing. Set 0 to make every categorised channel mandatory.
-
-    Returns
-    -------
-    channels : tuple of envelope.DragChannel
-        What to hand ``run_tune_up(drag_channels=...)``.
-    audit : dict
-        ``rows`` (every channel, each with ``selected`` and ``reason``), ``blocking``
-        (mandatory channels no pulse shape can fix), ``n_selected``,
-        ``envelope_m_min``, ``w_p_GHz``, ``eta_peak``, ``t_g_ns`` and
-        ``total_error_MHz``.
+    Returns ``(channels, audit)``: the ``envelope.DragChannel`` tuple for
+    ``run_tune_up(drag_channels=...)``, and a dict with ``rows`` (each with
+    ``selected``/``reason``), ``blocking``, ``n_selected``, ``envelope_m_min``,
+    ``w_p_GHz``, ``eta_peak``, ``t_g_ns``, ``total_error`` and the selection settings.
     """
     from snail_solver import sweep_common as SC
     from snail_solver.device_utils import build_coupler
     from snail_solver.envelope import DragChannel
 
     t_g = float(t_g_ns)
-    # chirp_coeffs_GHz=[] so the audit is of the UNCHIRPED tone: the chirp is what the
-    # tune-up is about to calibrate, and build_coupler would otherwise inherit whatever
-    # the device file happens to carry.
+    # audit the UNCHIRPED tone: the chirp is what the tune-up is about to calibrate
     cpl, w_p_GHz, eta_peak = build_coupler(config, t_g, float(amp_scale),
                                            float(wp_offset_GHz),
                                            spec_abs_GHz=spec_abs_GHz,
@@ -742,9 +528,7 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
                                  min_g_MHz=float(min_g_MHz),
                                  has_spectator=(spec_abs_GHz is not None))]
 
-    # --- the mode subharmonics, from the collision enumeration -------------------
-    # no_spectator when there is no 4th mode, so _collision_candidates emits the
-    # subharmonics only rather than inventing spectator beats against wspec = 0.
+    # --- the mode subharmonics (no_spectator: no invented beats against wspec = 0)
     sub_cfg = dict(config)
     if spec_abs_GHz is None:
         sub_cfg["no_spectator"] = True
@@ -757,17 +541,19 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
     sub_by_beat = {(_audit_beat_key(c.beat_GHz), int(c.n_pump)): c
                    for c in sub_chans}
 
+    def _ident(r: Dict[str, Any]) -> Tuple[int, int]:
+        return (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0))
+
     # --- mark up the audit -------------------------------------------------------
     req = tuple(str(c) for c in require)
     by_beat: Dict[int, Dict[str, Any]] = {}
     for r in rows:
         r["beat_GHz"] = float(r["detuning_MHz"]) / 1e3
         r["n_photon"] = max(int(r.get("n_pump", 1) or 1), 1)
-        # Same definition spectator_channels uses, so these rows drop straight into
-        # total_error_estimate / print_table rather than needing a parallel helper.
+        # same P_exc as spectator_channels, for total_error_estimate / print_table
         _ratio = float(r.get("ratio", 0.0) or 0.0)
         r["P_exc"] = 1.0 if not np.isfinite(_ratio) else min(1.0, 2.0 * _ratio ** 2)
-        key = (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0))
+        key = _ident(r)
         r["is_subharmonic"] = key in sub_by_beat
         r["negligible"] = bool(_ratio < float(min_ratio))
         r["too_strong"] = bool(_ratio >= float(max_ratio))
@@ -776,8 +562,7 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
         r["selected"], r["reason"] = False, ""
         by_beat.setdefault(key, r)
 
-    # A subharmonic with no matching Hamiltonian term above min_g_MHz still gets a row,
-    # so "always considered" is visible in the report rather than an absence.
+    # a subharmonic below the g floor still gets a row, so it is visibly considered
     for key, ch in sub_by_beat.items():
         if key in by_beat:
             continue
@@ -813,11 +598,9 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
     chosen: List[Dict[str, Any]] = []
     taken: set = set()
     for r in mand + rest:
-        ident = (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0))
+        ident = _ident(r)
         if ident in taken:
-            # Same beat AND same pump count as one already chosen: the identical
-            # substitution. Composing it twice would double the correction instead of
-            # suppressing a second process (cf. collision_drag_channels).
+            # the identical substitution: composing it twice doubles the correction
             r["reason"] = "duplicate substitution (same beat and pump count)"
             continue
         if len(chosen) >= cap:
@@ -838,18 +621,16 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
                 else f"negligible (g/|det| < {float(min_ratio):g})"
                 if r.get("negligible") else "not selected")
 
-    built = tuple(sub_by_beat.get((_audit_beat_key(r["beat_GHz"]),
-                                   int(r["n_pump"] or 0)))
+    built = tuple(sub_by_beat.get(_ident(r))
                   or DragChannel(float(r["beat_GHz"]), n_pump=int(r["n_pump"]),
                                  n_photon=int(r["n_photon"]),
                                  quotient_rule=bool(quotient_rule))
                   for r in chosen)
-    # The same safety filter every other auto-fill path uses; a channel a chirp would
-    # sweep through zero is dropped here rather than dividing by ~0 mid-pulse.
+    # the shared safety filter: drop channels a chirp would sweep through zero
     channels = SC._drag_channels_filtered(config, built, chirp_coeffs_GHz, t_g)
     kept = {(_audit_beat_key(c.beat_GHz), int(c.n_pump)) for c in channels}
     for r in chosen:
-        if (_audit_beat_key(r["beat_GHz"]), int(r["n_pump"] or 0)) not in kept:
+        if _ident(r) not in kept:
             r["selected"], r["reason"] = False, "dropped: inside the DRAG skip window"
 
     rows.sort(key=lambda r: (r["category"] != "target", not r["selected"], _rank(r)))
@@ -867,6 +648,7 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
              "n_capped": sum(1 for r in rows
                              if str(r.get("reason", "")).startswith("capped"))}
     return channels, audit
+
 
 CATEGORY_STYLE = {
     "target":    dict(colour="#111111", marker="*", label="target iSWAP  $a\\!\\leftrightarrow\\!b$"),
@@ -914,21 +696,14 @@ def plot_interaction_chart(config: Dict[str, Any], channels: Sequence[Dict[str, 
                            max_key: int = 14, device_name: str = "") -> None:
     r"""Two views of the interaction landscape, with a numbered key.
 
-    Channels are NUMBERED on both panels (the target is ``T``); the names, strengths
-    and DRAG verdicts live in the key panel on the right, together with the mode
-    inventory. Keeping the plot area free of text is what makes a crowded landscape
-    readable -- several processes routinely sit at nearly the same
-    :math:`(g, |\delta|)`.
+    Channels are NUMBERED on both panels (target ``T``); names, strengths and DRAG
+    verdicts live in the key panel on the right with the mode inventory.
 
-    LEFT TOP -- pump-frequency axis. The gate sits at :math:`f_p`; every pump-tunable
-    process is a stem at the pump frequency where it becomes resonant,
-    :math:`f_p + \delta/n`, with height = coupling :math:`g`. Horizontal distance from
-    :math:`f_p` is how far the pump would have to move to hit that resonance, and the
-    shaded strip is the pulse bandwidth :math:`1/t_g`.
-
-    LEFT BOTTOM -- the DRAG phase diagram, :math:`g` vs :math:`|\delta|`. The diagonal
-    :math:`g=|\delta|` is the perturbative boundary and the vertical line the pulse
-    bandwidth; iso-suppression diagonals mark 10/20/30 dB.
+    LEFT TOP -- each pump-tunable process as a stem at its resonant pump frequency
+    :math:`f_p + \delta/n`, height :math:`g`; the shaded strip is :math:`1/t_g`.
+    LEFT BOTTOM -- DRAG phase diagram, :math:`g` vs :math:`|\delta|`, with the
+    perturbative boundary :math:`g=|\delta|`, the bandwidth line and 10/20/30 dB
+    iso-suppression diagonals.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -953,13 +728,8 @@ def plot_interaction_chart(config: Dict[str, Any], channels: Sequence[Dict[str, 
     axk = fig.add_subplot(gs[:, 1]); axk.axis("off")
 
     def place_numbers(axis, items, min_sep_px: float = 15.0):
-        """Draw the number badges, choosing an offset for each so they do not collide.
-
-        Channels are routinely degenerate or near-degenerate (the two |2> leakage
-        paths share a detuning; the two branches of a subharmonic sit at +/- the same
-        offset), so a fixed offset would hide badges under one another. Work in
-        DISPLAY pixels and take the first candidate slot that clears every badge
-        already placed."""
+        """Draw number badges, each at the first candidate offset (display pixels) that
+        clears every badge already placed -- channels are often near-degenerate."""
         fig_ = axis.figure
         fig_.canvas.draw()                     # transforms must be current
         cands = [(0, 9), (0, -17), (14, 5), (-14, 5), (14, -13), (-14, -13),
@@ -1134,12 +904,8 @@ def total_error_estimate(channels: Sequence[Dict[str, Any]]) -> float:
 
 
 def print_channel_audit(audit: Dict[str, Any], top: int = 14) -> None:
-    """Print a :func:`select_drag_channels` audit: what will be corrected, and what not.
-
-    Deliberately printed BEFORE any solve. The point is that a channel the recursion
-    is not going to touch -- capped out, non-perturbative, or inside the skip window --
-    is visible as a line with a reason, rather than as an absence nobody notices.
-    """
+    """Print a :func:`select_drag_channels` audit before any solve: every channel the
+    recursion will NOT touch appears with its reason, not as a silent absence."""
     rows = audit.get("rows", [])
     print(f"  DRAG channel audit: w_p={audit['w_p_GHz']:.4f} GHz  "
           f"t_g={audit['t_g_ns']:.1f} ns  peak|eta|={audit['eta_peak']:.3f}  "
@@ -1171,17 +937,10 @@ def scan_band(config: Dict[str, Any], t_g_ns: float, *, n_points: int = 161,
               window_GHz: float = 1.0, pad_GHz: float = 0.0,
               coupler_levels: Optional[int] = None,
               verbose: bool = True) -> Dict[str, Any]:
-    """Sweep the spectator across the physical band and record its parasitic load.
+    """Sweep the spectator across [w_a, w_b] (+/- pad) and record its parasitic load.
 
-    A spectator qubit lives between the computational qubits, so the band is
-    [w_a, w_b] (optionally padded). For each placement the worst channel ratio and
-    the summed excitation estimate are recorded -- the quiet windows are the minima.
-
-    Returns
-    -------
-    dict
-        w_spec_GHz, worst_ratio, total_P_exc, worst_g_MHz, worst_det_MHz,
-        n_nonperturbative, plus t_g_ns / eta / band metadata.
+    Returns w_spec_GHz, worst_ratio, total_P_exc, worst_g_MHz, worst_det_MHz,
+    n_nonperturbative, plus t_g_ns / eta / band_GHz.
     """
     wa, wb = sorted(float(f) for f in config["qubit_freqs_GHz"])
     lo, hi = wa - float(pad_GHz), wb + float(pad_GHz)
@@ -1261,11 +1020,9 @@ def plot_chart(config: Dict[str, Any], scan: Optional[Dict[str, Any]],
                threshold: float = 1e-3, device_name: str = "") -> None:
     """Frequency chart: mode layout + strength-weighted channels, over a band scan.
 
-    Top panel is the spectral layout in the style of ``plot_allocation.py`` (modes,
-    pump, spectator band, curated collision centres) with the MEASURED channel
-    strengths overlaid as stems at the audited placement. Bottom panel is the band
-    scan: total excitation estimate vs spectator frequency, shaded where a channel
-    is non-perturbative, with the quiet windows marked.
+    Top: spectral layout as in ``plot_allocation.py`` plus the audited placement's
+    measured channels. Bottom (if `scan`): total excitation vs spectator frequency,
+    shaded where non-perturbative, with the quiet windows marked.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1369,10 +1126,10 @@ def plot_chart(config: Dict[str, Any], scan: Optional[Dict[str, Any]],
         if inbad.any():
             ax2.fill_between(w, 1e-12, 1.0, where=inbad, color="#b22222", alpha=0.16,
                              step="mid", label="a channel is non-perturbative")
-        for lo_w, hi_w in quiet_windows(scan, threshold):
+        qw = quiet_windows(scan, threshold)
+        for lo_w, hi_w in qw:
             if hi_w > lo_w:
                 ax2.axvspan(lo_w, hi_w, color="#2ca02c", alpha=0.18, zorder=0)
-        qw = quiet_windows(scan, threshold)
         if qw:
             ax2.text(0.005, 0.04,
                      "quiet windows (GHz): "
@@ -1421,21 +1178,15 @@ def save_npz(path: str, scan: Optional[Dict[str, Any]],
             payload[f"ch_{key}"] = np.array([c[key] for c in channels], dtype=dtype)
         payload["ch_transition"] = np.array([c["transition"] for c in channels])
     if interactions:
+        # dtype None: let numpy infer (the string columns)
         for key, dtype in (("g_MHz", float), ("detuning_MHz", float), ("ratio", float),
                            ("f_p_res_GHz", float), ("adiabaticity", float),
                            ("suppression", float), ("suppression_dB", float),
-                           ("n_pump", int)):
+                           ("n_pump", int), ("category", None), ("victim_tag", None),
+                           ("victim_freq_GHz", float), ("spectator_id", int),
+                           ("process", None), ("name", None), ("transition", None),
+                           ("verdict", None)):
             payload[f"int_{key}"] = np.array([c[key] for c in interactions], dtype=dtype)
-        payload["int_category"] = np.array([c["category"] for c in interactions])
-        payload["int_victim_tag"] = np.array([c["victim_tag"] for c in interactions])
-        payload["int_victim_freq_GHz"] = np.array(
-            [c["victim_freq_GHz"] for c in interactions], dtype=float)
-        payload["int_spectator_id"] = np.array(
-            [c["spectator_id"] for c in interactions], dtype=int)
-        payload["int_process"] = np.array([c["process"] for c in interactions])
-        payload["int_name"] = np.array([c["name"] for c in interactions])
-        payload["int_transition"] = np.array([c["transition"] for c in interactions])
-        payload["int_verdict"] = np.array([c["verdict"] for c in interactions])
     np.savez_compressed(path, **payload)
     print("saved", path)
 

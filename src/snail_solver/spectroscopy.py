@@ -1,41 +1,27 @@
 """Power-vs-frequency spectroscopy of a transmon transition, with stored data.
 
-Produces the standard drive-amplitude x drive-frequency map coloured by the
-population of a target level (|e> by default, starting from |g>): the direct
-resonance appears as a vertical line that bends with power (the AC-Stark pull),
-and multiphoton / subharmonic features appear at fractions of the transition
-frequency, e.g. ge/2 where two drive photons bridge |g> -> |e>.
+Maps drive amplitude x drive frequency, coloured by the population of a target level
+(|e> from |g> by default): the direct line bends with power (AC-Stark pull), and
+multiphoton features sit at fractions of the transition, e.g. ge/2. The grid is saved
+to ``.npz`` so ``--replot`` can restyle a figure without recomputing.
 
-The grid is written to an ``.npz`` so figures can be restyled without recomputing
-(scans are the expensive part), and ``--replot`` renders straight from a stored
-file.
-
-Evolution uses the SAME ``ZhouCoupler`` as the sweeps, integrated with QuTiP
-``sesolve`` on the exact time-dependent Hamiltonian (``evolve_state`` for a
-fixed-duration probe, ``evolve_trajectory`` when reducing over the probe). There is
-no rotating frame and no carrier cutoff here, so every multiphoton process the
-model contains appears -- and the map is directly comparable to sweep results,
-which use the same solver. QuTiP is therefore REQUIRED.
+Evolution uses the same ``ZhouCoupler`` as the sweeps, with QuTiP ``sesolve`` on the
+exact time-dependent Hamiltonian (no rotating frame, no carrier cutoff), so every
+multiphoton process in the model appears. QuTiP is REQUIRED.
 
 MULTIPHOTON ORDERS
 ------------------
-The drive enters through the coupler nonlinearity ``sum_n g_n X(t)^n``. At FIRST
-order in a cubic (g3) truncation the drive supplies at most two quanta alongside a
-mode operator, so only ge and ge/2 appear. But the solver integrates the exact
-Hamiltonian, and HIGHER orders in g3 generate higher multiphoton processes, so
-ge/3, ge/4, ... are present too -- progressively weaker. Verified against an
-independent lab-frame integration at g4 = 0 (w_a = 4.6 GHz, eta = 1.2, 85 ns):
-peak |e> population 0.99 at ge/2, 0.51 at ge/3, 0.05 at ge/4. Do NOT assume a
-subharmonic is absent because g4 = 0.
+At first order in g3 only ge and ge/2 appear, but higher orders in g3 generate ge/3,
+ge/4, ... (weaker). Verified by an independent lab-frame integration at g4 = 0
+(w_a = 4.6 GHz, eta = 1.2, 85 ns): peak |e> 0.99 at ge/2, 0.51 at ge/3, 0.05 at ge/4.
+Do NOT assume a subharmonic is absent because g4 = 0.
 
 ALLOCATION WARNING
 ------------------
-These subharmonics are spurious excitation channels, and they can land on the gate
-pump. With w_q/n = w_p the iSWAP drive also drives a mode out of the ground state.
-For a pair (w_a, w_b) the dangerous coincidences are w_a/n = w_b - w_a, i.e.
-w_b = w_a (1 + 1/n): n=2 -> 1.5 w_a, n=3 -> 1.333 w_a, n=4 -> 1.25 w_a. The
-example device (4.6, 5.7) sits 50 MHz from the n=4 case (w_b = 5.75), so its
-ge/4 line at 1.150 GHz is only 50 MHz from the 1.100 GHz pump.
+A subharmonic landing on the gate pump (w_a/n = w_b - w_a) drives a mode out of |g>,
+i.e. w_b = w_a (1 + 1/n): 1.5, 1.333, 1.25 w_a for n = 2, 3, 4. The example device
+(4.6, 5.7) is 50 MHz from n=4, so its ge/4 line (1.150 GHz) is 50 MHz from the
+1.100 GHz pump.
 
 CLI
 ---
@@ -54,13 +40,9 @@ import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.linalg import expm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-TWO_PI = 2.0 * np.pi
-BLUE, RED = "#2980B9", "#C0392B"
 
 
 # --------------------------------------------------------------------------- #
@@ -68,27 +50,12 @@ BLUE, RED = "#2980B9", "#C0392B"
 # --------------------------------------------------------------------------- #
 def marginal_population(probs: np.ndarray, dims: Sequence[int], mode: int,
                         level: int) -> float:
-    """Population of ``level`` in ``mode``, marginalised over all other modes.
+    """Population of ``level`` (1 = |e>) in ``mode``, marginalised over all other modes.
 
-    Reading a single Fock amplitude would undercount whenever the drive also
-    excites another mode (the coupler is a real dynamical mode here), so the
-    marginal is the honest observable to compare with a measured |e> population.
-
-    Parameters
-    ----------
-    probs : ndarray
-        Probabilities over the full product basis, ordered as ``dims``.
-    dims : sequence of int
-        Per-mode truncation levels.
-    mode : int
-        Mode whose level population is wanted.
-    level : int
-        Level index (1 = |e>, 2 = |f>, ...).
-
-    Returns
-    -------
-    float
-        Summed population of the requested level.
+    ``probs`` is over the full product basis ordered as ``dims``. A single Fock
+    amplitude would undercount whenever the drive also excites another mode (the
+    coupler is dynamical), so the marginal is the honest analogue of a measured |e>.
+    NaN if ``level`` is beyond the mode's truncation.
     """
     t = np.asarray(probs, dtype=float).reshape(tuple(dims))
     if level >= t.shape[mode]:
@@ -97,27 +64,11 @@ def marginal_population(probs: np.ndarray, dims: Sequence[int], mode: int,
 
 
 def expected_number(probs: np.ndarray, dims: Sequence[int], mode: int) -> float:
-    """Number-operator expectation ``<n>`` of ``mode``, marginalised over all others.
+    """``<n>`` of ``mode``, marginalised over all others.
 
-    ``sum_level level * marginal_population(probs, dims, mode, level)`` -- the real
-    photon-number occupation of a mode (e.g. the SNAIL/coupler), as opposed to
-    ``marginal_population``'s single-level readout. Used to check whether a pump
-    amplitude label (``eta``, nominally ``sqrt(n_s)``) still matches the coupler
-    mode's actual occupation once multi-photon channels start populating it.
-
-    Parameters
-    ----------
-    probs : ndarray
-        Probabilities over the full product basis, ordered as ``dims``.
-    dims : sequence of int
-        Per-mode truncation levels.
-    mode : int
-        Mode whose number expectation is wanted.
-
-    Returns
-    -------
-    float
-        ``<n>`` for ``mode``.
+    The real occupation of a mode (e.g. the coupler), used to check whether a pump
+    label ``eta`` (nominally ``sqrt(n_s)``) still matches it once multi-photon
+    channels populate the mode.
     """
     return float(sum(level * marginal_population(probs, dims, mode, level)
                      for level in range(1, int(dims[mode]))))
@@ -138,11 +89,10 @@ def _reduce_populations(pops: np.ndarray, reduce: str) -> float:
 def transition_lines(config: Dict[str, Any], mode: int = 0,
                      orders: Sequence[int] = (1, 2, 3, 4),
                      exchange: bool = True) -> Dict[str, float]:
-    """Expected drive frequencies of ge / ef features and their subharmonics.
+    """Expected drive frequencies of ge / ef lines and their subharmonics (w / n).
 
-    ``ge`` sits at the mode frequency and ``ef`` one anharmonicity below it; the
-    n-th subharmonic of a transition at w is at w / n. Orders up to 4 are included
-    by default because higher orders in g3 populate them even when g4 = 0.
+    ``ef`` is one anharmonicity below ``ge``; orders to 4 by default since higher
+    orders in g3 populate them even at g4 = 0.
     """
     freqs = list(np.asarray(config["qubit_freqs_GHz"], dtype=float))
     w_ge = float(freqs[mode])
@@ -155,9 +105,8 @@ def transition_lines(config: Dict[str, Any], mode: int = 0,
         # pump-driven exchange (iSWAP) resonances: |w_i - w_j|. Only visible when the
         # initial state carries an excitation -- an exchange annihilates |gg>.
         for j, w_j in enumerate(freqs):
-            if j == mode:
-                continue
-            out[f"swap({mode}-{j})"] = abs(w_ge - float(w_j))
+            if j != mode:
+                out[f"swap({mode}-{j})"] = abs(w_ge - float(w_j))
         w_c = config.get("coupler_freq_GHz")
         if w_c is not None:
             out[f"swap({mode}-c)"] = abs(w_ge - float(w_c))
@@ -166,26 +115,12 @@ def transition_lines(config: Dict[str, Any], mode: int = 0,
 
 def _scan_column(task: Tuple[int, float, Dict[str, Any], Dict[str, Any]]
                  ) -> Tuple[int, np.ndarray]:
-    """Compute one drive-frequency column using the ZhouCoupler / QuTiP solver.
+    """Population column over the amplitude axis at one drive frequency.
 
-    Top-level (not a closure) so it is picklable for multiprocessing. The mode
-    construction comes from ``device_utils.build_coupler`` -- identical to what the
-    sweeps use -- and the pump is then replaced by a single tone at this column's
-    drive frequency, so ``|eta|_peak`` equals the requested amplitude exactly.
-
-    Evolution is QuTiP ``sesolve`` on the EXACT time-dependent Hamiltonian
-    (``ZhouCoupler.evolve_state`` / ``evolve_trajectory``): no rotating frame and no
-    carrier cutoff, so every multiphoton process the model contains is present.
-
-    Parameters
-    ----------
-    task : tuple
-        ``(column_index, drive_frequency_GHz, config, params)``.
-
-    Returns
-    -------
-    (int, ndarray)
-        The column index and the population column over the amplitude axis.
+    ``task = (column_index, drive_frequency_GHz, config, params)``; top-level so it
+    pickles for multiprocessing. Modes come from ``device_utils.build_coupler`` (as in
+    the sweeps); its pump is replaced by one tone at this column's frequency, so the
+    requested amplitude is exactly ``|eta|_peak``. Returns ``(column_index, column)``.
     """
     jf, f_d, config, prm = task
     from snail_solver.device_utils import build_coupler
@@ -197,8 +132,6 @@ def _scan_column(task: Tuple[int, float, Dict[str, Any], Dict[str, Any]]
     EnvCls = RaisedCosine if prm["envelope"] == "raised_cosine" else ConstantPulse
     solver = dict(atol=prm["atol"], rtol=prm["rtol"], nsteps=prm["nsteps"])
 
-    # same mode construction as the sweeps (levels, participations, anharmonicities,
-    # optional spectator); the pump it sets is replaced below.
     cpl, _wp, _eta = build_coupler(config, t_g=probe_ns, amp_scale=1.0,
                                    wp_offset_GHz=0.0,
                                    spec_abs_GHz=prm["spec_abs_GHz"])
@@ -209,33 +142,30 @@ def _scan_column(task: Tuple[int, float, Dict[str, Any], Dict[str, Any]]
     times = (np.linspace(0.0, probe_ns, int(prm["n_times"]))
              if reduce in ("max", "mean") else None)
 
-    # population of the observable in the UNDRIVEN initial state: the zero-amplitude
-    # baseline (0 from |g>, but 1 if the observable coincides with the initial state)
+    def pop(probs):
+        return marginal_population(probs, cpl.dims, prm["target_mode"], prm["level"])
+
+    # zero-amplitude baseline: the observable in the undriven initial state
     base = np.zeros(cpl.dim)
     base[cpl.fock_index(occ0)] = 1.0
-    base_pop = marginal_population(base, cpl.dims, prm["target_mode"], prm["level"])
+    base_pop = pop(base)
 
     col = np.empty(len(amps))
     for ia, amp in enumerate(amps):
         if amp == 0.0:
-            col[ia] = base_pop                                 # no drive: unchanged
+            col[ia] = base_pop
             continue
-        # amp IS the peak |eta| for this envelope (verified: amp -> peak_eta)
-        # Deliberately UN-chirped: this is a swept spectroscopy PROBE at f_d, not the
-        # gate pump, so the device's `chirp_coeffs_GHz` (which is defined about the
-        # gate's own carrier |w_b - w_a| over the gate time) does not belong on it.
+        # Deliberately UN-chirped: this is a swept probe at f_d, and the device's
+        # `chirp_coeffs_GHz` is defined about the gate's own carrier |w_b - w_a|.
         cpl.set_pump(PumpTone(w_p_GHz=f_d, envelope=EnvCls(amp=float(amp),
                                                           t_g=probe_ns),
                               is_eta=True))
         if times is None:
             psi = cpl.evolve_state(occ0, probe_ns, **solver)
-            pops = np.array([marginal_population(np.abs(psi) ** 2, cpl.dims,
-                                                 prm["target_mode"], prm["level"])])
+            pops = np.array([pop(np.abs(psi) ** 2)])
         else:
             traj = cpl.evolve_trajectory(occ0, times, **solver)
-            pops = np.array([marginal_population(np.abs(psi_t) ** 2, cpl.dims,
-                                                 prm["target_mode"], prm["level"])
-                             for psi_t in traj])
+            pops = np.array([pop(np.abs(psi_t) ** 2) for psi_t in traj])
         col[ia] = _reduce_populations(pops, reduce)
     return jf, col
 
@@ -250,69 +180,42 @@ def scan_ge(config: Dict[str, Any], *, f_lo: float, f_hi: float, f_points: int =
             init_occ: Optional[Sequence[int]] = None,
             nproc: int = 1, columns: Optional[Sequence[int]] = None,
             verbose: bool = True) -> Dict[str, Any]:
-    """Scan drive frequency x drive amplitude, recording a level population.
+    """Scan drive frequency (GHz) x drive amplitude (|eta|), recording a level population.
 
-    The coupler is rebuilt at every frequency column so each column carries its own
-    rotating frame -- correct across a wide sweep, where a single reference frame's
-    RWA cutoff would wrongly discard terms that become resonant elsewhere.
+    The coupler is rebuilt per frequency column, so columns are independent.
 
     Parameters
     ----------
-    config : dict
-        Merged device configuration.
-    f_lo, f_hi : float
-        Drive-frequency range (GHz).
-    f_points : int
-        Frequency-axis resolution.
-    amp_lo, amp_hi : float
-        Drive amplitude range in units of |eta| (dimensionless displaced amplitude).
-    amp_points : int
-        Amplitude-axis resolution.
     probe_ns : float
-        Drive duration (ns). Longer probes give sharper lines (resolution ~ 1/T).
-    target_mode : int
-        Mode whose population is recorded (0 = qubit a).
-    level : int
-        Level to record (1 = |e>).
-    n_times : int
-        Output times for ``reduce`` in {'max', 'mean'} (ignored for 'final').
+        Drive duration (ns); linewidth ~ 1/T.
+    target_mode, level : int
+        Observable: population of ``level`` (1 = |e>) in ``target_mode`` (0 = qubit a).
     envelope : {'constant', 'raised_cosine'}
-        Probe shape. ``constant`` is the usual spectroscopy probe and gives the
-        sharpest lines; ``raised_cosine`` matches the gate pulse instead.
+        ``constant`` is the usual, sharpest probe; ``raised_cosine`` matches the gate.
     reduce : {'final', 'max', 'mean'}
-        Reduction of the population over the probe. ``final`` reproduces a
-        fixed-duration measurement (and its Rabi fringes); ``max`` gives the
-        cleanest map of where transitions live, which is usually what a published
-        power-vs-frequency figure is showing.
-    rtol, atol : float
-        QuTiP sesolve tolerances.
-    nsteps : int
-        Maximum internal solver steps between outputs.
+        Reduction over the probe: ``final`` is a fixed-duration measurement (Rabi
+        fringes); ``max`` cleanly maps where transitions live. 'max'/'mean' sample
+        ``n_times`` output times.
+    rtol, atol, nsteps
+        QuTiP sesolve settings.
     spec_abs_GHz : float, optional
         Include a spectator at this absolute frequency.
     init_occ : sequence of int, optional
-        Initial Fock occupations per mode; default all zero (|g>).
-
-        This choice decides WHICH resonances the map can show. From the ground
-        state only excitation-CREATING processes appear -- the direct ge/ef lines,
-        their subharmonics, pair creation. An EXCHANGE resonance such as the iSWAP
-        (a^dag b + a b^dag) conserves excitation number and annihilates |gg>, so it
-        is invisible from |g> at any drive frequency or power. To map the iSWAP,
-        start with one excitation in the partner (e.g. ``[0, 1, 0]``) and record the
-        target qubit's |e> population: that is the transfer probability, and the
-        bright line then appears at the pump frequency |w_b - w_a|.
+        Initial Fock occupations per mode (default |g...>). This decides which
+        resonances can show: from |g> only excitation-creating processes appear; an
+        exchange such as the iSWAP conserves excitation number and is invisible. To
+        map the iSWAP start from e.g. ``[0, 1, 0]`` and record qubit a's |e>: the
+        line then appears at |w_b - w_a|.
     nproc : int
         Worker processes over frequency columns (1 = serial).
     columns : sequence of int, optional
-        Compute only these column indices (used for array sharding); the rest of the
-        grid is left NaN and merged later by :func:`merge_shards`.
-    verbose : bool
-        Print progress per frequency column.
+        Compute only these columns (array sharding); the rest stay NaN for
+        :func:`merge_shards`.
 
     Returns
     -------
     dict
-        freqs_GHz, amps, Z (shape [amp_points, f_points]), lines, and metadata.
+        freqs_GHz, amps, Z (shape [amp_points, f_points]), lines, meta.
     """
     freqs = np.linspace(f_lo, f_hi, f_points)
     amps = np.linspace(amp_lo, amp_hi, amp_points)
@@ -325,32 +228,27 @@ def scan_ge(config: Dict[str, Any], *, f_lo: float, f_hi: float, f_points: int =
                   init_occ=(list(init_occ) if init_occ is not None else None))
     tasks = [(jf, float(freqs[jf]), config, params) for jf in todo]
 
+    def collect(results):
+        for k, (jf, col) in enumerate(results):
+            Z[:, jf] = col
+            if verbose:
+                print(f"    [{k + 1}/{len(tasks)}] f={freqs[jf]:6.3f} GHz  "
+                      f"max pop = {np.nanmax(col):.3f}", flush=True)
+
     if nproc and nproc > 1 and len(tasks) > 1:
-        # columns are independent (each rebuilds its own rotating frame), so this is
-        # embarrassingly parallel; imap_unordered keeps workers fed when per-column
-        # cost varies (n_sub grows with drive frequency).
         import multiprocessing as mp
         # 'fork' where available: 'spawn' re-imports __main__ in every worker, which
-        # hangs or fails when the caller is a notebook, a heredoc, or any module
-        # without an `if __name__ == "__main__"` guard. Workers here are pure
-        # compute, and SLURM pins BLAS to one thread, so fork is safe.
+        # hangs from a notebook/heredoc or an unguarded module. Workers are pure
+        # compute and SLURM pins BLAS to one thread, so fork is safe. imap_unordered
+        # keeps workers fed since per-column cost grows with drive frequency.
         try:
             ctx = mp.get_context("fork")
         except ValueError:                              # non-POSIX
             ctx = mp.get_context()
         with ctx.Pool(processes=int(nproc)) as pool:
-            for k, (jf, col) in enumerate(pool.imap_unordered(_scan_column, tasks)):
-                Z[:, jf] = col
-                if verbose:
-                    print(f"    [{k + 1}/{len(tasks)}] f={freqs[jf]:6.3f} GHz  "
-                          f"max pop = {np.nanmax(col):.3f}", flush=True)
+            collect(pool.imap_unordered(_scan_column, tasks))
     else:
-        for k, task in enumerate(tasks):
-            jf, col = _scan_column(task)
-            Z[:, jf] = col
-            if verbose:
-                print(f"    [{k + 1}/{len(tasks)}] f={freqs[jf]:6.3f} GHz  "
-                      f"max pop = {np.nanmax(col):.3f}", flush=True)
+        collect(map(_scan_column, tasks))
 
     return dict(freqs_GHz=freqs, amps=amps, Z=Z,
                 lines=transition_lines(config, target_mode),
@@ -404,24 +302,11 @@ def export_csv(result: Dict[str, Any], path: str) -> str:
 
 
 def merge_shards(prefix: str, out_npz: Optional[str] = None) -> Dict[str, Any]:
-    """Merge per-shard ``.npz`` files into one full grid.
+    """Merge ``<prefix>_shard*.npz`` into one grid (optionally written to ``out_npz``).
 
-    Each shard holds the same axes but only its own frequency columns (the rest
-    NaN), so merging is a NaN-aware overlay. Reports any column no shard filled,
-    which is how a failed or still-running array task shows up -- better than
-    silently plotting a striped map.
-
-    Parameters
-    ----------
-    prefix : str
-        Shard path prefix; files matching ``<prefix>_shard*.npz`` are merged.
-    out_npz : str, optional
-        Also write the merged grid here.
-
-    Returns
-    -------
-    dict
-        The merged scan (same structure as :func:`scan_ge`).
+    Shards share axes but fill only their own columns (the rest NaN), so this is a
+    NaN-aware overlay. Columns no shard filled (failed / running tasks) are reported
+    rather than silently plotted as stripes. Returns the merged scan.
     """
     import glob
     paths = sorted(glob.glob(f"{prefix}_shard*.npz"))
@@ -436,9 +321,8 @@ def merge_shards(prefix: str, out_npz: Optional[str] = None) -> Dict[str, Any]:
                           Z=np.full_like(part["Z"], np.nan),
                           lines=part["lines"], meta=dict(part["meta"]))
         else:
-            # Validate axis VALUES, not just lengths: two runs with the same point
-            # count but different F_LO/F_HI would otherwise merge silently and
-            # relabel every feature's frequency.
+            # Validate axis VALUES, not just lengths: same point count but different
+            # F_LO/F_HI would otherwise merge silently at the wrong frequencies.
             for name in ("freqs_GHz", "amps"):
                 if len(part[name]) != len(merged[name]):
                     raise SystemExit(f"{path}: {name} has {len(part[name])} points but "
@@ -485,25 +369,11 @@ def missing_columns(result: Dict[str, Any]) -> List[int]:
 
 
 def report_missing(prefix: str, nshards: Optional[int] = None) -> Dict[str, Any]:
-    """Diagnose gaps in a sharded scan and print how to fill them.
+    """Diagnose gaps (all-NaN columns) in a sharded scan and print how to fill them.
 
-    White vertical stripes in a merged map are all-NaN columns: shards that never
-    completed. Because sharding is strided, column j belongs to shard
-    ``j % nshards``, so the missing columns map back to a small set of shard indices
-    to resubmit -- no need to rerun the whole scan.
-
-    Parameters
-    ----------
-    prefix : str
-        Shard prefix (``<prefix>_shard*.npz``).
-    nshards : int, optional
-        Shard count the scan was launched with. Required to map columns back to
-        shards; without it only the column list is reported.
-
-    Returns
-    -------
-    dict
-        missing (column indices), shards (indices to resubmit), array_spec.
+    Sharding is strided, so column j belongs to shard ``j % nshards``; with
+    ``nshards`` the gaps map back to the few shard indices to resubmit. Returns
+    ``missing`` (columns), ``shards`` (to resubmit) and ``array_spec``.
     """
     merged = merge_shards(prefix)
     missing = missing_columns(merged)
@@ -522,8 +392,6 @@ def report_missing(prefix: str, nshards: Optional[int] = None) -> Dict[str, Any]
         except Exception:
             spec = ",".join(str(i) for i in shards)
         out["array_spec"] = spec
-        # a shard whose columns are ALL missing never ran; a partially-missing shard
-        # died midway -- both are fixed by rerunning that shard index.
         print(f"belongs to {len(shards)} shard(s) of {nshards}: {shards}")
         print(f"resubmit just those:\n"
               f"  PREFIX={prefix} NSHARDS={nshards} <other env...> \\\n"
@@ -537,12 +405,10 @@ def report_missing(prefix: str, nshards: Optional[int] = None) -> Dict[str, Any]
 
 
 def inspect_scan(path: str) -> Dict[str, Any]:
-    """Print the axes and physics metadata stored with a scan.
+    """Print a scan's stored axes, probe, observable and device metadata, plus its peak.
 
-    Use this before trusting a map: it shows the frequency/amplitude axes actually
-    stored, the probe and reduction, the initial state, and the device parameters --
-    which together determine where features are EXPECTED, so a shifted line can be
-    checked against them rather than guessed at.
+    These determine where features are EXPECTED, so a shifted line can be checked
+    rather than guessed at.
     """
     r = load_scan(path)
     f, a, m = r["freqs_GHz"], r["amps"], r["meta"]
@@ -564,7 +430,6 @@ def inspect_scan(path: str) -> Dict[str, Any]:
     wq = m.get("qubit_freqs_GHz")
     if wq and len(wq) > 1:
         print(f"  expected swap |w_b - w_a| = {abs(float(wq[1]) - float(wq[0])):.6f} GHz")
-    # where the peak actually is, per amplitude row, for comparison
     Z = r["Z"]
     if np.isfinite(Z).any():
         ia = int(np.nanargmax(np.nanmax(Z, axis=1)))
@@ -602,7 +467,7 @@ def plot_spectroscopy(result: Dict[str, Any], out: str = "figs/ge_map.png",
             ax.text(f0, amps[-1], f" {label}", color="w", fontsize=8.5,
                     rotation=90, va="top", ha="left", zorder=4)
 
-    gaps = [j for j in range(Z.shape[1]) if not np.isfinite(Z[:, j]).any()]
+    gaps = missing_columns(result)
     if gaps:
         ax.text(0.02, 0.02, f"{len(gaps)} of {Z.shape[1]} columns missing "
                             f"(incomplete shards)", transform=ax.transAxes,
@@ -617,9 +482,10 @@ def plot_spectroscopy(result: Dict[str, Any], out: str = "figs/ge_map.png",
                  fontsize=12)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    pdf = out.rsplit(".", 1)[0] + ".pdf"
     fig.savefig(out, bbox_inches="tight", facecolor="white")
-    fig.savefig(out.rsplit(".", 1)[0] + ".pdf", bbox_inches="tight", facecolor="white")
-    print("wrote", out, "and", out.rsplit(".", 1)[0] + ".pdf")
+    fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+    print("wrote", out, "and", pdf)
 
 
 def main() -> None:
@@ -732,17 +598,16 @@ def main() -> None:
                                    if args.init else None),
                          spec_abs_GHz=args.spec_abs_GHz,
                          nproc=args.nproc, columns=columns)
+        path = args.save_data or "scan"
+        prefix = path[:-4] if path.endswith(".npz") else path
         if args.save_data:
-            path = args.save_data
             if args.shard is not None:                # one file per array task
-                base = path[:-4] if path.endswith(".npz") else path
-                path = f"{base}_shard{args.shard:03d}.npz"
+                path = f"{prefix}_shard{args.shard:03d}.npz"
             save_scan(result, path)
         if args.save_csv:
             export_csv(result, args.save_csv)
         if args.shard is not None:
-            print("shard complete; merge with:  --merge "
-                  f"{(args.save_data or 'scan')[:-4] if (args.save_data or '').endswith('.npz') else (args.save_data or 'scan')}")
+            print(f"shard complete; merge with:  --merge {prefix}")
             return                                    # a partial grid is not plottable
 
     plot_spectroscopy(result, out=args.out, title=args.title,

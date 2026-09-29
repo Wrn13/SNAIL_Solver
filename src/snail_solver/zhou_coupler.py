@@ -57,33 +57,19 @@ Conventions
 
 Chirped pumps
 -------------
-A pump letter enters X(t) as eta_p(t) e^{-i w_p t}, so chirping the carrier,
-w_p -> w_p + delta(t), is ALGEBRAICALLY IDENTICAL to putting the phase e^{-i Phi(t)}
-(Phi = integral delta) on the complex envelope. The fixed w_p therefore remains
-the expansion reference and NOTHING in `_flux_letters` / `expand_terms` /
-`to_qutip_hamiltonian` changes; a term carrying k net pump quanta picks up
-e^{-i k Phi(t)} on its own, which is exactly the k-quanta carrier shift. Attach a
-`Chirp` to the `PumpTone` (see envelope.py). A CONSTANT chirp c0 is exactly a
-retune to w_p + c0 -- asserted in test_physics.
+Chirping the carrier, w_p -> w_p + delta(t), is ALGEBRAICALLY IDENTICAL to the phase
+e^{-i Phi(t)} (Phi = integral delta) on the complex envelope, so w_p stays the
+expansion reference and a term carrying k pump quanta picks up e^{-i k Phi(t)} on
+its own. Attach a `Chirp` to the `PumpTone` (envelope.py).
 
 Time evolution
 --------------
-Gate dynamics are integrated with QuTiP's compiled solver on the EXACT
-Hamiltonian (no terms pruned): `to_qutip_hamiltonian()` returns the operator as a
-sparse list-format QobjEvo, and `evolve_state`, `propagator_columns`, and
-`iswap_fidelity` drive it through `qt.sesolve`. QuTiP is imported lazily, so the
-model builders (`dressed_flux`, `hamiltonian_matrix`, `expand_terms`) and the
-analytic estimators stay importable and testable without QuTiP. The dense
-`hamiltonian_matrix` is retained only as a lightweight correctness oracle (the
-self-test below, and a one-point cross-check against `iswap_fidelity` on a QuTiP
-node); it is not part of the production solve path.
-
-For grids rather than single points, `expand_terms_symbolic` gives the same
-expansion with the frequencies factored out (Omega = M @ frequency_vector()), so a
-whole sweep shares one sparse operator stack. That is the structure `jax_engine.py`
-batches and runs on GPU; it is ~300x smaller than the dense equivalent and is
-validated against `hamiltonian_matrix` and against `qt.sesolve`
-(`validate_engines.py`).
+`to_qutip_hamiltonian()` exports the EXACT Hamiltonian (no terms pruned) as a sparse
+list-format QobjEvo that `evolve_state`, `propagator_columns` and `iswap_fidelity`
+drive through `qt.sesolve`. QuTiP is imported lazily. The dense `hamiltonian_matrix`
+is only a correctness oracle. `expand_terms_symbolic` factors the frequencies out
+(Omega = M @ frequency_vector()) so a whole sweep shares one sparse operator stack
+-- the structure `jax_engine.py` batches (validated in `validate_engines.py`).
 """
 
 from __future__ import annotations
@@ -95,9 +81,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-# Envelopes, chirps and the pump-tone container live in envelope.py (the single
-# source of truth) and are re-exported below, so the established
-# `from zhou_coupler import RaisedCosine, PumpTone, ...` call sites keep working.
+# envelope.py names are re-exported for `from zhou_coupler import RaisedCosine, ...`
 from snail_solver import drag
 from snail_solver.envelope import (  # noqa: F401
     Chirp,
@@ -113,10 +97,8 @@ from snail_solver.envelope import (  # noqa: F401
 TWO_PI: float = 2.0 * np.pi
 
 # --- solver backend (CPU QuTiP by default; GPU via qutip-jax / diffrax) -------
-# Operators run as `jaxdia` (diagonal-sparse JAX) and states as dense `jax`, with
-# the diffrax integrator, following QuTiP 5 (Lambert et al., arXiv:2412.04705).
-# GPU only wins above a Hilbert-space crossover (thousands of states); for the
-# small couplers here CPU is usually faster -- see use_gpu().
+# Operators as `jaxdia`, states as dense `jax`, diffrax integrator (QuTiP 5,
+# Lambert et al., arXiv:2412.04705).
 _SOLVER_BACKEND: Dict[str, Any] = {"gpu": False, "op_dtype": "jaxdia", "state_dtype": "jax",
                                    "method": "diffrax"}
 
@@ -124,36 +106,18 @@ _SOLVER_BACKEND: Dict[str, Any] = {"gpu": False, "op_dtype": "jaxdia", "state_dt
 def use_gpu(enable: bool = True, x64: bool = True) -> None:
     """Route the QuTiP solver through the qutip-jax / diffrax GPU backend.
 
-    When enabled, `to_qutip_hamiltonian` stores each constant operator in the
-    `jaxdia` data layer, initial states are converted to dense `jax`, the
-    time-dependent pump/DRAG/chirp coefficients are built from `jax.numpy` (via
-    the SAME `_eta_at(..., xp)` the CPU path and the batched `jax_engine` both
-    use) and `jax.jit`-wrapped, and the solvers integrate with diffrax (which
-    runs on GPU if JAX sees one). Requires `qutip-jax` and a JAX build with CUDA;
-    raises ImportError otherwise.
+    When enabled, constant operators use the `jaxdia` data layer, initial states
+    dense `jax`, the pump coefficients are `jax.jit`-wrapped builds of the SAME
+    `_eta_at(..., xp)` the CPU path uses, and the solvers integrate with diffrax.
+    Requires `qutip-jax` (ImportError otherwise).
 
-    FIXED as of qutip 5.3.1 / qutip-jax 0.1.1, after being broken for any
-    time-dependent Hamiltonian (every pumped gate in this repo): a plain Python
-    closure gets wrapped by QuTiP as an unhashable `FunctionCoefficient`, and
-    diffrax's `equinox.filter_jit` needs its ODE pytree's static leaves to be
-    hashable. `qutip_jax` registers ``coefficient_builders[PjitFunction] =
-    JaxJitCoeff`` (a hashable, pytree-friendly wrapper) -- so a coefficient built
-    from an ALREADY-`jax.jit`-wrapped function takes that path instead. Verified
-    against plain CPU QuTiP on a real pumped, shaped, chirped coupler: final-state
-    amplitudes agree to ~1e-7--1e-8 and unitarity is preserved to ~1e-16. Note
-    `diffrax`'s own complex-dtype support is flagged upstream as "a work in
-    progress" (a UserWarning fires every call); the agreement above says it is
-    fine for THIS Hamiltonian family, not that the warning can be ignored in
-    general -- re-check it if the physics here changes qualitatively (e.g. a much
-    stiffer drive, or actual GPU hardware rather than CPU-backed JAX).
-
-    Note on when it's worth it: JAX + diffrax is commonly said to pay off only
-    for large Hilbert spaces (the QuTiP 5 paper puts the CPU<->GPU crossover in
-    the thousands of states), and this project's couplers are dim ~ tens. In
-    practice, on a 150 ns shaped+chirped pumped gate (dim 45), the diffrax path
-    ran ~10x FASTER than CPU QuTiP even without real GPU hardware -- the stiffness
-    of a long, chirped pump apparently matters more here than raw dimension. Time
-    your own case; do not assume the crossover rule applies unchanged.
+    The coefficients must be ALREADY `jax.jit`-wrapped: qutip_jax maps a
+    `PjitFunction` to the hashable `JaxJitCoeff`, whereas a plain closure becomes an
+    unhashable `FunctionCoefficient` that diffrax's `equinox.filter_jit` rejects.
+    Verified against CPU QuTiP on a pumped, shaped, chirped coupler to ~1e-7--1e-8
+    (unitarity ~1e-16). diffrax warns that complex dtypes are "a work in progress";
+    re-check if the physics changes qualitatively. On a 150 ns chirped gate (dim 45)
+    diffrax ran ~10x faster than CPU QuTiP even on CPU-backed JAX -- time your case.
 
     Parameters
     ----------
@@ -161,10 +125,6 @@ def use_gpu(enable: bool = True, x64: bool = True) -> None:
         Turn the GPU backend on (True) or back to CPU QuTiP (False).
     x64 : bool, default True
         Enable JAX double precision (recommended for gate fidelities).
-
-    Returns
-    -------
-    None
     """
     if enable:
         import jax
@@ -205,36 +165,19 @@ def _ideal_iswap() -> np.ndarray:
 
 def _fit_virtual_z(U: np.ndarray, U_ideal: np.ndarray) -> np.ndarray:
     r"""Apply the single-qubit virtual-Z rotation that best aligns `U` with the
-    target. Virtual-Z phases are free in software (McKay et al., PRA 96, 022330
-    (2017)) and should not be charged as gate error.
+    target (virtual-Z is free in software: McKay et al., PRA 96, 022330 (2017)).
 
-    The maximisation is 1-D and EXACT in the second phase, rather than a 2-D grid.
-    Writing :math:`Z = \mathrm{diag}(1, e^{i\varphi_b}, e^{i\varphi_a},
-    e^{i(\varphi_a+\varphi_b)})` and using that Z is diagonal,
+    With :math:`Z = \mathrm{diag}(1, e^{i\varphi_b}, e^{i\varphi_a},
+    e^{i(\varphi_a+\varphi_b)})` and :math:`c_k = (U U_{\rm ideal}^\dagger)_{kk}`,
 
     .. math::
         \mathrm{Tr}(U_{\rm ideal}^\dagger Z U)
-          = \sum_k Z_{kk} (U U_{\rm ideal}^\dagger)_{kk}
-          = \sum_k z_k c_k , \qquad c_k \equiv (U U_{\rm ideal}^\dagger)_{kk} .
+          = \underbrace{(c_0 + e^{i\varphi_a} c_2)}_{A(\varphi_a)}
+          + e^{i\varphi_b}\underbrace{(c_1 + e^{i\varphi_a} c_3)}_{B(\varphi_a)} ,
 
-    Grouping the two terms that carry :math:`e^{i\varphi_b}`,
-
-    .. math::
-        \sum_k z_k c_k = \underbrace{(c_0 + e^{i\varphi_a} c_2)}_{A(\varphi_a)}
-                       + e^{i\varphi_b}\underbrace{(c_1 + e^{i\varphi_a} c_3)}_{B(\varphi_a)} ,
-
-    so at fixed :math:`\varphi_a` the modulus is maximised by simply rotating
-    :math:`B` onto :math:`A` -- two phasors, no search:
-
-    .. math::
-        \max_{\varphi_b} |A + e^{i\varphi_b} B| = |A| + |B| ,
-        \qquad \varphi_b^\star = \arg A - \arg B .
-
-    What remains is the 1-D maximisation of :math:`|A(\varphi_a)| + |B(\varphi_a)|`,
-    done here as a vectorised sweep plus a ternary search (the objective is smooth
-    and unimodal inside one coarse cell). This is exact in :math:`\varphi_b` --
-    the old 48x48 grid + refinement left a residual in BOTH phases -- and costs
-    ~1e3 scalar evaluations instead of ~3.6e3 4x4 matrix products.
+    maximised over :math:`\varphi_b` EXACTLY by rotating B onto A
+    (:math:`|A| + |B|`, :math:`\varphi_b^\star = \arg A - \arg B`). The remaining 1-D
+    maximisation over :math:`\varphi_a` is a vectorised sweep plus ternary search.
 
     Parameters
     ----------
@@ -305,25 +248,12 @@ class ZhouCoupler:
     levels : int or sequence of int, default 3
         Per-mode Fock truncation. 2 -> qubit (sigma_-, Eq. 72); >= 3 -> oscillator
         (captures leakage). A scalar applies to every mode.
+    anharmonicities_GHz : dict[int, float], optional
+        Per-mode transmon anharmonicity alpha_i (GHz); omitted modes are harmonic.
 
-    Attributes
-    ----------
-    omega : ndarray
-        Mode angular frequencies (rad/ns).
-    n_modes, dim : int
-        Number of modes and total Hilbert-space dimension.
-    coupler_index : int
-        Index of the coupler mode.
-    dims : list[int]
-        Per-mode truncations.
-    participation : ndarray
-        Participation vector (1 on the coupler, lambda_is on coupled modes).
-    g_n : dict[int, float]
-        Non-linear coefficients in rad/ns.
-    a_ops, ad_ops : list[ndarray]
-        Embedded annihilation / creation operators.
-    identity : ndarray
-        Identity on the full space.
+    Attributes: ``omega`` and ``g_n`` (rad/ns), ``n_modes``, ``dim``, ``dims``,
+    ``participation`` (1 on the coupler), ``a_ops`` / ``ad_ops`` (embedded ladder
+    operators), ``identity``.
     """
 
     def __init__(
@@ -367,9 +297,8 @@ class ZhouCoupler:
         if not self.g_n:
             raise ValueError("Provide at least one non-linearity, e.g. {3: g3_GHz}.")
 
-        # per-mode transmon anharmonicity alpha_i (GHz -> rad/ns); 0 = harmonic mode.
-        # The coupler's non-linearity lives in g_n, so it is normally left harmonic
-        # here; alpha is meant for the transmon/spectator modes.
+        # per-mode anharmonicity alpha_i (rad/ns); the coupler's own non-linearity
+        # lives in g_n, so alpha is meant for the transmon/spectator modes.
         self.anharm: np.ndarray = np.zeros(self.n_modes, dtype=float)
         if anharmonicities_GHz:
             for index, value in anharmonicities_GHz.items():
@@ -383,10 +312,8 @@ class ZhouCoupler:
         self.ad_ops: List[np.ndarray] = [op.conj().T for op in self.a_ops]
         self.identity: np.ndarray = np.eye(self.dim, dtype=complex)
 
-        # static transmon-anharmonicity operator  sum_i (alpha_i/2) a_i^d a_i^d a_i a_i
-        #   = sum_i (alpha_i/2) n_i (n_i - 1)   (diagonal; shifts |2>_i by alpha_i).
-        # Time-independent and number-diagonal, so it commutes with the free
-        # Hamiltonian and enters the interaction picture unchanged (Omega = 0).
+        # static anharmonicity  sum_i (alpha_i/2) n_i (n_i - 1): number-diagonal, so
+        # it enters the interaction picture unchanged (Omega = 0).
         self._anharm_op: np.ndarray = np.zeros((self.dim, self.dim), dtype=complex)
         for i in range(self.n_modes):
             if self.anharm[i] != 0.0:
@@ -394,9 +321,7 @@ class ZhouCoupler:
                 local = np.diag([float(k * (k - 1)) for k in range(d)]).astype(complex)
                 self._anharm_op = self._anharm_op + 0.5 * self.anharm[i] * self._embed(local, i)
 
-        # time-independent letters of X(t) (mode operators only); the pump letters
-        # are time-dependent and are added in _flux_letters(). Single source of
-        # truth shared by dressed_flux() and the term expansion.
+        # time-independent (mode) letters of X(t); _flux_letters() adds the pumps
         self._mode_letters: List[FluxLetter] = []
         for i in range(self.n_modes):
             lam = self.participation[i]
@@ -426,18 +351,8 @@ class ZhouCoupler:
 
     # -- Fock-space indexing ------------------------------------------------
     def fock_index(self, occupations: Sequence[int]) -> int:
-        """Flat Hilbert-space index of a Fock state.
-
-        Parameters
-        ----------
-        occupations : sequence of int
-            Per-mode photon numbers |n_0, n_1, ...> (mode 0 most significant).
-
-        Returns
-        -------
-        int
-            The mixed-radix flat index.
-        """
+        """Mixed-radix flat index of the Fock state |n_0, n_1, ...> (mode 0 most
+        significant)."""
         index = 0
         for occ, d in zip(occupations, self.dims):
             if not (0 <= occ < d):
@@ -446,18 +361,7 @@ class ZhouCoupler:
         return index
 
     def decode_index(self, index: int) -> List[int]:
-        """Inverse of `fock_index`.
-
-        Parameters
-        ----------
-        index : int
-            Flat Hilbert-space index.
-
-        Returns
-        -------
-        list of int
-            Per-mode occupations.
-        """
+        """Inverse of `fock_index`: per-mode occupations of a flat index."""
         occupations: List[int] = []
         for d in reversed(self.dims):
             index, occ = divmod(index, d)
@@ -465,53 +369,18 @@ class ZhouCoupler:
         return occupations[::-1]
 
     def basis_state(self, occupations: Sequence[int]) -> np.ndarray:
-        """Unit state vector for a Fock state.
-
-        Parameters
-        ----------
-        occupations : sequence of int
-            Per-mode photon numbers.
-
-        Returns
-        -------
-        ndarray, shape (dim,)
-            The corresponding computational-basis ket.
-        """
+        """Unit ket, shape (dim,), for the Fock state with these occupations."""
         psi = np.zeros(self.dim, dtype=complex)
         psi[self.fock_index(occupations)] = 1.0
         return psi
 
     def mean_occupation(self, probabilities: np.ndarray, mode: int) -> float:
-        """Expected photon number of one mode.
-
-        Parameters
-        ----------
-        probabilities : ndarray, shape (dim,)
-            Probability vector over the Fock basis (e.g. |psi|^2).
-        mode : int
-            Mode index whose occupation is wanted.
-
-        Returns
-        -------
-        float
-            <n_mode> = sum_k p_k * occ_mode(k).
-        """
+        """<n_mode> = sum_k p_k occ_mode(k) for a Fock-basis probability vector."""
         return float(sum(probabilities[k] * self.decode_index(k)[mode]
                          for k in range(self.dim)))
 
     def delta(self, i: int, j: int) -> float:
-        """Angular detuning between two modes.
-
-        Parameters
-        ----------
-        i, j : int
-            Mode indices.
-
-        Returns
-        -------
-        float
-            w_i - w_j (rad/ns).
-        """
+        """Angular detuning w_i - w_j (rad/ns) between two modes."""
         return float(self.omega[i] - self.omega[j])
 
     # -- pump ---------------------------------------------------------------
@@ -528,10 +397,6 @@ class ZhouCoupler:
             pumped at w_b - w_a, the time-integrated rate realises a full iSWAP on
             the (a, b) pair (rotation angle pi/2). The condition is
             integral 6 g3 lambda_as lambda_bs |eta(t)| dt = pi/2 (Eqs. 55/73).
-
-        Returns
-        -------
-        None
         """
         self._pump_tones = [tones] if isinstance(tones, PumpTone) else list(tones)
         if normalize_iswap is None:
@@ -558,62 +423,30 @@ class ZhouCoupler:
         tone.envelope.amp *= target_eta_area / current_eta_area
 
     def scale_pump_amplitude(self, scale: float, tone_index: int = 0) -> None:
-        """Multiply one tone's envelope amplitude by `scale`, applied AFTER any
-        normalization. Used to apply a calibrated correction to the open-loop
-        analytic pi/2 amplitude, which over-rotates because the leading-order rate
-        6 g3 la lb |eta| under-estimates the dressed effective rate at finite eta.
-
-        Parameters
-        ----------
-        scale : float
-            Multiplicative factor on the envelope peak amplitude.
-        tone_index : int, default 0
-            Which attached tone to rescale.
-
-        Returns
-        -------
-        None
-        """
+        """Multiply tone `tone_index`'s envelope amplitude by `scale`, AFTER any
+        normalization -- a calibrated correction to the open-loop pi/2 amplitude
+        (the leading-order rate under-estimates the dressed rate at finite eta)."""
         self._pump_tones[tone_index].envelope.amp *= float(scale)
 
     def _eta_at(self, tone: PumpTone, t: Any, xp: Any = np) -> Any:
         """Displaced pump amplitude eta_p(t) for scalar OR array `t`, built from
         `xp` primitives (Eq. 50; Motzoi PRL 103, 110501 (2009)).
 
-        This is the SINGLE definition of the pump amplitude. The per-time QuTiP
-        callback (`_eta`) and the batched engine both route through it, so the two
-        solve paths cannot drift apart.
+        The SINGLE definition of the pump amplitude: the QuTiP callback (`_eta`) and
+        the batched engine both route through it.
 
-        Ordering is deliberate: DRAG is applied to the BASE envelope, and the
-        chirp phase multiplies the result. The chirp is a rotation of the pump
-        frame, not a feature of the pulse shape, so it must not be differentiated
-        by the DRAG quadrature -- doing so would inject a spurious
-        -i delta(t) eta / Delta term that grows with the chirp rate and has no
-        physical counterpart. Equivalently: in the frame rotating at the
-        INSTANTANEOUS pump frequency the chirp phase is absorbed into the frame, so
-        only the amplitude derivative survives in the numerator.
+        DRAG acts on the BASE envelope and the chirp phase multiplies the result: the
+        chirp rotates the pump frame, and differentiating it would inject a spurious
+        -i delta(t) eta / Delta term. The DENOMINATOR does move with the chirp,
+        ``Delta(t) = Delta_0 - k delta(t)`` with k = ``tone.drag_n_pump``
+        (`PumpTone.drag_detuning`); a static Delta_0 would mis-weight the quadrature
+        most exactly near a collision. Several channels apply recursive DRAG
+        (:mod:`snail_solver.drag`) under the same rules.
 
-        The DENOMINATOR, however, does move with the chirp. That same instantaneous
-        frame puts the suppressed process at ``Delta(t) = Delta_0 - k delta(t)``,
-        with k = ``tone.drag_n_pump`` the number of pump quanta it carries -- the
-        beat convention ``beat = separation - k w_p`` used throughout
-        ``sweep_common._nearest_collision``. Dividing by the static Delta_0 instead
-        mis-weights the quadrature by O(k delta / Delta_0), which is a ~10%
-        correction for a 100-300 MHz beat but order-unity near a collision, i.e.
-        exactly where DRAG is doing the most work. See `PumpTone.drag_detuning`.
-
-        With SEVERAL channels the tone applies recursive multi-derivative DRAG --
-        one substitution per suppressed process, composed innermost-first (see
-        :mod:`snail_solver.drag`). Everything above still holds term by term: the
-        chirp phase is still applied last and never differentiated, and each
-        channel's denominator still moves with the chirp at its own ``n_pump``.
-
-        The single-channel first-order case keeps its own closed-form branch below.
-        That is not an optimization -- jet arithmetic reaches the same value by a
-        different sequence of floating-point operations, so routing the legacy case
-        through it would perturb every previously recorded result in the last ulp.
-        The two are asserted equal to 1e-13 in the tests, which turns the general
-        path's correctness into a checked claim rather than an assumption.
+        The single-channel first-order case keeps its closed-form branch: jet
+        arithmetic reaches the same value by a different floating-point sequence, so
+        routing it through jets would perturb recorded results in the last ulp (the
+        two are asserted equal to 1e-13 in the tests).
         """
         omega_p = tone.w_p_GHz * TWO_PI
         omega_s = self.omega[self.coupler_index]
@@ -658,18 +491,8 @@ class ZhouCoupler:
     def dressed_flux(self, t: float) -> np.ndarray:
         r"""Dressed flux operator X(t) (Hermitian).
 
-        X(t) = sum_i lambda_is a_i e^{-i w_i t} + sum_p eta_p(t) e^{-i w_p t} + h.c.
-        The coupler (lambda = 1) is one of the modes.
-
-        Parameters
-        ----------
-        t : float
-            Time (ns).
-
-        Returns
-        -------
-        ndarray, shape (dim, dim)
-            The dense X(t).
+        X(t) = sum_i lambda_is a_i e^{-i w_i t} + sum_p eta_p(t) e^{-i w_p t} + h.c.,
+        dense, at time `t` (ns); the coupler (lambda = 1) is one of the modes.
         """
         etas = [self._eta(tone, t) for tone in self._pump_tones]
         X = np.zeros((self.dim, self.dim), dtype=complex)
@@ -684,20 +507,9 @@ class ZhouCoupler:
 
     def hamiltonian_matrix(self, t: float) -> np.ndarray:
         """Exact interaction-picture Hamiltonian
-        H_I(t) = sum_n g_n X(t)^n + sum_i (alpha_i/2) n_i(n_i-1) (dense).
+        H_I(t) = sum_n g_n X(t)^n + sum_i (alpha_i/2) n_i(n_i-1), dense, rad/ns.
 
-        Reference builder used by the self-test and as a one-point cross-check
-        against the QuTiP solver; it is not used in the production solve path.
-
-        Parameters
-        ----------
-        t : float
-            Time (ns).
-
-        Returns
-        -------
-        ndarray, shape (dim, dim)
-            The dense Hamiltonian (rad/ns).
+        A reference oracle only; not used in the production solve path.
         """
         X = self.dressed_flux(t)
         highest_order = max(self.g_n)
@@ -725,10 +537,9 @@ class ZhouCoupler:
         Parameters
         ----------
         cutoff_GHz : float, default inf
-            Keep only terms with |Omega| <= 2 pi cutoff. The default (inf) prunes
-            NOTHING -- the sum reproduces `hamiltonian_matrix(t)` exactly and is
-            the form handed to QuTiP. A finite cutoff drops the fast carriers,
-            leaving a rotating-wave / average-Hamiltonian reduction.
+            Keep only terms with |Omega| <= 2 pi cutoff. inf prunes NOTHING (the sum
+            reproduces `hamiltonian_matrix(t)` exactly); a finite cutoff gives a
+            rotating-wave reduction.
 
         Returns
         -------
@@ -746,15 +557,8 @@ class ZhouCoupler:
                 net_freq = sum(letter[1] for letter in combo)
                 if abs(net_freq) > cutoff_rad:
                     continue
-                amplitude = 1.0
-                operator: Optional[np.ndarray] = None
-                pump_signature: List[Tuple[int, bool]] = []
-                for op, _signed_freq, amp, pump_key in combo:
-                    amplitude *= amp
-                    operator = op if operator is None else operator @ op
-                    if pump_key is not None:
-                        pump_signature.append(pump_key)
-                key = (round(net_freq, 6), tuple(sorted(pump_signature)))
+                amplitude, operator, signature = self._letter_product(combo)
+                key = (round(net_freq, 6), signature)
                 contribution = (g * amplitude) * operator
                 if key in groups:
                     groups[key][0] += contribution
@@ -763,6 +567,19 @@ class ZhouCoupler:
 
         return [(exact_omega, key[1], operator_sum)
                 for key, (operator_sum, exact_omega) in groups.items()]
+
+    @staticmethod
+    def _letter_product(combo: Sequence[Any]) -> Tuple[float, Any, Tuple[Tuple[int, bool], ...]]:
+        """``(amplitude, operator, sorted pump signature)`` of an ordered letter product."""
+        amplitude = 1.0
+        operator = None
+        pump_signature: List[Tuple[int, bool]] = []
+        for op, _carrier, amp, pump_key in combo:
+            amplitude *= amp
+            operator = op if operator is None else operator @ op
+            if pump_key is not None:
+                pump_signature.append(pump_key)
+        return amplitude, operator, tuple(sorted(pump_signature))
 
     # -- frequency-INDEPENDENT expansion (engine of the batched solver) ------
     def _symbolic_letters(self) -> List[Tuple[np.ndarray, np.ndarray, float,
@@ -800,25 +617,16 @@ class ZhouCoupler:
     def expand_terms_symbolic(self) -> Dict[str, Any]:
         r"""Expand sum_n g_n X(t)^n into a FREQUENCY-INDEPENDENT term structure.
 
-        Same algebra as :meth:`expand_terms`, but grouped by the integer carrier
-        row rather than by the numerical Omega. The returned structure therefore
-        depends only on ``(dims, participation, g_n, n_tones)`` -- NOT on any mode
-        or pump frequency, and not on the envelope. That is what lets a whole
-        frequency sweep share one operator stack and vary only a vector::
+        Same algebra as :meth:`expand_terms`, grouped by the integer carrier row
+        instead of the numerical Omega, so it depends only on
+        ``(dims, participation, g_n, n_tones)`` and a frequency sweep shares one
+        operator stack::
 
             Omega = M @ cpl.frequency_vector()          # (n_terms,)
             H(t)  = sum_j e^{-i Omega_j t} prod_p eta_p^{n_pos} conj(eta_p)^{n_neg} O_j
 
-        `expand_terms` rebuilds an ``O(n_letters^order)`` product for every grid
-        point because its grouping key moves with the frequencies; this does not.
-
-        Operators are returned in COO form. Each raw letter product is a
-        generalized permutation matrix (at most one non-zero per column), so a
-        grouped operator stays extremely sparse -- typically O(dim) non-zeros
-        rather than dim^2. Applying ``sum_j c_j O_j`` to a state block via the COO
-        triplets is what makes the batched engine affordable; forming the dense
-        (n_terms, dim, dim) stack instead would cost ~dim times more memory and
-        arithmetic for no benefit.
+        Operators are returned as COO triplets: every letter product is a generalized
+        permutation matrix, so each grouped operator has ~O(dim) non-zeros.
 
         Returns
         -------
@@ -840,26 +648,16 @@ class ZhouCoupler:
         letters = self._symbolic_letters()
         n_tones = len(self._pump_tones)
 
-        # Every letter operator is a ladder operator (or the identity), i.e. a
-        # generalized permutation matrix with <= 1 non-zero per column, and so is
-        # any product of them. Multiplying them as CSR costs O(dim) instead of the
-        # O(dim^3) of a dense matmul -- at dim = 135 that is the difference between
-        # a ~50 s build and a sub-second one, and this runs once per device.
+        # CSR products of generalized permutation matrices cost O(dim), not the
+        # O(dim^3) of a dense matmul (~50 s -> sub-second at dim = 135)
         sletters = [(sp.csr_matrix(op), row, amp, key) for op, row, amp, key in letters]
 
         groups: Dict[Tuple[Tuple[int, ...], Tuple[Tuple[int, bool], ...]], List] = {}
         for order, g in self.g_n.items():
             for combo in itertools.product(sletters, repeat=order):
                 carrier = sum(letter[1] for letter in combo)
-                amplitude = 1.0
-                operator = None
-                pump_signature: List[Tuple[int, bool]] = []
-                for op, _row, amp, pump_key in combo:
-                    amplitude *= amp
-                    operator = op if operator is None else operator @ op
-                    if pump_key is not None:
-                        pump_signature.append(pump_key)
-                key = (tuple(int(v) for v in carrier), tuple(sorted(pump_signature)))
+                amplitude, operator, signature = self._letter_product(combo)
+                key = (tuple(int(v) for v in carrier), signature)
                 contribution = (g * amplitude) * operator
                 if key in groups:
                     groups[key][0] = groups[key][0] + contribution
@@ -920,13 +718,9 @@ class ZhouCoupler:
             Multinomial coefficient of the process. Defaults to n! (n distinct
             factors); pass it explicitly for degenerate factors.
         eta : float, optional
-            Pump amplitude |eta|. Defaults to |eta| at the envelope peak of the
-            first tone.
+            Pump amplitude |eta|; defaults to the first tone's envelope peak.
 
-        Returns
-        -------
-        float
-            The effective rate g_eff (rad/ns).
+        Returns g_eff in rad/ns.
         """
         g = self.g_n.get(n)
         if g is None:
@@ -945,36 +739,13 @@ class ZhouCoupler:
         return float(C * g * (eta ** n_pump_quanta) * participation_product)
 
     def iswap_rate(self, a: int, b: int, eta: Optional[float] = None) -> float:
-        """iSWAP coupling g_eff = 6 g3 lambda_as lambda_bs |eta| (Eqs. 55/73).
-
-        Parameters
-        ----------
-        a, b : int
-            The two qubit-mode indices.
-        eta : float, optional
-            Pump amplitude |eta|; defaults to the envelope peak of the first tone.
-
-        Returns
-        -------
-        float
-            The iSWAP rate (rad/ns).
-        """
+        """iSWAP coupling g_eff = 6 g3 lambda_as lambda_bs |eta| (rad/ns; Eqs. 55/73);
+        `eta` defaults to the first tone's envelope peak."""
         return self.effective_rate([a, b], n=3, C=6, eta=eta)
 
     def peak_eta(self, tone_index: int = 0) -> float:
-        """|eta| at the envelope peak -- the perturbative-pump diagnostic (the
-        dressed-mode expansion needs |eta| << 1).
-
-        Parameters
-        ----------
-        tone_index : int, default 0
-            Which attached tone to evaluate.
-
-        Returns
-        -------
-        float
-            |eta| at t_g/2.
-        """
+        """|eta| at t_g/2 -- the perturbative-pump diagnostic (the dressed-mode
+        expansion needs |eta| << 1)."""
         tone = self._pump_tones[tone_index]
         return abs(self._eta(tone, tone.envelope.t_g / 2.0))
 
@@ -1011,48 +782,32 @@ class ZhouCoupler:
         c_j(t) = exp(-i Omega_j t) prod_p eta_p(t)^(...). g_n and the participation
         factors are folded into O_j.
 
-        Because the operators are built ONCE, QuTiP's compiled solver does sparse
-        matrix-vector products each step instead of rebuilding the dense X^n -- the
-        fast path. With cutoff_GHz = inf (default) it prunes NOTHING:
-        sum_j c_j(t) O_j reproduces hamiltonian_matrix(t) exactly.
+        With cutoff_GHz = inf (default) it prunes NOTHING: sum_j c_j(t) O_j
+        reproduces hamiltonian_matrix(t) exactly.
 
         Parameters
         ----------
         cutoff_GHz : float, default inf
-            Passed to `expand_terms`; inf keeps the full, exact Hamiltonian. Pass
-            a finite value only to obtain the RWA-reduced model.
+            Passed to `expand_terms`; inf keeps the full, exact Hamiltonian.
         sparse : bool, default True
-            Store each constant operator as a SciPy CSR matrix (the fast path);
-            False keeps dense arrays.
+            Store each operator as SciPy CSR (the fast path) rather than dense.
 
         Returns
         -------
         qutip.QobjEvo or list
             A QobjEvo on QuTiP 5; the raw list on QuTiP 4 (both accepted by the
-            solvers). Feed to qt.sesolve (closed system) or qt.mesolve /
-            qt.propagator with collapse operators (T1/T2, coupler loss) for the
-            open-system run that hardware adds on top of Zhou's unitary model.
+            solvers, including qt.mesolve / qt.propagator with collapse operators).
         """
-        import cmath
         import qutip as qt
         import scipy.sparse as sp
 
         dims = [self.dims, self.dims]
         pump_tones = list(self._pump_tones)
 
-        # One eta evaluation per (tone, t), shared across every Hamiltonian term.
-        #
-        # Each term gets its own coefficient closure, but the solver evaluates ALL of
-        # them at the same t before stepping, and each one was recomputing eta from
-        # scratch -- 12 identical evaluations per timestep on a bare 3-mode pair.
-        # That was invisible while eta was a couple of trig calls; recursive DRAG
-        # makes it the dominant cost of the whole solve.
-        #
-        # One slot per tone (not a growing dict): consecutive calls share a t, so a
-        # single slot captures all of it in O(1) memory, and a solver that interleaves
-        # times simply misses instead of going stale. The cache lives exactly as long
-        # as this QobjEvo -- every solve path rebuilds it -- so a tone mutated in
-        # place between solves (as `grape` does) cannot be served a stale value.
+        # One eta evaluation per (tone, t), shared by every term's coefficient (the
+        # solver calls them all at the same t; recursive DRAG makes eta expensive).
+        # One slot per tone: interleaved times just miss. The cache lives only as
+        # long as this QobjEvo, so a tone mutated between solves (grape) is never stale.
         eta_cache: Dict[int, Tuple[float, complex]] = {}
 
         def eta_of(tone_index: int, t: float) -> complex:
@@ -1066,12 +821,7 @@ class ZhouCoupler:
         def make_coeff(omega: float, pump_signature: Tuple[Tuple[int, bool], ...]
                        ) -> Callable[[float], complex]:
             if _SOLVER_BACKEND["gpu"]:
-                # jax.jit'd, built on _eta_at(..., jnp) -- the SAME xp-generic pump
-                # amplitude the CPU path uses, just traced instead of called eagerly.
-                # qutip_jax registers coefficient_builders[PjitFunction] = JaxJitCoeff,
-                # which IS hashable, unlike the plain-closure FunctionCoefficient the
-                # CPU branch below produces -- that hashability is what diffrax's
-                # equinox.filter_jit needs and FunctionCoefficient lacks (see use_gpu).
+                # must be jax.jit'd so qutip_jax builds a hashable JaxJitCoeff (use_gpu)
                 import jax
                 import jax.numpy as jnp
 
@@ -1118,9 +868,7 @@ class ZhouCoupler:
         diffrax integrator when the GPU backend is active)."""
         import qutip as qt
         if _SOLVER_BACKEND["gpu"]:
-            # qutip_jax's DiffraxIntegrator takes a diffrax stepsize controller and
-            # max_steps, not flat atol/rtol/nsteps -- those raise KeyError as "not
-            # supported" against integrator.integrator_options.
+            # DiffraxIntegrator rejects flat atol/rtol/nsteps (KeyError)
             import diffrax
             return {"method": _SOLVER_BACKEND["method"],
                     "stepsize_controller": diffrax.PIDController(rtol=rtol, atol=atol),
@@ -1141,14 +889,10 @@ class ZhouCoupler:
 
     def _sesolve_final(self, H: Any, start_index: int, t_g: float,
                        options: Any) -> np.ndarray:
-        """Closed-system evolve a single computational-basis ket to t_g and return
-        the final state vector (numpy).
+        """Closed-system evolve a computational-basis ket to t_g; final state (numpy).
 
-        The interval [0, t_g] is subdivided into ~5 ns chunks so the solver's
-        per-interval internal-step cap (nsteps) is not exhausted on long or stiff
-        gates -- otherwise zvode raises "Excess work done on this call". Output
-        spacing does not change the result: sesolve integrates continuously through
-        the intermediate points and only the final state is returned.
+        Output points every ~5 ns keep the per-interval step cap (nsteps) from being
+        exhausted on long gates ("Excess work done"); they do not change the result.
         """
         import qutip as qt
         psi0 = self._ket(start_index)
@@ -1160,25 +904,8 @@ class ZhouCoupler:
     def evolve_state(self, init_occupations: Sequence[int], t_g: float,
                      atol: float = 1e-10, rtol: float = 1e-8,
                      nsteps: int = 500000) -> np.ndarray:
-        """Evolve a Fock initial state to t_g on the EXACT Hamiltonian via QuTiP's
-        compiled sesolve.
-
-        Parameters
-        ----------
-        init_occupations : sequence of int
-            Per-mode photon numbers of the initial state.
-        t_g : float
-            Final time (ns).
-        atol, rtol : float
-            Absolute / relative ODE tolerances.
-        nsteps : int
-            Maximum internal solver steps between outputs.
-
-        Returns
-        -------
-        ndarray, shape (dim,)
-            Final state vector |psi(t_g)>.
-        """
+        """Final state |psi(t_g)>, shape (dim,), of a Fock initial state evolved on the
+        EXACT Hamiltonian (QuTiP sesolve; `atol`/`rtol`/`nsteps` are ODE options)."""
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
         return self._sesolve_final(H, self.fock_index(init_occupations), t_g, options)
@@ -1186,26 +913,9 @@ class ZhouCoupler:
     def evolve_trajectory(self, init_occupations: Sequence[int], times: Sequence[float],
                           atol: float = 1e-10, rtol: float = 1e-8,
                           nsteps: int = 500000) -> np.ndarray:
-        """Evolve a Fock initial state on the EXACT Hamiltonian and return the state
-        at EVERY time in `times` (QuTiP sesolve over the full tlist). Used to map
-        population exchange P(t) at a fixed pump strength (Fig. 8a style).
-
-        Parameters
-        ----------
-        init_occupations : sequence of int
-            Per-mode photon numbers of the initial state.
-        times : sequence of float
-            Output times (ns); must be sorted and start at 0.
-        atol, rtol : float
-            Absolute / relative ODE tolerances.
-        nsteps : int
-            Maximum internal solver steps between outputs.
-
-        Returns
-        -------
-        ndarray, shape (len(times), dim)
-            State vector at each output time.
-        """
+        """States, shape (len(times), dim), of a Fock initial state at EVERY time in
+        `times` (sorted, starting at 0) on the EXACT Hamiltonian -- e.g. to map P(t)
+        at fixed pump strength (Fig. 8a style)."""
         import qutip as qt
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
@@ -1217,26 +927,8 @@ class ZhouCoupler:
                            atol: float = 1e-10, rtol: float = 1e-8,
                            nsteps: int = 500000) -> np.ndarray:
         """4x4 projection of the realised propagator onto the (a, b) computational
-        subspace (Pedersen/Wood convention; all spectators start in |0>), via
-        QuTiP's compiled sesolve on the EXACT Hamiltonian. The Hamiltonian is built
-        once and reused across the four columns.
-
-        Parameters
-        ----------
-        a, b : int
-            The two target-qubit mode indices.
-        t_g : float
-            Gate duration (ns).
-        atol, rtol : float
-            Absolute / relative ODE tolerances.
-        nsteps : int
-            Maximum internal solver steps between outputs.
-
-        Returns
-        -------
-        ndarray, shape (4, 4)
-            The projected propagator (columns evolve |00>, |01>, |10>, |11>).
-        """
+        subspace (Pedersen/Wood convention; spectators start in |0>), on the EXACT
+        Hamiltonian. Columns evolve |00>, |01>, |10>, |11>."""
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
         indices = self._subspace_indices(a, b)
@@ -1250,40 +942,11 @@ class ZhouCoupler:
     def iswap_fidelity(self, a: int, b: int, t_g: float, fit_virtual_z: bool = True,
                        atol: float = 1e-10, rtol: float = 1e-8,
                        nsteps: int = 500000) -> Tuple[float, float, np.ndarray]:
-        """Leakage-aware average iSWAP fidelity on (a, b) via QuTiP's compiled
-        sesolve on the EXACT full Hamiltonian (no terms pruned).
+        """Leakage-aware average iSWAP fidelity on (a, b) on the EXACT Hamiltonian.
 
-        Parameters
-        ----------
-        a, b : int
-            The two target-qubit mode indices.
-        t_g : float
-            Gate duration (ns).
-        fit_virtual_z : bool, default True
-            If True, divide out the optimal single-qubit virtual-Z phases (free in
-            software) before scoring.
-        atol, rtol : float
-            Absolute / relative ODE tolerances.
-        nsteps : int
-            Maximum internal solver steps between outputs.
-
-        Returns
-        -------
-        fidelity : float
-            Leakage-aware average gate fidelity vs the ideal iSWAP.
-        leakage : float
-            Population lost from the computational subspace, 1 - Tr(U^dag U)/4.
-        U : ndarray, shape (4, 4)
-            The projected propagator.
-
-        Notes
-        -----
-        Open system ('what hardware achieves'): build collapse operators from the
-        embedded ladder ops -- e.g. sqrt(1/T1) qt.Qobj(self.a_ops[i]) for
-        relaxation, sqrt(1/(2 Tphi)) qt.Qobj(2 self.ad_ops[i] @ self.a_ops[i]) for
-        dephasing -- propagate the superoperator with
-        qt.propagator(self.to_qutip_hamiltonian(), [0, t_g], c_ops=...), restrict
-        to the computational subspace, and use qt.average_gate_fidelity.
+        Returns ``(fidelity, leakage, U)``: leakage is 1 - Tr(U^dag U)/4 and U the
+        projected propagator. `fit_virtual_z` divides out the optimal (free)
+        single-qubit virtual-Z phases first. For the open system see ``open_system``.
         """
         U = self.propagator_columns(a, b, t_g, atol=atol, rtol=rtol, nsteps=nsteps)
         fidelity, leakage = self._iswap_fidelity_from_U(U, fit_virtual_z)

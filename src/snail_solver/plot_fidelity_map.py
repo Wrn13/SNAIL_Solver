@@ -1,27 +1,22 @@
 """Side-by-side DRAG / no-DRAG fidelity heatmaps over the target allocation grid.
 
-The ``target`` sweep in :mod:`run_sweep_zhou` scans the partner-qubit frequency
-:math:`\\omega_b` against the spectator frequency :math:`\\omega_c` (column
-``spec_GHz``) and records the average iSWAP gate fidelity per point. This module
-pivots ``summary.csv`` onto that grid and renders two heatmaps -- without DRAG and
-with DRAG -- sharing one colour scale so the panels are directly comparable, with an
-optional dotted contour marking the ``nearest_beat = 0`` collision locus.
+Pivots a ``target`` sweep's ``summary.csv`` (partner frequency :math:`\\omega_b` =
+``wb_GHz`` vs spectator :math:`\\omega_c` = ``spec_GHz``) onto a grid and renders
+no-DRAG and DRAG heatmaps on one shared colour scale, optionally with a dotted
+``nearest_beat = 0`` collision contour.
 
-DRAG appears in the summary in one of two layouts, both handled here:
+Two DRAG layouts are handled:
 
-* separate ``--drags true,false`` rows: two rows per :math:`(\\omega_b, \\omega_c)`
-  cell whose ``F_avg`` is routed by ``drag_applied``;
-* an in-row ``--drag-compare``: one row per cell whose ``F_avg`` is the no-DRAG
-  result and whose ``F_avg_drag`` is the DRAG result (here ``drag_applied`` is not a
-  reliable router, so the presence of ``F_avg_drag`` takes precedence).
+* separate ``--drags true,false`` rows, routed by ``drag_applied``;
+* in-row ``--drag-compare``: ``F_avg`` is no-DRAG and ``F_avg_drag`` is DRAG. Here
+  ``drag_applied`` is unreliable, so the presence of ``F_avg_drag`` takes precedence.
 
-Where both layouts are present for a cell, a dedicated DRAG-on row wins over the
-in-row compare value.
+Where both exist for a cell, the dedicated DRAG-on row wins.
 
 CLI
 ---
 ``python -m snail_solver.plot_fidelity_map --outdir results/<run> [--metric fidelity|infidelity]
-[--log/--no-log] [--cmap NAME] [--no-collision-line] [--out fig.png]``
+[--log/--no-log] [--cmap NAME] [--no-collision-line] [--diff] [--out fig.png]``
 """
 
 from __future__ import annotations
@@ -40,18 +35,7 @@ from matplotlib.colors import LogNorm, Normalize
 
 
 def _to_float(x: object) -> Optional[float]:
-    """Parse a CSV cell into a finite float, or ``None``.
-
-    Parameters
-    ----------
-    x : object
-        Raw CSV field (``str`` such as ``""``, ``"0.97"``, ``"nan"``).
-
-    Returns
-    -------
-    float or None
-        The value if it parses to a finite float, else ``None``.
-    """
+    """Parse a CSV cell into a finite float, or ``None``."""
     try:
         v = float(x)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -65,23 +49,9 @@ def _to_bool(x: object) -> bool:
 
 
 def load_summary_rows(path: str) -> List[Dict[str, str]]:
-    """Read a sweep ``summary.csv`` into a list of row dicts.
+    """Read ``summary.csv`` (from a sweep directory or a direct path) into row dicts.
 
-    Parameters
-    ----------
-    path : str
-        Either a sweep output directory (``summary.csv`` is appended) or a direct
-        path to the CSV.
-
-    Returns
-    -------
-    list of dict
-        One dict per row, keyed by column name.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the CSV does not exist (``collect`` has not been run).
+    Raises ``FileNotFoundError`` if the CSV does not exist (``collect`` not run).
     """
     csv_path = os.path.join(path, "summary.csv") if os.path.isdir(path) else path
     if not os.path.exists(csv_path):
@@ -96,28 +66,14 @@ def build_fidelity_grids(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pivot target-sweep rows onto the :math:`(\\omega_b, \\omega_c)` grid.
 
-    Parameters
-    ----------
-    rows : list of dict
-        Rows from a *target* ``summary.csv`` (must contain ``wb_GHz`` and
-        ``spec_GHz``).
-    metric : {"fidelity", "infidelity"}, optional
-        ``"fidelity"`` maps each cell to ``F_avg``; ``"infidelity"`` maps it to
-        ``1 - F_avg``.
+    ``metric="fidelity"`` maps each cell to ``F_avg``; ``"infidelity"`` to ``1 - F_avg``.
 
     Returns
     -------
-    wb_vals : ndarray, shape (n_wb,)
-        Sorted unique :math:`\\omega_b` grid values (GHz), the x-axis.
-    spec_vals : ndarray, shape (n_spec,)
-        Sorted unique spectator :math:`\\omega_c` grid values (GHz), the y-axis.
-    z_nodrag : ndarray, shape (n_spec, n_wb)
-        Metric without DRAG; missing cells are ``nan``.
-    z_drag : ndarray, shape (n_spec, n_wb)
-        Metric with DRAG; missing cells are ``nan``.
-    beat_grid : ndarray, shape (n_spec, n_wb)
-        ``nearest_beat_GHz`` per cell (for the collision contour); ``nan`` where
-        absent.
+    wb_vals, spec_vals : ndarray
+        Sorted unique ``wb_GHz`` (x) and ``spec_GHz`` (y) values.
+    z_nodrag, z_drag, beat_grid : ndarray, shape (n_spec, n_wb)
+        Metric without / with DRAG and ``nearest_beat_GHz``; ``nan`` where missing.
 
     Raises
     ------
@@ -132,64 +88,81 @@ def build_fidelity_grids(
     if metric not in ("fidelity", "infidelity"):
         raise ValueError("metric must be 'fidelity' or 'infidelity'")
 
-    def _key(r: Dict[str, str]) -> Optional[Tuple[float, float]]:
-        wb, sp = _to_float(r.get("wb_GHz")), _to_float(r.get("spec_GHz"))
-        if wb is None or sp is None:
-            return None
-        return (round(wb, 9), round(sp, 9))
-
-    nodrag: Dict[Tuple[float, float], float] = {}
-    drag_ded: Dict[Tuple[float, float], float] = {}   # dedicated DRAG-on rows
-    drag_cmp: Dict[Tuple[float, float], float] = {}    # in-row F_avg_drag compare
-    beat: Dict[Tuple[float, float], float] = {}
+    Key = Tuple[float, float]
+    nodrag: Dict[Key, float] = {}
+    drag_ded: Dict[Key, float] = {}   # dedicated DRAG-on rows
+    drag_cmp: Dict[Key, float] = {}   # in-row F_avg_drag compare
+    beat: Dict[Key, float] = {}
 
     for r in rows:
-        key = _key(r)
-        if key is None:
+        wb, sp = _to_float(r.get("wb_GHz")), _to_float(r.get("spec_GHz"))
+        if wb is None or sp is None:
             continue
+        key = (round(wb, 9), round(sp, 9))
         f_avg = _to_float(r.get("F_avg"))
         f_drag = _to_float(r.get("F_avg_drag"))
         b = _to_float(r.get("nearest_beat_GHz"))
         if b is not None:
             beat[key] = b
         if f_drag is not None:
-            # in-row compare: F_avg is no-DRAG, F_avg_drag is DRAG (ignore
-            # drag_applied here -- it is set True in the compare window even though
-            # F_avg is the DRAG-off result).
-            if f_avg is not None:
-                nodrag[key] = f_avg
+            # in-row compare: drag_applied is True here even though F_avg is DRAG-off
             drag_cmp[key] = f_drag
-        elif _to_bool(r.get("drag_applied")):
-            if f_avg is not None:
-                drag_ded[key] = f_avg
+            dst = nodrag
         else:
-            if f_avg is not None:
-                nodrag[key] = f_avg
+            dst = drag_ded if _to_bool(r.get("drag_applied")) else nodrag
+        if f_avg is not None:
+            dst[key] = f_avg
 
     drag = {**drag_cmp, **drag_ded}  # dedicated DRAG-on wins where both exist
 
-    wb_vals = np.array(sorted({k[0] for k in
-                               set(nodrag) | set(drag) | set(beat)}))
-    spec_vals = np.array(sorted({k[1] for k in
-                                 set(nodrag) | set(drag) | set(beat)}))
+    keys = set(nodrag) | set(drag) | set(beat)
+    wb_vals = np.array(sorted({k[0] for k in keys}))
+    spec_vals = np.array(sorted({k[1] for k in keys}))
     wb_ix = {w: i for i, w in enumerate(wb_vals)}
     sp_ix = {s: i for i, s in enumerate(spec_vals)}
 
-    shape = (spec_vals.size, wb_vals.size)
-    z_nodrag = np.full(shape, np.nan)
-    z_drag = np.full(shape, np.nan)
-    beat_grid = np.full(shape, np.nan)
-
-    def _fill(dst: np.ndarray, src: Dict[Tuple[float, float], float],
-              transform: bool) -> None:
+    def _grid(src: Dict[Key, float], transform: bool) -> np.ndarray:
+        dst = np.full((spec_vals.size, wb_vals.size), np.nan)
         for (w, s), v in src.items():
             dst[sp_ix[s], wb_ix[w]] = (1.0 - v) if (transform and metric ==
                                                     "infidelity") else v
+        return dst
 
-    _fill(z_nodrag, nodrag, transform=True)
-    _fill(z_drag, drag, transform=True)
-    _fill(beat_grid, beat, transform=False)
-    return wb_vals, spec_vals, z_nodrag, z_drag, beat_grid
+    return (wb_vals, spec_vals, _grid(nodrag, True), _grid(drag, True),
+            _grid(beat, False))
+
+
+def _load_grids(source: str, metric: str):
+    """``build_fidelity_grids`` on ``source``; raise if the grid is empty."""
+    grids = build_fidelity_grids(load_summary_rows(source), metric=metric)
+    if grids[0].size == 0 or grids[1].size == 0:
+        raise ValueError("no (wb_GHz, spec_GHz) grid found in the summary.")
+    return grids
+
+
+def _has_beat_crossing(beat: np.ndarray) -> bool:
+    """True if ``beat`` changes sign somewhere (so a zero contour exists)."""
+    return bool(np.isfinite(beat).any() and (np.nanmin(beat) < 0 < np.nanmax(beat)))
+
+
+def _masked_cmap(name: str):
+    """Copy of colormap ``name`` with missing cells drawn light grey."""
+    cmap = plt.get_cmap(name).copy()
+    cmap.set_bad("0.85")
+    return cmap
+
+
+def _save(fig, source: str, out: Optional[str], default_name: str) -> str:
+    """Save ``fig`` to ``out`` (or ``<source dir>/figs/<default_name>``) and close it."""
+    if out is None:
+        base = source if os.path.isdir(source) else os.path.dirname(source) or "."
+        os.makedirs(os.path.join(base, "figs"), exist_ok=True)
+        out = os.path.join(base, "figs", default_name)
+    else:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
 
 
 def plot_fidelity_map(
@@ -202,49 +175,34 @@ def plot_fidelity_map(
     out: Optional[str] = None,
     title: Optional[str] = None,
 ) -> str:
-    """Render the DRAG vs no-DRAG fidelity heatmaps and save a PNG.
+    """Render the DRAG vs no-DRAG fidelity heatmaps and return the PNG path.
 
     Parameters
     ----------
     source : str
         Sweep output directory (or a direct ``summary.csv`` path).
     metric : {"fidelity", "infidelity"}, optional
-        Quantity shown in colour. Default ``"fidelity"`` (as requested);
-        ``"infidelity"`` with ``log=True`` usually reveals the collision ridges
-        far more clearly.
+        Colour quantity; ``"infidelity"`` with a log scale shows collision ridges best.
     log : bool or None, optional
-        Logarithmic colour scale. ``None`` auto-selects: log for ``infidelity``,
-        linear for ``fidelity``.
+        Log colour scale; ``None`` = log for infidelity, linear for fidelity.
     cmap : str or None, optional
-        Matplotlib colormap. ``None`` picks ``"viridis"`` for fidelity (bright =
-        good) and ``"inferno"`` for infidelity (bright = bad).
+        ``None`` = ``"viridis"`` for fidelity, ``"inferno"`` for infidelity.
     collision_line : bool, optional
-        Overlay a dotted contour where ``nearest_beat_GHz`` crosses zero (the
-        one-pump spectator resonance). Default ``True``.
+        Overlay the dotted ``nearest_beat_GHz = 0`` (one-pump spectator resonance)
+        contour.
     out : str or None, optional
-        Output PNG path. ``None`` writes ``<dir>/figs/fidelity_map_<metric>.png``.
+        ``None`` writes ``<dir>/figs/fidelity_map_<metric>.png``.
     title : str or None, optional
-        Figure suptitle. ``None`` uses a sensible default.
+        Figure suptitle.
 
-    Returns
-    -------
-    str
-        Path to the written PNG.
-
-    Notes
-    -----
-    Missing grid cells (points that did not finish) render in light grey. A colour
-    scale shared across both panels keeps them directly comparable.
+    Missing cells render light grey.
     """
     if log is None:
         log = (metric == "infidelity")
     if cmap is None:
         cmap = "inferno" if metric == "infidelity" else "viridis"
 
-    rows = load_summary_rows(source)
-    wb, spec, z_off, z_on, beat = build_fidelity_grids(rows, metric=metric)
-    if wb.size == 0 or spec.size == 0:
-        raise ValueError("no (wb_GHz, spec_GHz) grid found in the summary.")
+    wb, spec, z_off, z_on, beat = _load_grids(source, metric)
 
     finite = np.concatenate([z_off[np.isfinite(z_off)].ravel(),
                              z_on[np.isfinite(z_on)].ravel()])
@@ -258,24 +216,21 @@ def plot_fidelity_map(
     else:
         norm = Normalize(vmin=float(finite.min()), vmax=float(finite.max()))
 
-    cmap_obj = plt.get_cmap(cmap).copy()
-    cmap_obj.set_bad("0.85")  # missing cells
-
+    cmap_obj = _masked_cmap(cmap)
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8),
                              constrained_layout=True, sharey=True)
     wb_mesh, sp_mesh = np.meshgrid(wb, spec)
-    have_beat = np.isfinite(beat).any() and (np.nanmin(beat) < 0 < np.nanmax(beat))
+    draw_beat = collision_line and _has_beat_crossing(beat)
 
     im = None
-    for ax, z, lab, present in ((axes[0], z_off, "no DRAG", np.isfinite(z_off).any()),
-                                (axes[1], z_on, "with DRAG", np.isfinite(z_on).any())):
+    for ax, z, lab in ((axes[0], z_off, "no DRAG"), (axes[1], z_on, "with DRAG")):
         im = ax.pcolormesh(wb, spec, np.ma.masked_invalid(z), shading="nearest",
                            cmap=cmap_obj, norm=norm)
-        if collision_line and have_beat:
+        if draw_beat:
             ax.contour(wb_mesh, sp_mesh, beat, levels=[0.0],
                        colors="white", linestyles=":", linewidths=1.1, alpha=0.75)
         ax.set_xlabel(r"$\omega_b$ (GHz)")
-        ax.set_title(lab + ("" if present else "  (no data)"), fontsize=11)
+        ax.set_title(lab + ("" if np.isfinite(z).any() else "  (no data)"), fontsize=11)
         ax.tick_params(labelsize=9)
     axes[0].set_ylabel(r"$\omega_c$ spectator (GHz)")
 
@@ -284,32 +239,15 @@ def plot_fidelity_map(
                   else r"fidelity $F$") + ("  (log)" if log else ""))
     if title is None:
         title = "iSWAP allocation: DRAG vs no DRAG"
-        if collision_line and have_beat:
+        if draw_beat:
             title += "   (dotted: spectator resonance, beat $=0$)"
     fig.suptitle(title, fontsize=12)
-
-    if out is None:
-        base = source if os.path.isdir(source) else os.path.dirname(source) or "."
-        os.makedirs(os.path.join(base, "figs"), exist_ok=True)
-        out = os.path.join(base, "figs", f"fidelity_map_{metric}.png")
-    else:
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return out
+    return _save(fig, source, out, f"fidelity_map_{metric}.png")
 
 
 def _peak_2d(Z: np.ndarray, wb: np.ndarray, spec: np.ndarray):
-    """Return ``(F, wb, spec)`` at the maximum of ``Z``, or ``(nan, None, None)``
-    if ``Z`` is entirely non-finite.
-
-    Parameters
-    ----------
-    Z : ndarray, shape (n_spec, n_wb)
-        Fidelity grid (rows indexed by ``spec``, columns by ``wb``).
-    wb, spec : ndarray
-        Grid axes matching ``Z``'s columns and rows respectively.
-    """
+    """``(F, wb, spec)`` at the max of ``Z`` (rows = spec, cols = wb), or
+    ``(nan, None, None)`` if ``Z`` is entirely non-finite."""
     if not np.isfinite(Z).any():
         return (float("nan"), None, None)
     i, j = np.unravel_index(int(np.nanargmax(Z)), Z.shape)
@@ -318,12 +256,8 @@ def _peak_2d(Z: np.ndarray, wb: np.ndarray, spec: np.ndarray):
 
 def _fidelity_summary(wb: np.ndarray, spec: np.ndarray,
                       z_off: np.ndarray, z_on: np.ndarray) -> Dict[str, object]:
-    """Assemble the best-fidelity summary from the two fidelity grids.
-
-    ``best_of_both`` is the element-wise ``nan``-aware max (``np.fmax``): a cell
-    with only one condition present keeps that value, so it is the best fidelity
-    *available* at each allocation point.
-    """
+    """Best-fidelity summary; ``best_of_both`` is ``np.fmax`` (a cell present in
+    only one condition keeps that value)."""
     best = np.fmax(z_off, z_on)
     return {
         "wb": wb, "spec": spec,
@@ -335,22 +269,12 @@ def _fidelity_summary(wb: np.ndarray, spec: np.ndarray,
 
 
 def best_fidelities(source: str) -> Dict[str, object]:
-    """Extract the best average iSWAP fidelity achieved with and without DRAG.
+    """Best average iSWAP fidelity with and without DRAG.
 
-    Parameters
-    ----------
-    source : str
-        Sweep directory (containing ``summary.csv``) or a direct CSV path.
-
-    Returns
-    -------
-    dict
-        Keys: ``wb``, ``spec`` (grid axes, ndarray); ``F_nodrag``, ``F_drag``
-        (2-D fidelity grids, shape ``(n_spec, n_wb)``, ``nan`` where a point is
-        missing or absent for that condition); ``best_of_both`` (element-wise
-        ``nan``-aware max of the two); and ``nodrag`` / ``drag`` / ``overall``,
-        each a ``(F, wb, spec)`` tuple giving the peak fidelity and where it
-        occurs (``(nan, None, None)`` if that condition has no data).
+    Returns a dict with grid axes ``wb``, ``spec``; 2-D grids ``F_nodrag``,
+    ``F_drag``, ``best_of_both`` (shape ``(n_spec, n_wb)``, ``nan`` = missing); and
+    ``nodrag`` / ``drag`` / ``overall`` peaks as ``(F, wb, spec)`` tuples
+    (``(nan, None, None)`` if that condition has no data).
     """
     rows = load_summary_rows(source)
     wb, spec, z_off, z_on, _beat = build_fidelity_grids(rows, metric="fidelity")
@@ -365,41 +289,19 @@ def plot_diff_and_best(
     out: Optional[str] = None,
     title: Optional[str] = None,
 ) -> Tuple[str, Dict[str, object]]:
-    """Render the DRAG-minus-no-DRAG fidelity difference alongside the
-    best-of-both map, and return the PNG path plus the best-fidelity summary.
+    """Render ``F_DRAG - F_noDRAG`` beside the best-of-both map.
 
-    The left panel is :math:`\\Delta F = F_{\\mathrm{DRAG}} - F_{\\mathrm{no\\,DRAG}}`
-    on a diverging scale (blue where DRAG improves the gate, red where it degrades
-    it, grey where a cell is missing in either condition). The right panel is
-    :math:`\\max(F_{\\mathrm{DRAG}}, F_{\\mathrm{no\\,DRAG}})` -- the best fidelity
-    obtainable at each allocation point by choosing the better of the two gates.
+    Left: :math:`\\Delta F` on a diverging scale (blue = DRAG better, red = worse).
+    Right: :math:`\\max(F_{\\mathrm{DRAG}}, F_{\\mathrm{no\\,DRAG}})`.
 
-    Parameters
-    ----------
-    source : str
-        Sweep directory (containing ``summary.csv``) or a direct CSV path.
-    collision_line : bool, optional
-        Overlay the ``nearest_beat = 0`` spectator-resonance contour on both
-        panels. Default ``True``.
-    diff_pct : float, optional
-        Percentile of ``|ΔF|`` used to set the symmetric colour range of the diff
-        panel (default 95). Cells beyond it saturate; this keeps the collision
-        bands -- where the DRAG calibration mislocates and ``ΔF`` is large -- from
-        washing out the small genuine differences elsewhere.
-    out : str or None, optional
-        Output PNG path. ``None`` writes ``<dir>/figs/fidelity_diff_best.png``.
-    title : str or None, optional
-        Figure suptitle.
+    ``diff_pct`` is the percentile of ``|ΔF|`` setting the symmetric diff range;
+    larger cells saturate so collision bands (where DRAG calibration mislocates)
+    don't wash out small genuine differences. ``out=None`` writes
+    ``<dir>/figs/fidelity_diff_best.png``.
 
-    Returns
-    -------
-    (str, dict)
-        The written PNG path and the :func:`best_fidelities` summary dict.
+    Returns the PNG path and the :func:`best_fidelities` summary dict.
     """
-    rows = load_summary_rows(source)
-    wb, spec, z_off, z_on, beat = build_fidelity_grids(rows, metric="fidelity")
-    if wb.size == 0 or spec.size == 0:
-        raise ValueError("no (wb_GHz, spec_GHz) grid found in the summary.")
+    wb, spec, z_off, z_on, beat = _load_grids(source, "fidelity")
     info = _fidelity_summary(wb, spec, z_off, z_on)
 
     diff = z_on - z_off                                   # +ve => DRAG improves F
@@ -408,35 +310,28 @@ def plot_diff_and_best(
     m = max(m, 1e-6)
 
     wb_mesh, sp_mesh = np.meshgrid(wb, spec)
-    have_beat = np.isfinite(beat).any() and (np.nanmin(beat) < 0 < np.nanmax(beat))
-
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8),
                              constrained_layout=True, sharey=True)
 
-    # left: difference (red = DRAG worse, blue = DRAG better)
-    cmap_d = plt.get_cmap("RdBu").copy()
-    cmap_d.set_bad("0.85")
     im0 = axes[0].pcolormesh(wb, spec, np.ma.masked_invalid(diff), shading="nearest",
-                             cmap=cmap_d, norm=Normalize(vmin=-m, vmax=+m))
+                             cmap=_masked_cmap("RdBu"), norm=Normalize(vmin=-m, vmax=+m))
     axes[0].set_title(r"$\Delta F = F_{\mathrm{DRAG}} - F_{\mathrm{no\,DRAG}}$"
                       "\n(blue: DRAG better, red: worse)", fontsize=10)
     cb0 = fig.colorbar(im0, ax=axes[0], shrink=0.9, pad=0.02)
     cb0.set_label(rf"$\Delta F$  (saturates at $\pm{m:.3f}$)")
 
-    # right: best of both
     fb = info["best_of_both"][np.isfinite(info["best_of_both"])]
-    cmap_b = plt.get_cmap("viridis").copy()
-    cmap_b.set_bad("0.85")
     norm_b = Normalize(vmin=float(fb.min()), vmax=float(fb.max())) if fb.size else None
     im1 = axes[1].pcolormesh(wb, spec, np.ma.masked_invalid(info["best_of_both"]),
-                             shading="nearest", cmap=cmap_b, norm=norm_b)
+                             shading="nearest", cmap=_masked_cmap("viridis"), norm=norm_b)
     axes[1].set_title(r"best of both: $\max(F_{\mathrm{DRAG}},\,F_{\mathrm{no\,DRAG}})$",
                       fontsize=10)
     cb1 = fig.colorbar(im1, ax=axes[1], shrink=0.9, pad=0.02)
     cb1.set_label(r"fidelity $F$")
 
+    draw_beat = collision_line and _has_beat_crossing(beat)
     for ax in axes:
-        if collision_line and have_beat:
+        if draw_beat:
             ax.contour(wb_mesh, sp_mesh, beat, levels=[0.0], colors="0.3",
                        linestyles=":", linewidths=1.0, alpha=0.7)
         ax.set_xlabel(r"$\omega_b$ (GHz)")
@@ -444,16 +339,7 @@ def plot_diff_and_best(
     axes[0].set_ylabel(r"$\omega_c$ spectator (GHz)")
 
     fig.suptitle(title or "DRAG vs no-DRAG: difference and best-of-both", fontsize=12)
-
-    if out is None:
-        base = source if os.path.isdir(source) else os.path.dirname(source) or "."
-        os.makedirs(os.path.join(base, "figs"), exist_ok=True)
-        out = os.path.join(base, "figs", "fidelity_diff_best.png")
-    else:
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return out, info
+    return _save(fig, source, out, "fidelity_diff_best.png"), info
 
 
 def main() -> None:

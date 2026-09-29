@@ -7,26 +7,22 @@ w_p = |w_b - w_a| as a separate drive stripe, the PHYSICAL spectator band
 [w_a, w_b] (a spectator qubit lives between the two computational qubits), and
 the collision zones inside that band that a spectator must avoid.
 
-Collision physics (why the danger frequencies are where they are)
-------------------------------------------------------------------
-A spectator at w_spec is dangerous when it is resonant with an active process:
+Collision physics
+-----------------
+A spectator at w_spec is dangerous when resonant with an active process:
 
-* direct exchange with a mode:                w_spec = w_a, w_b, or w_s
-* pump-assisted (one-pump) sideband:          |w_q - w_spec| = w_p  for q in {a,b,s}
+* direct exchange with a mode:         w_spec = w_a, w_s, or w_b
+* one-pump (g3) sideband:              |w_q - w_spec| = w_p
+* subharmonic (pump 2nd harmonic):     w_p = w_i/2 for each mode i (marked at w_i/2,
+  plus 2 w_p where the current pump's 2nd harmonic drives any mode)
 
-Because the iSWAP pump is the qubit-qubit difference, w_p = |w_b - w_a|, the
-pump-assisted sidebands of the qubits fall exactly on the OTHER qubit:
-    w_b - w_p = w_a           and           w_a + w_p = w_b .
-So inside the band the collision frequencies are w_a, the coupler w_s, and w_b;
-a spectator wants to sit in the gaps between them. This also means the
-"spectator resonance" seen in the sweeps (beat = Delta - w_p -> 0) is the point
-where the spectator becomes degenerate with qubit a, i.e. the lower band edge.
+Since w_p = |w_b - w_a|, the qubits' one-pump sidebands land on the OTHER qubit
+(w_b - w_p = w_a, w_a + w_p = w_b), so in-band collisions sit at w_a, w_s, w_b.
+The sweeps' "spectator resonance" (beat = Delta - w_p -> 0) is thus degeneracy
+with qubit a, the lower band edge.
 
-Note on the sweep axis
-----------------------
-run_sweep_zhou's ``spec_freq_GHz`` is the DETUNING Delta = w_b - w_spec, not an
-absolute frequency; the absolute placement is w_spec = w_b - Delta. This tool
-works in ABSOLUTE frequency (GHz) so the layout is unambiguous.
+run_sweep_zhou's ``spec_freq_GHz`` is the DETUNING Delta = w_b - w_spec; this tool
+works in ABSOLUTE frequency, w_spec = w_b - Delta.
 
 CLI
 ---
@@ -47,22 +43,13 @@ def allocation_frequencies(config: Dict[str, Any],
                            margin_MHz: float = 50.0) -> Dict[str, Any]:
     """Compute the mode frequencies, pump, spectator band and collision zones.
 
-    Parameters
-    ----------
-    config : dict
-        Device configuration; needs ``qubit_freqs_GHz`` (2 entries) and
-        ``coupler_freq_GHz``. ``g3_GHz``, ``lam_a``, ``lam_b`` are used only to
-        report a representative iSWAP coupling.
-    margin_MHz : float, default 50.0
-        Half-width (MHz) of the shaded collision zone around each collision
-        centre. A few tens of MHz (order 10x the effective coupling) captures
-        the region where the gate degrades in the sweeps.
+    ``config`` needs ``qubit_freqs_GHz`` (2 entries) and ``coupler_freq_GHz``;
+    ``g3_GHz``, ``lam_a``, ``lam_b`` only feed the reported iSWAP coupling.
+    ``margin_MHz`` is the collision-zone half-width; a few tens of MHz (~10x the
+    effective coupling) covers where the gate degrades in the sweeps.
 
-    Returns
-    -------
-    dict
-        w_a_GHz, w_b_GHz, w_s_GHz, w_p_GHz, band_GHz=(lo, hi),
-        collisions=list of (centre_GHz, label), margin_GHz, g_iswap_MHz.
+    Returns a dict: w_a_GHz, w_b_GHz, w_s_GHz, w_p_GHz, band_GHz=(lo, hi),
+    collisions=[(centre_GHz, label)], families, margin_GHz, g_iswap_MHz.
     """
     wa, wb = sorted(float(f) for f in config["qubit_freqs_GHz"])   # wa < wb
     ws = float(config["coupler_freq_GHz"])
@@ -74,16 +61,7 @@ def allocation_frequencies(config: Dict[str, Any],
     la = float(config.get("lam_a", 0.0)); lb = float(config.get("lam_b", 0.0))
     g_iswap_MHz = 6.0 * g3 * la * lb * 1e3
 
-    # Spectator interaction channels. A spectator at w_spec is resonant with an
-    # active process at these frequencies (the ones to keep it away from):
-    #   direct exchange with a mode:        w_spec = w_a, w_s, w_b
-    #   pump-assisted swap (one g3 pump):   |w_q - w_spec| = w_p  -> w_spec = w_q +/- w_p
-    #   subharmonic (pump's 2nd harmonic):  w_p = w_i/2  for every mode i
-    # Because the iSWAP pump is the qubit difference w_p = w_b - w_a, the one-pump
-    # sidebands fall on the OTHER qubit (w_a + w_p = w_b, w_b - w_p = w_a). Each mode i
-    # also has a subharmonic resonance at the pump frequency w_i/2 (the pump's second
-    # harmonic drives mode i); those are marked at w_a/2, w_s/2, w_b/2, and the in-band
-    # point 2 w_p is where the CURRENT pump's second harmonic would drive any mode.
+    # spectator interaction channels (see module docstring)
     families = [
         {"key": "direct", "color": "#555555",
          "label": r"direct  $w_{\rm spec}=w_q$",
@@ -124,8 +102,7 @@ def _safe_windows(band: Tuple[float, float],
                   margin: float, min_width: float = 0.0) -> List[Tuple[float, float]]:
     """Sub-intervals of the band left free once each collision +/- margin is removed.
 
-    Windows narrower than ``min_width`` (GHz) are dropped -- a gap thinner than the
-    collision margin is not usefully collision-free.
+    Windows narrower than ``min_width`` (GHz) are dropped.
     """
     lo, hi = band
     blocked = sorted((c - margin, c + margin) for c, _ in collisions)
@@ -157,28 +134,11 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
                     title: Optional[str] = None) -> Dict[str, Any]:
     """Render the frequency-allocation diagram to ``png_path``.
 
-    Parameters
-    ----------
-    config : dict
-        Device configuration (see ``allocation_frequencies``).
-    png_path : str
-        Output PNG path (parent directory is created).
-    spec_GHz : float, optional
-        A specific ABSOLUTE spectator frequency to mark; annotated green if it
-        falls in a safe window, red if inside a collision zone or out of band.
-    sweep_wspec_GHz : (float, float), optional
-        ABSOLUTE spectator range covered by a sweep, drawn as a bar so out-of-band
-        excursions are obvious.
-    margin_MHz : float, default 50.0
-        Collision-zone half-width (MHz).
-    title : str, optional
-        Figure title.
-
-    Returns
-    -------
-    dict
-        The ``allocation_frequencies`` result (frequencies + collision zones),
-        for programmatic use.
+    ``spec_GHz`` marks an ABSOLUTE spectator frequency (purple if safe, red if in a
+    collision zone or out of band); ``sweep_wspec_GHz`` draws an ABSOLUTE swept range
+    as a bar with out-of-band parts in red. ``f_min``/``f_max`` set the axis (GHz);
+    channels beyond them become edge arrows. Returns the ``allocation_frequencies``
+    result.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -194,8 +154,7 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
         pass
 
     class _GradHandler(HandlerBase):
-        """Legend handler that draws a horizontal colour gradient swatch (c0 -> c1)
-        as a row of thin rectangles, so drive entries show their blended colours."""
+        """Legend handler drawing a horizontal c0 -> c1 gradient swatch."""
         def __init__(self, c0: str, c1: str, n: int = 24) -> None:
             super().__init__()
             self._c0, self._c1, self._n = to_rgb(c0), to_rgb(c1), n
@@ -212,9 +171,8 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
     wa, wb, ws, w_p = info["w_a_GHz"], info["w_b_GHz"], info["w_s_GHz"], info["w_p_GHz"]
     band, collisions, margin = info["band_GHz"], info["collisions"], info["margin_GHz"]
 
-    # Distinct colour per mode; each DRIVE is painted as a vertical gradient blending
-    # the two modes it couples, so "which qubit" is unambiguous: the pump blends a->b,
-    # the one-pump swaps blend qubit->spectator, the subharmonic blends pump->spectator.
+    # one colour per mode; each drive is a vertical gradient between the two modes
+    # it couples (pump a->b, one-pump swaps qubit->spectator)
     A, B = "#2a9d8f", "#e76f51"           # qubit a (teal), qubit b (coral)
     SPEC, COUPLER, GOLD = "#7b2cbf", "#6c757d", "#e9a000"
     # paint: ("solid", color) or ("grad", bottom_color, top_color)
@@ -229,8 +187,7 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
     }
     ORDER = ["qubit_a", "qubit_b", "coupler", "pump", "a_spec", "b_spec", "subharm"]
 
-    # frequency -> categories resonant there. Qubit degeneracies are split by qubit so
-    # a-vs-b is distinguishable; one-pump sidebands and the subharmonics are explicit.
+    # frequency -> categories resonant there
     freqmap: Dict[float, set] = {}
     def _add(f: float, cat: str) -> None:
         freqmap.setdefault(round(float(f), 6), set()).add(cat)
@@ -239,8 +196,6 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
         _add(c, "a_spec")
     for c in (wb - w_p, wb + w_p):
         _add(c, "b_spec")
-    # a subharmonic at every w_p = w_i/2: mark w_i/2 for each mode (pump 2nd harmonic
-    # drives mode i), plus 2 w_p (in-band, where the CURRENT pump drives any mode).
     sub_marks = [(0.5 * wa, r"$w_a/2$"), (0.5 * ws, r"$w_s/2$"),
                  (0.5 * wb, r"$w_b/2$"), (2.0 * w_p, r"$2w_p$")]
     if spec_GHz is not None:
@@ -287,9 +242,6 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
     for c, _k in collisions:
         _shade(c - margin, c + margin, "#d62728", 0.13)
 
-    def _rep_color(paint) -> str:
-        return paint[1]                                   # solid colour, or gradient's bottom end
-
     def _paint_stripe(x: float, ylo: float, yhi: float, paint) -> None:
         if paint[0] == "solid":
             ax.plot([x, x], [ylo, yhi], color=paint[1], lw=3.4, solid_capstyle="butt",
@@ -300,8 +252,8 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
                       extent=[x - hw, x + hw, ylo, yhi], origin="lower", cmap=cmap,
                       aspect="auto", zorder=4, interpolation="bilinear")
 
-    # stacked stripes at each frequency (coincident channels split the height); a
-    # gradient drive shows the two modes it couples. Off-scale -> edge arrows.
+    # stacked stripes per frequency (coincident channels split the height);
+    # off-scale channels become edge arrows
     ymid = 0.5 * (y0 + y1)
     for f, cats in sorted(freqmap.items()):
         cs = [c for c in ORDER if c in cats]
@@ -312,7 +264,7 @@ def plot_allocation(config: Dict[str, Any], png_path: str,
                 ax.annotate("", xy=(edge, ymid - 0.10 + 0.14 * j),
                             xytext=(edge - dx, ymid - 0.10 + 0.14 * j),
                             arrowprops=dict(arrowstyle="->",
-                                            color=_rep_color(CATS[cat]["paint"]), lw=1.4))
+                                            color=CATS[cat]["paint"][1], lw=1.4))
             ax.annotate(f"{f:.2f}", (edge - dx, ymid + 0.10 + 0.14 * (len(cs) - 1)),
                         ha="center", va="bottom", fontsize=6.0, color="0.35")
             continue
@@ -443,9 +395,9 @@ def main() -> None:
           f"w_p={info['w_p_GHz']:.3f} GHz   g_iSWAP~{info['g_iswap_MHz']:.1f} MHz")
     print(f"physical spectator band: [{wa:.3f}, {wb:.3f}] GHz")
     for fam in info["families"]:
-        inb = [f"{c:.3f}" for c in sorted(set(round(x, 6) for x in fam["centers"]))
-               if wa <= c <= wb]
-        allc = [f"{c:.3f}" for c in sorted(set(round(x, 6) for x in fam["centers"]))]
+        centers = sorted(set(round(x, 6) for x in fam["centers"]))
+        inb = [f"{c:.3f}" for c in centers if wa <= c <= wb]
+        allc = [f"{c:.3f}" for c in centers]
         print(f"  {fam['key']:8s}: all {', '.join(allc)}  |  in-band {', '.join(inb) or '(none)'}")
     margin = info["margin_GHz"]
     windows = _safe_windows(info["band_GHz"], info["collisions"], margin, min_width=margin)

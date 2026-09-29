@@ -4,53 +4,34 @@ envelope.py
 
 Pump envelopes, frequency chirps, and the pump-tone container.
 
-This module is the SINGLE SOURCE OF TRUTH for these classes; `zhou_coupler`
-re-exports every public name here, so ``from zhou_coupler import RaisedCosine``
-keeps working unchanged.
+The single source of truth for these classes; `zhou_coupler` re-exports them.
 
-Split of responsibilities
--------------------------
-* :class:`Envelope` carries the pulse SHAPE and its peak scale ``amp``. Its
-  ``value`` may be complex (the DRAG quadrature and the CRAB I/Q ansatz both
-  need that), but ``|value|`` is what the iSWAP normalization integrates.
-* :class:`Chirp` carries a time-dependent FREQUENCY offset delta(t) about the
-  tone's fixed carrier ``w_p_GHz``, as an accumulated phase Phi(t) = int_0^t delta.
+* :class:`Envelope` carries the pulse SHAPE and its peak scale ``amp``. ``value`` may
+  be complex (DRAG, CRAB I/Q), but ``|value|`` is what the iSWAP normalization
+  integrates.
+* :class:`Chirp` carries a FREQUENCY offset delta(t) about the tone's fixed carrier
+  ``w_p_GHz``, as the accumulated phase Phi(t) = int_0^t delta.
 * :class:`PumpTone` binds the two to a carrier.
 
-Why a chirp needs no solver changes
------------------------------------
-A pump letter enters X(t) as ``eta_p(t) e^{-i w_p t}``. Chirping the carrier,
-w_p -> w_p + delta(t), is therefore ALGEBRAICALLY IDENTICAL to multiplying the
-complex envelope by a phase::
+A chirp needs no solver changes: a pump letter enters X(t) as ``eta_p e^{-i w_p t}``,
+so chirping w_p -> w_p + delta(t) is ALGEBRAICALLY IDENTICAL to a phase on the
+envelope::
 
     eta_p(t) e^{-i(w_p t + Phi(t))} = [eta_p(t) e^{-i Phi(t)}] e^{-i w_p t}
 
-so the fixed carrier w_p stays the expansion reference and the chirp rides in the
-envelope. A Hamiltonian term carrying k net pump quanta picks up ``e^{-i k Phi(t)}``
-automatically, which is exactly the k-quanta net-carrier shift. Nothing in
-``_flux_letters``, ``expand_terms`` or ``to_qutip_hamiltonian`` has to know.
-This is the time-dependent generalization of the constant ``offset_rad`` trick in
-``grape._H``.
+A term carrying k net pump quanta then picks up ``e^{-i k Phi(t)}`` automatically.
 
-Array API and tracing
----------------------
-Every shape function is available in an ``xp``-generic form -- ``value_at(t, xp)``,
-``deriv_at(t, xp)``, ``Chirp.phase(t, xp)`` -- accepting scalar OR array ``t`` and
-built only from ``xp`` primitives, following the convention already used by
-``grape._iq_ansatz``. With ``xp=jax.numpy`` these stay trace-clean: no ``float()``
-and no ``asarray(..., dtype=)`` is applied to any value that can carry a tracer,
-either of which raises (TracerArrayConversionError / ConcretizationTypeError).
-Domain guards are ``xp.where`` masks rather than Python ``if``, since a branch on a
-traced value cannot compile.
-
-The scalar ``value(t)`` / ``deriv(t)`` methods remain as thin wrappers so that the
-existing per-time solver callbacks are unchanged.
+Array API: every shape function has an ``xp``-generic form (``value_at(t, xp)``,
+``deriv_at(t, xp)``, ``Chirp.phase(t, xp)``) taking scalar OR array ``t``. With
+``xp=jax.numpy`` they stay trace-clean: no ``float()`` or ``asarray(..., dtype=)`` on
+anything that can carry a tracer, and domain guards are ``xp.where`` masks, not
+Python ``if``. The scalar ``value(t)`` / ``deriv(t)`` are thin wrappers.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import comb as _comb
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -65,10 +46,8 @@ TWO_PI = 2.0 * np.pi
 class Envelope:
     """Base class for a pump-amplitude envelope eps(t) on [0, t_g].
 
-    Subclasses implement `value_at` and `deriv_at` (the ``xp``-generic forms);
-    `value` / `deriv` are scalar wrappers around them and need no overriding.
-    `area` integrates |eps| over the gate (subclasses with closed forms override
-    it).
+    Subclasses implement the ``xp``-generic `value_at` and `deriv_at`; `value` /
+    `deriv` wrap them for scalars.
 
     Parameters
     ----------
@@ -81,8 +60,7 @@ class Envelope:
     Attributes
     ----------
     is_complex : bool
-        Class attribute; True if `value` can return a complex amplitude. Only
-        controls the scalar wrapper's cast.
+        Class attribute; True if `value` can be complex (the scalar wrapper's cast).
     """
 
     is_complex: bool = False
@@ -93,11 +71,8 @@ class Envelope:
 
     # -- xp-generic core (subclasses implement these) ----------------------
     def value_at(self, t: Any, xp: Any = np) -> Any:
-        """Envelope amplitude at time(s) `t` (ns), built from `xp` primitives.
-
-        Accepts a scalar or an array and returns the same shape. Must not branch
-        on `t` (use ``xp.where``) so the body stays vectorizable and traceable.
-        """
+        """Envelope amplitude at time(s) `t` (ns), same shape as `t`, built from `xp`
+        primitives; must not branch on `t` (use ``xp.where``)."""
         raise NotImplementedError
 
     def deriv_at(self, t: Any, xp: Any = np) -> Any:
@@ -119,15 +94,10 @@ class Envelope:
     def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
         """Derivatives ``(eps, eps', ..., eps^(order))`` at time(s) `t` (ns).
 
-        Recursive DRAG (:mod:`snail_solver.drag`) differentiates the amplitude
-        produced by the previous correction, so a K-fold composition needs the base
-        envelope to order K. Every envelope in this module is a finite trigonometric
-        polynomial, so the overrides below are all closed forms -- no quadrature, no
-        finite differences, and trace-clean like `value_at`/`deriv_at`.
-
-        `order` must be a static Python int (it controls an unrolled loop). The base
-        implementation covers orders 0 and 1 by delegating to the existing methods;
-        anything higher is a per-subclass responsibility.
+        K-channel recursive DRAG (:mod:`snail_solver.drag`) needs order K. Subclass
+        overrides are closed forms (every envelope here is a trigonometric
+        polynomial). `order` must be a static Python int; the base class covers
+        orders 0 and 1 only.
         """
         order = int(order)
         if order <= 0:
@@ -140,13 +110,11 @@ class Envelope:
 
     # -- integrated quantities ---------------------------------------------
     def area(self) -> float:
-        """Return integral_0^{t_g} value(t) dt by quadrature (override if a closed
-        form exists).
+        """integral_0^{t_g} value(t) dt by quadrature (subclasses override with closed
+        forms).
 
-        This is the quantity `set_pump(..., normalize_iswap=...)` divides by to
-        calibrate the pi/2 rotation. It is unaffected by a chirp: a chirp lives on
-        the PumpTone, not the envelope, and is a pure phase that leaves |eta|
-        alone. Do not add a chirp correction here.
+        `set_pump(..., normalize_iswap=...)` divides by this. A chirp is a pure phase
+        on the PumpTone and leaves |eta| alone, so it needs no correction here.
         """  # noqa: D205
         ts = np.linspace(0.0, self.t_g, 4001)
         return float(_trapezoid(self.value_at(ts, np), ts))
@@ -199,10 +167,7 @@ class ConstantPulse(Envelope):
 
 
 class RaisedCosine(Envelope):
-    """Hann (raised-cosine) envelope: smooth turn-on/off, vanishing endpoints,.
-
-    value(t) = amp/2 [1 - cos(2 pi t / t_g)] ,  t in [0, t_g] .
-    """
+    """Hann (raised-cosine) envelope: value(t) = amp/2 [1 - cos(2 pi t / t_g)] on [0, t_g]."""
 
     def value_at(self, t: Any, xp: Any = np) -> Any:
         """Hann amplitude at `t` (ns); 0 outside [0, t_g]."""
@@ -215,15 +180,10 @@ class RaisedCosine(Envelope):
                 * self._support(t, xp))
 
     def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
-        """Closed-form derivatives to any order.
+        """Closed form: for n >= 1, ``-amp/2 w^n cos(w t + n pi/2)``, ``w = 2 pi / t_g``.
 
-        Only the cosine carries the time dependence, so for n >= 1
-        ``d^n/dt^n[-amp/2 cos(w t)] = -amp/2 w^n cos(w t + n pi/2)`` with
-        ``w = 2 pi / t_g``. At n = 1 this reproduces :meth:`deriv_at` exactly.
-
-        Note what this shows about the boundaries: ``eps(0) = eps'(0) = 0`` but
-        ``eps''(0) = amp/2 w^2 != 0``. A Hann window therefore supports exactly ONE
-        clean derivative correction -- see :mod:`snail_solver.drag`.
+        ``eps''(0) = amp/2 w^2 != 0``, so Hann supports exactly ONE clean derivative
+        correction -- see :mod:`snail_solver.drag`.
         """
         w = TWO_PI / self.t_g
         support = self._support(t, xp)
@@ -248,37 +208,21 @@ class SinePowerRamp(Envelope):
     normalized by :math:`\mathcal{I}_0` so that :math:`\Omega(t_r) = \mathrm{amp}`,
     then held flat and mirrored down over ``[t_g - t_r, t_g]``.
 
-    Why this shape exists
-    ---------------------
-    Recursive DRAG differentiates the pulse once per suppressed channel, and the
-    paper requires the base shape to be m-times differentiable with **all m
-    derivatives vanishing at both ends**, "which guarantees the validity of the frame
-    transformation". :class:`RaisedCosine` only manages two
-    (``eps(0) = eps'(0) = 0`` but ``eps''(0) != 0``), and that is not a small error:
-    with ``F^(2)`` innermost the imaginary term dominates as ``t -> 0``, so a shape
-    vanishing as ``t^p`` comes out as ``t^(p - 1/2)``. Hann has ``p = 2``, so two
-    further derivatives give a ``t^(-1/2)`` DIVERGENCE at both gate edges -- measured,
-    and pinned by ``test_hann_diverges_under_the_full_recursion``. Here
-    ``eps ~ t^(m+1)``, so ``m = 3`` carries a 3-channel recursion comfortably.
+    Recursive DRAG differentiates the pulse once per channel and needs the base shape
+    to have **m derivatives vanishing at both ends**. Hann only manages
+    ``eps(0) = eps'(0) = 0``; under ``F^(2)`` innermost a shape ``~ t^p`` becomes
+    ``t^(p - 1/2)``, so Hann (``p = 2``) DIVERGES as ``t^(-1/2)`` at the edges
+    (pinned by ``test_hann_diverges_under_the_full_recursion``). Here
+    ``eps ~ t^(m+1)``, so ``m = 3`` carries a 3-channel recursion. Keep m small: larger
+    m adds high-frequency content, itself a source of non-adiabatic error.
 
-    Keep m as small as the channel count allows: the paper warns that larger m packs
-    more high-frequency content into the pulse, which is itself a source of
-    non-adiabatic error.
-
-    Reduces exactly to a Hann window
-    --------------------------------
-    ``SinePowerRamp(amp, t_g, m=1)`` (i.e. ``t_rise = t_g/2``, no plateau) IS
-    :class:`RaisedCosine`, to floating-point equality -- the paper says as much
-    ("for m = 1 and with zero holding time, the pulse is the same as the Hann
-    window"), and a test asserts it. That makes every Hann-specific constant elsewhere
-    in the codebase a special case of this family rather than a separate derivation.
+    ``SinePowerRamp(amp, t_g, m=1)`` (no plateau) IS :class:`RaisedCosine` to
+    floating-point equality (asserted by a test).
 
     .. note::
-       The paper PRINTS the integrand as ``sin^m(pi t'/2 t_r)``, which would make it
-       equal 1 (its maximum) at ``t' = t_r`` and so leave ``Omega'(t_r) != 0`` --
-       contradicting the very property the equation is introduced to provide, and
-       failing its own m=1 claim by 0.25 in amplitude. The ``pi t'/t_r`` reading used
-       here vanishes at both ends and reproduces the Hann window to 6e-16.
+       The paper PRINTS the integrand as ``sin^m(pi t'/2 t_r)``, which leaves
+       ``Omega'(t_r) != 0`` and fails its own m=1 claim. The ``pi t'/t_r`` reading used
+       here vanishes at both ends and reproduces Hann to 6e-16.
 
     Parameters
     ----------
@@ -303,10 +247,8 @@ class SinePowerRamp(Envelope):
         if not (0.0 < self.t_rise <= self.t_g / 2.0 + 1e-12):
             raise ValueError(f"t_rise must be in (0, t_g/2]; got {self.t_rise} "
                              f"with t_g = {self.t_g}")
-        # sin^m(x) = sum_j W_j e^{i k_j x},  k_j = m - 2j, from the binomial expansion
-        # of ((e^{ix} - e^{-ix}) / 2i)^m. Complex exponentials rather than a
-        # parity-split sin/cos series: one code path covers odd and even m, and both
-        # the antiderivative and every derivative are then one-liners.
+        # sin^m(x) = sum_j W_j e^{i k_j x},  k_j = m - 2j  (binomial expansion of
+        # ((e^{ix} - e^{-ix}) / 2i)^m): one code path for odd and even m.
         j = np.arange(self.m + 1)
         self._k = (self.m - 2 * j).astype(float)
         self._W = (np.array([_comb(self.m, int(x)) for x in j], dtype=complex)
@@ -317,11 +259,8 @@ class SinePowerRamp(Envelope):
 
     # -- the ramp, its integral and its derivatives ------------------------
     def _integral(self, t: Any, xp: Any = np) -> Any:
-        """``int_0^t sin^m(w t') dt'`` (un-normalized), termwise in the exponentials.
-
-        The basis lives on a trailing axis, so a scalar and an array of times take
-        the same code path (the same trick as ``IQFourierEnvelope._basis``).
-        """
+        """``int_0^t sin^m(w t') dt'`` (un-normalized), termwise; the basis lives on a
+        trailing axis so scalar and array `t` share one path."""
         k, W, w = self._k, self._W, self._w
         zero = np.abs(k) < 1e-12
         k_safe = np.where(zero, 1.0, k)        # avoid 0/0 in the discarded branch
@@ -343,21 +282,16 @@ class SinePowerRamp(Envelope):
         return out
 
     def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
-        """Closed-form derivatives to any order, across rise / plateau / fall.
-
-        The three regions are combined with ``xp.where`` masks, never a Python
-        branch, so a scalar, an array and a tracer all take the same path. The fall
-        is the rise reflected, so its n-th derivative carries ``(-1)^n``.
-        """
+        """Closed-form derivatives to any order across rise / plateau / fall, combined
+        with ``xp.where`` masks. The fall is the rise reflected: its n-th derivative
+        carries ``(-1)^n``."""
         order = int(order)
         t = xp.asarray(t)
         t_r, t_g = self.t_rise, self.t_g
         up = self._ramp_derivs(t, order, xp)
         down = self._ramp_derivs(t_g - t, order, xp)
-        # Closed on the left at t_r, so the ramp -- not the plateau -- owns the
-        # junction. With no plateau (t_rise = t_g/2) that point is the bell's peak,
-        # where derivatives above order m are genuinely NON-zero; handing it to the
-        # plateau branch would zero them and silently break the m=1/Hann identity.
+        # The ramp, not the plateau, owns the junction t_r: with no plateau it is the
+        # bell's peak, where derivatives above order m are NON-zero (m=1/Hann identity).
         rising = t <= t_r
         falling = t >= (t_g - t_r)
         support = self._support(t, xp)
@@ -378,11 +312,7 @@ class SinePowerRamp(Envelope):
         return self.jet_at(t, 1, xp)[1]
 
     def area(self) -> float:
-        """Closed form: two ramps plus the plateau.
-
-        Exact rather than quadrature because ``set_pump(normalize_iswap=...)``
-        divides by this to calibrate the pi/2 rotation.
-        """
+        """Closed form (two ramps plus the plateau): ``normalize_iswap`` divides by it."""
         k, W, w, t_r = self._k, self._W, self._w, self.t_rise
         zero = np.abs(k) < 1e-12
         k_safe = np.where(zero, 1.0, k)
@@ -404,24 +334,11 @@ class IQFourierEnvelope(Envelope):
 
     with :math:`S(t) = \tfrac12[1 - \cos(2\pi t/t_g)]` the Hann shape function.
 
-    This is the ansatz container used by the CRAB / JOPT optimizers in
-    ``grape.py``. Two properties make it safe to drop into the existing pump
-    machinery:
-
-    * ``value`` returns a COMPLEX amplitude. ``ZhouCoupler._eta`` already treats
-      the envelope value as complex (it has to, for the DRAG quadrature), so the
-      full QuTiP path -- ``to_qutip_hamiltonian`` -> ``propagator_columns`` /
-      ``iswap_fidelity`` -- evaluates an arbitrary shaped pulse with no changes.
-      That means an optimizer can use the compiled QuTiP solver as its black box
-      instead of a reduced model.
-    * With all coefficients zero it reduces EXACTLY to
-      :class:`RaisedCosine`, so ``set_pump(..., normalize_iswap=...)`` performed
-      with a raised cosine stays valid, ``peak_eta`` is unchanged, and the
-      optimizer starts from the sweep's baseline gate.
-
-    The Hann prefactor enforces :math:`\eta(0) = \eta(t_g) = 0` for ANY
-    coefficients, so the optimizer cannot produce a pulse with a discontinuous
-    turn-on -- the usual CRAB "shape function" role.
+    The CRAB / JOPT ansatz of ``grape.py``. ``value`` is COMPLEX, which the full
+    QuTiP path already handles, so an optimizer can use the exact solver as its black
+    box. With all coefficients zero it is EXACTLY :class:`RaisedCosine` (same
+    normalization and ``peak_eta``), and the Hann prefactor forces
+    :math:`\eta(0) = \eta(t_g) = 0` for ANY coefficients.
 
     Parameters
     ----------
@@ -430,18 +347,15 @@ class IQFourierEnvelope(Envelope):
     t_g : float
         Gate duration (ns).
     freqs : array_like, optional
-        Angular frequencies :math:`\omega_k` (rad/ns) of the basis. For CRAB these
-        are randomized about the harmonics; ``None`` (default) gives no
-        modulation, i.e. a plain raised cosine.
+        Basis angular frequencies :math:`\omega_k` (rad/ns); ``None`` means no
+        modulation (a plain raised cosine).
     sin_I, sin_Q, cos_I, cos_Q : array_like, optional
-        Coefficients of the sin/cos basis in the in-phase (I) and quadrature (Q)
-        components. Each must match ``freqs`` in length; omitted arrays are zero.
+        In-phase (I) / quadrature (Q) coefficients of the sin/cos basis, each the
+        length of ``freqs``; omitted arrays are zero.
 
     Notes
     -----
-    ``area`` integrates the REAL part, matching the leading-order iSWAP
-    normalization convention (the in-phase component is what drives the swap);
-    with zero coefficients it is exactly ``amp * t_g / 2``.
+    ``area`` integrates the REAL part (the in-phase component drives the swap).
     """
 
     is_complex = True
@@ -467,12 +381,7 @@ class IQFourierEnvelope(Envelope):
 
     # -- the modulation factor and its derivative --------------------------
     def _basis(self, t: Any, xp: Any):
-        """sin/cos of every basis frequency, broadcast over `t`.
-
-        ``t[..., None] * freqs`` puts the basis on a trailing axis so a scalar and
-        an array of times take the same code path; the contractions below then sum
-        over that axis.
-        """
+        """sin/cos of every basis frequency on a trailing axis, broadcast over `t`."""
         arg = xp.asarray(t)[..., None] * self.freqs
         return xp.sin(arg), xp.cos(arg)
 
@@ -481,8 +390,7 @@ class IQFourierEnvelope(Envelope):
         if self.freqs.size == 0:
             return 1.0 + 0.0j
         s, c = self._basis(t, xp)
-        # sum over the trailing basis axis -- NOT float(), which would concretize
-        # a tracer and break the JAX gradient path.
+        # xp.sum over the basis axis, never float() (that would concretize a tracer)
         return ((1.0 + xp.sum(s * self.sin_I, axis=-1) + xp.sum(c * self.cos_I, axis=-1))
                 + 1j * (xp.sum(s * self.sin_Q, axis=-1) + xp.sum(c * self.cos_Q, axis=-1)))
 
@@ -541,12 +449,8 @@ class IQFourierEnvelope(Envelope):
         return out
 
     def jet_at(self, t: Any, order: int, xp: Any = np) -> tuple:
-        """Closed-form derivatives to any order, by Leibniz over ``S(t) M(t)``.
-
-        Both factors are finite trigonometric polynomials, so each is differentiated
-        by phase-shifting its arguments; the product rule is then the plain binomial
-        sum. At order 1 this reproduces :meth:`deriv_at` exactly.
-        """
+        """Closed-form derivatives to any order, by Leibniz over ``S(t) M(t)`` (both
+        trigonometric polynomials, differentiated by phase shifts)."""
         order = int(order)
         S = self._shape_derivs(t, order, xp)
         M = self._mod_derivs(t, order, xp)
@@ -587,11 +491,8 @@ class IQFourierEnvelope(Envelope):
 # Frequency chirp
 # ===========================================================================
 def _legendre_stack(u: Any, degree: int, xp: Any):
-    """Shifted-Legendre values P_0(u) .. P_degree(u), by the standard recurrence.
-
-    Built with the recurrence rather than ``numpy.polynomial`` so the same code
-    runs under ``jax.numpy`` (and so it vectorizes over an array of `u`).
-    """
+    """Legendre values P_0(u) .. P_degree(u) by the recurrence (``xp``-generic, unlike
+    ``numpy.polynomial``)."""
     ones = xp.ones_like(u)
     out = [ones]
     if degree >= 1:
@@ -605,14 +506,10 @@ def _legendre_stack(u: Any, degree: int, xp: Any):
 def _legendre_deriv_stack(u: Any, degree: int, order: int, xp: Any):
     """``P[m][k] = d^m P_k / du^m`` for m <= `order`, k <= `degree`.
 
-    The same recurrence as :func:`_legendre_stack`, differentiated m times in place.
-    Since ``u P_k`` is a product with a LINEAR factor, Leibniz truncates after two
-    terms::
+    The value recurrence differentiated m times; ``u`` is LINEAR, so Leibniz stops
+    after two terms::
 
         (k+1) P_{k+1}^(m) = (2k+1) [ u P_k^(m) + m P_k^(m-1) ] - k P_{k-1}^(m)
-
-    Used by :meth:`Chirp.detuning_jet`; kept here beside the value recurrence so the
-    two cannot drift.
     """
     zero = 0.0 * u
     ones = xp.ones_like(u)
@@ -639,26 +536,16 @@ class Chirp:
         \delta(t) = 2\pi \sum_k c_k P_k(u) ,\qquad
         \Phi(t) = \int_0^t \delta(t')\,dt'
 
-    The Legendre basis is used (rather than raw powers of `t`) because its terms
-    are orthogonal over the gate, which keeps an optimizer's parameters from
-    fighting each other: `c_0` is the mean detuning, `c_1` the linear chirp rate,
-    and higher terms add structure without shifting the mean.
-
-    :math:`\Phi` is obtained in CLOSED FORM, not by quadrature, from
-    :math:`\int_{-1}^{u} P_k = (P_{k+1} - P_{k-1})/(2k+1)` for k >= 1 and
-    :math:`\int_{-1}^{u} P_0 = u + 1`:
+    Legendre terms are orthogonal over the gate, so optimizer parameters do not fight:
+    `c_0` is the mean detuning, `c_1` the linear rate. :math:`\Phi` is in CLOSED FORM
+    via :math:`\int_{-1}^{u} P_k = (P_{k+1} - P_{k-1})/(2k+1)` (k >= 1):
 
     .. math::
         \Phi(t) = \pi t_g \Big[ c_0 (u+1)
                   + \sum_{k\ge 1} c_k \frac{P_{k+1}(u) - P_{k-1}(u)}{2k+1} \Big]
 
-    Special cases worth knowing:
-
-    * ``coeffs_GHz = [c0]`` is a CONSTANT detuning, and is exactly equivalent to
-      building the tone at ``w_p_GHz + c0`` (see the module docstring). This is a
-      free regression test and is asserted in ``test_physics``.
-    * ``coeffs_GHz = [c0, c1]`` is a linear chirp sweeping from ``c0 - c1`` to
-      ``c0 + c1`` GHz across the gate.
+    ``[c0]`` is exactly a retune to ``w_p_GHz + c0`` (asserted in ``test_physics``);
+    ``[c0, c1]`` sweeps linearly from ``c0 - c1`` to ``c0 + c1`` GHz.
 
     Parameters
     ----------
@@ -670,13 +557,9 @@ class Chirp:
 
     Notes
     -----
-    A chirp is a pure PHASE: it leaves ``|eta(t)|`` untouched. Therefore it does
-    not change ``Envelope.area()``, the ``normalize_iswap`` amplitude calibration,
-    or ``peak_eta``. Do not "fix" those to account for it.
-
-    `t` is clipped to [0, t_g] before evaluation. The envelope is zero outside the
-    gate so this changes no observable, but it stops a high-degree polynomial from
-    reporting a meaningless multi-thousand-radian phase just outside the support.
+    A chirp is a pure PHASE: it does not change ``Envelope.area()``,
+    ``normalize_iswap`` or ``peak_eta``. `t` is clipped to [0, t_g] (the envelope is
+    zero outside), so a high-degree polynomial cannot blow up just past the support.
     """
 
     def __init__(self, coeffs_GHz: Sequence[float], t_g: float) -> None:
@@ -708,19 +591,13 @@ class Chirp:
     def detuning_jet(self, t: Any, order: int, xp: Any = np) -> tuple:
         """``delta, delta', ..., delta^(order)`` at time(s) `t`, in rad/ns^(1+m).
 
-        Recursive DRAG applied verbatim (Eq. 4 of Li/Calarco/Motzoi) differentiates
-        ``Omega^n / Delta(t)`` as a whole, so on a CHIRPED tone it needs derivatives
-        of the beat, not just its value. Those did not exist before this method:
-        ``Delta(t) = Delta_0 - k delta(t)``, so ``Delta^(m) = -k delta^(m)``.
-
-        With ``u = 2t/t_g - 1`` the chain rule gives
+        Recursive DRAG on a chirped tone needs derivatives of the beat
+        ``Delta(t) = Delta_0 - k delta(t)``. By the chain rule
         ``d^m delta/dt^m = 2 pi (2/t_g)^m sum_k c_k P_k^(m)(u)``.
 
-        Outside the gate :meth:`_u` CLIPS, so ``delta`` is constant there and every
-        derivative is genuinely zero. The support mask below states that explicitly
-        rather than leaning on ``xp.clip``'s subgradient, which is backend-dependent
-        at the boundary. The 0th entry is left unmasked so it is exactly
-        :meth:`detuning` -- changing that would move the DRAG beat outside the gate.
+        :meth:`_u` clips outside the gate, so the derivatives there are zero; the
+        support mask states that explicitly (``xp.clip``'s subgradient is
+        backend-dependent). The 0th entry stays unmasked so it equals :meth:`detuning`.
         """
         order = int(order)
         n = self.coeffs_GHz.size
@@ -731,9 +608,7 @@ class Chirp:
         P = _legendre_deriv_stack(u, n - 1, order, xp)
         support = xp.where((t >= 0.0) & (t <= self.t_g), 1.0, 0.0)
         du_dt = 2.0 / self.t_g
-        # order 0 from the stack we already have -- calling self.detuning() here would
-        # rebuild the whole Legendre recurrence a second time, which showed up as ~10x
-        # redundant work in the scalar solver callback.
+        # order 0 from this stack, not self.detuning() (which rebuilds the recurrence)
         out = [TWO_PI * sum(c * P[0][k] for k, c in enumerate(self.coeffs_GHz))]
         for m in range(1, order + 1):
             total = sum(c * P[m][k] for k, c in enumerate(self.coeffs_GHz))
@@ -773,23 +648,17 @@ class Chirp:
 
 
 def make_chirp(coeffs_GHz: Optional[Sequence[float]], t_g: float) -> Optional[Chirp]:
-    """Build a :class:`Chirp`, or None when there is nothing to apply.
-
-    Returning None for an absent/zero chirp keeps the un-chirped solver path
-    byte-identical to before this feature existed (``_eta`` skips the phase
-    entirely), which is what makes the "chirp is inert when unset" regression
-    test meaningful.
-    """
+    """Build a :class:`Chirp`, or None for an absent/zero chirp (so ``_eta`` skips the
+    phase entirely and the un-chirped path stays byte-identical)."""
     if coeffs_GHz is None:
         return None
     chirp = Chirp(coeffs_GHz, t_g)
     return None if chirp.is_trivial else chirp
 
 
-#: Envelope kinds addressable by name, for ``config["envelope"]`` and
-#: ``find_stark_resonance.scan(shape=...)``. The Hann default is deliberately
-#: unchanged: ``sine_power`` is opt-in, because switching the base shape moves the
-#: amplitude/area algebra the tune-up is built on (see ``tune_up.area_factor``).
+#: Envelope kinds addressable by name (``config["envelope"]``). Hann stays the
+#: default; ``sine_power`` is opt-in because it moves the tune-up's area algebra
+#: (``tune_up.area_factor``).
 ENVELOPE_KINDS = {
     "raised_cosine": RaisedCosine,
     "constant": ConstantPulse,
@@ -800,28 +669,19 @@ ENVELOPE_KINDS = {
 def envelope_from_config(config: Dict[str, Any], t_g: float, amp: float = 1.0):
     """The envelope THIS device is configured to play, at a real gate length.
 
-    Every probe that claims to be "the actual gate pulse" has to be built from the
-    configured shape, not from a hardcoded one. ``tune_up.chirp_from_measured_shift``
-    already reads the envelope off the config for exactly this reason -- selecting a
-    different base shape (which recursive DRAG requires past one channel, see
-    :class:`SinePowerRamp`) must not leave a calibration tracking a pulse the solver
-    is not playing. This is the same rule for the chevron probes.
+    Any probe of "the actual gate pulse" must use the configured shape, not a
+    hardcoded one, or a calibration ends up tracking a pulse the solver is not playing.
 
     Parameters
     ----------
     config : dict
         Merged device configuration. Reads ``envelope`` (default
         ``"raised_cosine"``) and, for ``sine_power``, ``envelope_m`` and
-        ``envelope_rise_frac``.
+        ``envelope_rise_frac`` (a FRACTION of `t_g`, so the shape scales with it).
     t_g : float
-        Gate duration (ns). ``envelope_rise_frac`` is a FRACTION of it, which is what
-        keeps the shape -- and hence the chirp built from it -- independent of `t_g`.
+        Gate duration (ns).
     amp : float, default 1.0
         Peak amplitude before any iSWAP normalization.
-
-    Returns
-    -------
-    Envelope
     """
     kind = str(config.get("envelope", "raised_cosine"))
     cls = ENVELOPE_KINDS.get(kind)
@@ -841,12 +701,9 @@ def envelope_from_config(config: Dict[str, Any], t_g: float, amp: float = 1.0):
 class DragChannel:
     """One off-resonant process for recursive DRAG to suppress.
 
-    See :mod:`snail_solver.drag`. A tone carrying several of these applies one
-    substitution ``F^(n_photon)_{Delta(t)}`` per channel, composed innermost-first.
-
-    Frozen so it can be carried as STATIC data in a ``jax_engine`` pulse spec (it
-    controls unrolled Python loops and must never be traced) and hashed as a jit
-    static argument.
+    See :mod:`snail_solver.drag`: a tone applies one substitution
+    ``F^(n_photon)_{Delta(t)}`` per channel, innermost-first. Frozen so it can be
+    STATIC (hashable, never traced) data in a ``jax_engine`` pulse spec.
 
     Parameters
     ----------
@@ -854,48 +711,31 @@ class DragChannel:
         ``Delta_0``, the static beat of the suppressed process.
     n_pump : int, default 1
         Pump quanta the process carries, i.e. how its beat MOVES under a chirp:
-        ``Delta(t) = 2 pi beat_GHz - n_pump delta(t)``. This is the codebase's
-        long-standing ``drag_n_pump``; see ``sweep_common._PUMP_QUANTA``.
+        ``Delta(t) = 2 pi beat_GHz - n_pump delta(t)`` (``drag_n_pump``; see
+        ``sweep_common._PUMP_QUANTA``).
     n_photon : int, default 1
-        The paper's ``n`` in ``F^(n)`` -- the exponent the drive is raised to.
-
-        Deliberately SEPARATE from `n_pump` even though the two are the same
-        physical integer for every channel this device produces. They enter in
-        different places (``n_pump`` in the denominator, ``n_photon`` as a numerator
-        exponent), and fusing them would silently promote every existing
-        ``drag_n_pump=2`` call site -- the subharmonic sweeps, ``--drag-n-pump 2`` --
-        from first-order to second-order DRAG. :meth:`from_collision` sets both when
-        that IS what you want.
+        The paper's ``n`` in ``F^(n)``, the exponent the drive is raised to. Kept
+        SEPARATE from `n_pump` (same integer physically, but different places in the
+        formula): fusing them would silently promote every ``drag_n_pump=2`` call site
+        to second-order DRAG. :meth:`from_collision` sets both.
     mode : str, default "perturbative"
         ``"perturbative"`` is Eq. (4). ``"givens"`` (Eq. 7) is not implemented.
     quotient_rule : bool, default False
         Whether ``d/dt`` acts on ``Omega^n / Delta`` as a whole (Eq. 4 verbatim) or
-        only on ``Omega^n``. False reproduces this codebase's historical first-order
-        arithmetic bit-for-bit; on an UNCHIRPED tone the two are identical anyway
-        (``Delta' = 0``).
+        only on ``Omega^n``. False reproduces the historical first-order arithmetic
+        bit-for-bit; on an UNCHIRPED tone the two coincide (``Delta' = 0``).
     kappa : float, optional
-        Coupling-per-unit-drive ``g = kappa Omega`` of this process. Required only by
-        ``mode="givens"``.
+        Coupling-per-unit-drive ``g = kappa Omega``; needed only by ``mode="givens"``.
     stark_scale : float, default 0.0
-        This channel's OWN AC-Stark shift, as a multiple of the chirp
-        (``spectator_audit.stark_scales``). Default 0.0 keeps the historical
-        behaviour, a static beat.
-
-        The chirp is the target transition's measured Stark curve, and every other
-        transition shifts at the same leading order in the same envelope, so a
-        channel's shift is proportional to it and can be tracked by reusing the curve
-        the pulse already carries::
+        This channel's OWN AC-Stark shift as a multiple of the chirp (the chirp is the
+        target's Stark curve; ``spectator_audit.stark_scales``)::
 
             Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)
 
-        It matters: measured against a wide chevron survey, the ``|2>``-involving
-        channels shift 6-10x HARDER than the target (``stark_scale`` ~ +10 for
-        ``a|1>->|2>``, ~ -8 for ``b|1>->|2>`` -- opposite signs at the same operating
-        point, so no single global factor can stand in for them). Against detunings of
-        100-200 MHz that is a 15-30% error in the DRAG denominator, concentrated on
-        exactly the marginal channels where ``g/|Delta|`` is largest. The subharmonic
-        channels, by contrast, barely move (~ -0.2), which is why a static beat worked
-        as well as it did for the channels that carry most of the correction.
+        Measured: ``|2>``-involving channels shift 6-10x harder than the target, with
+        opposite signs (~ +10 for ``a|1>->|2>``, ~ -8 for ``b|1>->|2>``) -- a 15-30%
+        error in the DRAG denominator if ignored. Subharmonic channels barely move
+        (~ -0.2). 0.0 means a static beat.
     """
 
     beat_GHz: float
@@ -908,12 +748,8 @@ class DragChannel:
 
     @classmethod
     def from_collision(cls, beat_GHz: float, kind: str, **kw: Any) -> "DragChannel":
-        """Channel for a collision labelled by ``sweep_common._nearest_collision``.
-
-        Sets BOTH `n_pump` and `n_photon` from the collision's pump-quanta count, and
-        turns the quotient rule on -- i.e. the paper's scheme applied verbatim. This
-        is the auto-fill path; construct :class:`DragChannel` directly for full control.
-        """
+        """Channel for a collision labelled by ``sweep_common._nearest_collision``: the
+        paper's scheme verbatim (`n_pump` = `n_photon` = pump quanta, quotient rule on)."""
         from snail_solver.sweep_common import _PUMP_QUANTA
         k = int(_PUMP_QUANTA.get(str(kind), 1))
         kw.setdefault("quotient_rule", True)
@@ -930,58 +766,41 @@ class PumpTone:
     Parameters
     ----------
     w_p_GHz : float
-        Pump frequency f_p (GHz); the dressed amplitude oscillates at this rate
-        inside X(t). This is the FIXED reference carrier -- any time dependence
-        of the frequency belongs in `chirp`, not here.
+        FIXED reference carrier f_p (GHz); any frequency time dependence belongs in
+        `chirp`.
     envelope : Envelope
         Shape eps_p(t). Its `amp` carries |eps_p| (rad/ns), or directly the
         dimensionless displaced amplitude |eta_p| when `is_eta` is True.
     phi_p : float, default 0.0
         Pump phase (rad); enters as eta_p -> |eta_p| e^{i phi_p}.
     is_eta : bool, default True
-        If True the envelope amplitude is already eta_p; if False it is the bare
-        pump eps_p and eta_p is computed from eta = 2 w_p/(w_p^2 - w_s^2) eps
-        (Eq. 50).
+        If False the envelope is the bare pump eps_p and
+        eta = 2 w_p/(w_p^2 - w_s^2) eps (Eq. 50).
     drag : bool, default False
-        If True, add the first-order DRAG quadrature (Motzoi et al., PRL 103,
-        110501 (2009)): eta(t) -> eta(t) - i d/dt[eta(t)] / delta. The derivative
-        quadrature cancels, to leading order, the adiabatic excitation of a
-        process detuned by `delta_drag_GHz`. It suppresses an OFF-resonant
-        spectator and is singular as the detuning -> 0 (an on-resonant collision
-        needs frequency allocation, not DRAG).
+        Add the first-order DRAG quadrature (Motzoi et al., PRL 103, 110501 (2009)),
+        eta -> eta - i (d eta/dt) / Delta, cancelling to leading order the excitation
+        of an OFF-resonant process detuned by `delta_drag_GHz` (singular as it -> 0).
     delta_drag_GHz : float, optional
-        STATIC beat Delta_0 (GHz) of the targeted off-resonant process; the
-        quadrature is -d eta/dt / (2 pi Delta(t)). Required if `drag`. On a chirped
-        tone this is only the t=0 value of the beat -- see `drag_n_pump`.
+        STATIC beat Delta_0 (GHz) of that process; required if `drag`.
     drag_n_pump : int, default 1
-        Number of PUMP QUANTA the suppressed process carries. On a CHIRPED tone the
-        pump sits at w_p + delta(t), so the beat is time-dependent::
-
-            Delta(t) = Delta_0 - drag_n_pump * delta(t)
-
-        matching this codebase's beat convention ``beat = separation - k w_p``
-        (``sweep_common._nearest_collision``): k = 1 for a one-pump process, 2 for a
-        subharmonic (two-pump) one, and **0 for a static, pump-independent beat**,
-        which a chirp must not move. Irrelevant without a chirp (delta = 0), so the
-        default leaves every un-chirped tone byte-identical.
+        PUMP QUANTA the suppressed process carries. On a chirped tone
+        ``Delta(t) = Delta_0 - drag_n_pump * delta(t)``, matching the beat convention
+        ``beat = separation - k w_p`` (``sweep_common._nearest_collision``): 1 for a
+        one-pump process, 2 for a subharmonic, **0 for a pump-independent beat**.
+        Irrelevant without a chirp.
     chirp : Chirp, optional
-        Time-dependent offset delta(t) of the carrier. Applied as the phase
-        e^{-i Phi(t)} on the pump amplitude AFTER the DRAG quadrature -- see
-        `ZhouCoupler._eta`. None (default) means an un-chirped tone.
+        Carrier offset delta(t), applied as ``e^{-i Phi(t)}`` AFTER the DRAG
+        quadrature (see `ZhouCoupler._eta_at`). None means un-chirped.
 
     Notes
     -----
-    Sign conventions differ between the two phases here, for historical reasons:
-    `phi_p` enters as ``e^{+i phi_p}`` while the chirp enters as ``e^{-i Phi(t)}``,
-    which is the sign that matches the ``e^{-i w_p t}`` carrier in X(t). A constant
-    chirp `c0` therefore shifts the carrier to ``w_p + c0``, not ``w_p - c0``.
+    `phi_p` enters as ``e^{+i phi_p}`` but the chirp as ``e^{-i Phi(t)}`` (matching
+    the ``e^{-i w_p t}`` carrier), so a constant chirp `c0` retunes to ``w_p + c0``.
 
-    A chirp interacts with DRAG in exactly ONE place: the denominator. The quadrature
-    still differentiates the BASE envelope (the chirp phase is absorbed into the frame
-    rotating at the instantaneous pump frequency, so only the amplitude derivative
-    enters), but the beat it divides by moves with the pump. Getting this wrong is
-    silent: it simply mis-weights the quadrature, most severely near a collision where
-    Delta_0 is small and DRAG matters most.
+    A chirp touches DRAG only in the DENOMINATOR: the quadrature differentiates the
+    BASE envelope (the chirp phase is absorbed into the instantaneous frame), but the
+    beat moves with the pump. Getting this wrong silently mis-weights the quadrature,
+    worst near a collision where DRAG matters most.
     """
 
     w_p_GHz: float
@@ -998,14 +817,10 @@ class PumpTone:
     def drag_channels_resolved(self) -> tuple:
         """The active :class:`DragChannel` list, innermost-first; ``()`` when DRAG is off.
 
-        Resolution order: an explicit `drag_channels` list wins; otherwise the legacy
-        scalar ``drag``/``delta_drag_GHz``/``drag_n_pump`` fields are read as the
-        one-channel shorthand; otherwise DRAG is off.
-
-        Returning an EMPTY tuple for an inert tone (rather than a one-element list
-        with a zero beat) is deliberate, and mirrors :func:`make_chirp` returning None
-        for an absent chirp: it lets the solver skip the correction entirely, which is
-        what keeps the DRAG-off path byte-identical to before this feature existed.
+        An explicit `drag_channels` wins; otherwise the scalar ``drag`` /
+        ``delta_drag_GHz`` / ``drag_n_pump`` fields are the one-channel shorthand.
+        The EMPTY tuple (like :func:`make_chirp`'s None) lets the solver skip DRAG
+        entirely, keeping the DRAG-off path byte-identical.
         """
         from snail_solver.drag import order_channels
         if self.drag_channels:
@@ -1018,28 +833,16 @@ class PumpTone:
 
     @property
     def is_legacy_drag(self) -> bool:
-        """True when the active DRAG is exactly the historical first-order form.
-
-        One perturbative channel, single-photon, no quotient rule -- the case the
-        solver evaluates through its closed-form fast path rather than through jet
-        arithmetic, so that every pre-existing result stays bit-identical.
-        """
+        """True for exactly one perturbative, single-photon channel without the
+        quotient rule: the case the solver evaluates by its closed form, not jets."""
         chs = self.drag_channels_resolved()
         return (len(chs) == 1 and chs[0].n_photon == 1
                 and chs[0].mode == "perturbative" and not chs[0].quotient_rule)
 
     def channel_detuning(self, ch: DragChannel, t: Any, xp: Any = np) -> Any:
-        """Instantaneous beat ``Delta_j(t)`` of one channel, in rad/ns.
-
-        ``Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)``. Two distinct
-        effects share the chirp's shape and so collapse into one coefficient:
-
-        * ``-n_pump delta(t)`` -- the PUMP moved, and this process carries `n_pump`
-          pump quanta. Always present.
-        * ``+stark_scale delta(t)`` -- the channel's OWN levels Stark-shift, and the
-          chirp is the target transition's Stark curve, so this channel's shift is a
-          multiple of it (:attr:`DragChannel.stark_scale`). Zero by default.
-        """
+        """Instantaneous beat ``Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)``
+        of one channel, rad/ns: the pump moved (``-n_pump``) and the channel's own
+        levels Stark-shift (:attr:`DragChannel.stark_scale`)."""
         detuning = float(ch.beat_GHz) * TWO_PI
         coeff = float(ch.stark_scale) - float(ch.n_pump)
         if self.chirp is None or coeff == 0.0:
@@ -1048,14 +851,8 @@ class PumpTone:
 
     def channel_detuning_jet(self, ch: DragChannel, t: Any, order: int,
                              xp: Any = np) -> tuple:
-        """``Delta_j`` and its derivatives to `order`, in rad/ns.
-
-        ``Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)``, so every
-        derivative still comes from the chirp alone:
-        ``Delta_j^(m) = (stark_scale - n_pump) delta^(m)`` for m >= 1. Tracking the
-        channel's own Stark shift therefore costs the recursion NOTHING -- it reuses
-        the chirp jet the pulse already computes, with a different coefficient.
-        """
+        """``Delta_j`` and its derivatives to `order`, rad/ns:
+        ``Delta_j^(m) = (stark_scale - n_pump) delta^(m)`` for m >= 1."""
         value = self.channel_detuning(ch, t, xp)
         order = int(order)
         coeff = float(ch.stark_scale) - float(ch.n_pump)
@@ -1066,27 +863,24 @@ class PumpTone:
 
     def channel_detuning_jets(self, channels: Sequence[DragChannel], t: Any,
                               order: int, xp: Any = np) -> list:
-        """``Delta_j`` jets for every channel, sharing ONE chirp evaluation.
-
-        Every channel divides the same ``delta(t)`` by a different ``n_pump``, so
-        calling :meth:`channel_detuning_jet` per channel rebuilds the whole Legendre
-        recurrence once per channel. That is the dominant cost of the scalar solver
-        callback (the recurrence ran 10x more often than necessary in a 3-channel
-        profile), and it is pure duplication.
-        """
+        """``Delta_j`` jets for every channel, sharing ONE chirp evaluation (the
+        Legendre recurrence dominates the scalar solver callback). Uses
+        ``-n_pump delta^(m)`` only; ``stark_scale`` is not applied here."""
         order = int(order)
         chs = tuple(channels)
         zero = 0.0 * xp.asarray(t)
+
+        def static(c):
+            return (float(c.beat_GHz) * TWO_PI + zero,) + tuple(zero for _ in range(order))
+
         if self.chirp is None:
-            return [(float(c.beat_GHz) * TWO_PI + zero,)
-                    + tuple(zero for _ in range(order)) for c in chs]
+            return [static(c) for c in chs]
         dj = self.chirp.detuning_jet(t, order, xp)          # once, not once per channel
         out = []
         for c in chs:
             k = int(c.n_pump)
             if not k:                                        # static, pump-independent
-                out.append((float(c.beat_GHz) * TWO_PI + zero,)
-                           + tuple(zero for _ in range(order)))
+                out.append(static(c))
             else:
                 out.append((float(c.beat_GHz) * TWO_PI - k * dj[0],)
                            + tuple(-k * dj[m] for m in range(1, order + 1)))
@@ -1094,30 +888,19 @@ class PumpTone:
 
     # -- the time-dependent DRAG beat ---------------------------------------
     def drag_detuning(self, t: Any, xp: Any = np) -> Any:
-        """Instantaneous DRAG beat Delta(t) in rad/ns; xp-generic and trace-clean.
-
-        ``Delta_0 - drag_n_pump * delta(t)``. Returns the constant Delta_0 when the
-        tone is un-chirped or ``drag_n_pump == 0``.
-        """
+        """Instantaneous DRAG beat ``Delta_0 - drag_n_pump * delta(t)`` in rad/ns
+        (xp-generic); constant when un-chirped or ``drag_n_pump == 0``."""
         detuning = float(self.delta_drag_GHz or 0.0) * TWO_PI
         if self.chirp is None or not self.drag_n_pump:
             return detuning + 0.0 * xp.asarray(t)
         return detuning - self.drag_n_pump * self.chirp.detuning(t, xp)
 
     def drag_detuning_floor(self, n: int = 257) -> float:
-        """min_t |Delta(t)| over the gate -- the singularity guard.
+        """min_t |Delta_j(t)| over the gate and ALL channels -- the singularity guard.
 
-        A chirp can drive Delta(t) through zero DURING the pulse even when Delta_0 is
-        comfortably large, which makes the quadrature diverge mid-gate. That failure
-        is invisible in Delta_0 alone, so callers that build a tone should check this
-        rather than ``abs(delta_drag_GHz)``.
-
-        Returns ``inf`` when DRAG is off (nothing to guard).
-
-        With several channels this is the min over ALL of them -- one collapsing beat
-        is enough to break the pulse. :meth:`drag_detuning_floors` gives the
-        per-channel breakdown, which is what an error message needs in order to name
-        the offender.
+        A chirp can drive a beat through zero mid-gate even when Delta_0 is large, so
+        check this rather than ``abs(delta_drag_GHz)``. ``inf`` when DRAG is off;
+        :meth:`drag_detuning_floors` gives the per-channel breakdown.
         """
         floors = self.drag_detuning_floors(n)
         return min(floors) if floors else float("inf")

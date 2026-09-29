@@ -29,17 +29,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-#: keys that describe WHERE a point was calibrated (used for validation)
-#: `chirp_coeffs_GHz` appears in BOTH tuples on purpose: a chirp is a setting the
-#: point applies, and it is also context, since an amplitude/offset calibrated under
-#: one chirp does not transfer to another. This tuple is used for DISPLAY only --
-#: `check_context` builds its own comparison set, and validates the (list-valued)
-#: chirp separately from the scalar keys.
+#: keys that describe WHERE a point was calibrated (DISPLAY only; `check_context`
+#: builds its own set). The chirp is in both tuples: a setting the point applies, and
+#: context, since a calibration under one chirp does not transfer to another.
 CONTEXT_KEYS = ("wa_GHz", "wb_GHz", "t_g_ns", "spec_abs_GHz", "drag_beat_GHz",
                 "chirp_coeffs_GHz")
-#: keys that the point actually SETS on a run
-#: `chirp_coeffs_GHz` is a list, not a scalar -- a calibrated chirp is part of the
-#: operating point exactly like the constant pump offset it generalizes.
+#: keys that the point actually SETS on a run (the chirp is list-valued)
 SETTING_KEYS = ("amp_scale", "wp_offset_GHz", "t_g_ns", "chirp_coeffs_GHz")
 
 
@@ -49,25 +44,8 @@ def list_points(config: Dict[str, Any]) -> List[str]:
 
 
 def get_point(config: Dict[str, Any], name: str) -> Dict[str, Any]:
-    """Fetch one operating point by name from a loaded device config.
-
-    Parameters
-    ----------
-    config : dict
-        Merged device configuration (from ``device_utils.load_device``).
-    name : str
-        Operating-point name.
-
-    Returns
-    -------
-    dict
-        The stored record.
-
-    Raises
-    ------
-    KeyError
-        If no point of that name exists (the message lists what is available).
-    """
+    """Copy of the operating point `name` from a loaded device config; KeyError
+    (listing what is available) if it does not exist."""
     points = config.get("operating_points") or {}
     if name not in points:
         raise KeyError(f"no operating point {name!r} in device "
@@ -77,26 +55,11 @@ def get_point(config: Dict[str, Any], name: str) -> Dict[str, Any]:
 
 def save_point(device_path: str, name: str, record: Dict[str, Any],
                overwrite: bool = False) -> Dict[str, Any]:
-    """Write an operating point into a device JSON file, in place.
+    """Write `record` into the device JSON under `name`, in place (atomically), and
+    return it with ``created``/``source`` filled in.
 
-    Only the device file's own keys are touched (the DEFAULT_CONFIG merge that
-    ``load_device`` performs is not written back).
-
-    Parameters
-    ----------
-    device_path : str
-        Path to the device JSON.
-    name : str
-        Name to store the point under.
-    record : dict
-        The point (amp_scale / wp_offset_GHz plus context and provenance).
-    overwrite : bool, default False
-        Allow replacing an existing point of the same name.
-
-    Returns
-    -------
-    dict
-        The record as written (with ``created`` and ``source`` filled in).
+    Only the file's own keys are written (not the DEFAULT_CONFIG merge that
+    ``load_device`` performs). Raises SystemExit if `name` exists and not `overwrite`.
     """
     with open(device_path) as fh:
         raw = json.load(fh)
@@ -120,20 +83,9 @@ def check_context(point: Dict[str, Any], config: Dict[str, Any],
                   wa_GHz: Optional[float] = None, wb_GHz: Optional[float] = None,
                   spec_abs_GHz: Optional[float] = None,
                   tol_GHz: float = 1e-6, tol_ns: float = 1e-3) -> List[str]:
-    """Return a list of human-readable context mismatches (empty == consistent).
-
-    Parameters
-    ----------
-    point : dict
-        A stored operating point.
-    config : dict
-        The configuration the point is about to be applied to.
-    t_g : float, optional
-        Gate duration of the run (ns); defaults to ``config['t_g_ns']``.
-    wa_GHz, wb_GHz, spec_abs_GHz : float, optional
-        Run context overriding the config values (e.g. a target sweep's swept w_b).
-    tol_GHz, tol_ns : float
-        Comparison tolerances.
+    """Human-readable context mismatches between `point` and the run (empty ==
+    consistent). The run context is `config`, overridden by ``t_g`` / ``wa_GHz`` /
+    ``wb_GHz`` / ``spec_abs_GHz`` (e.g. a target sweep's swept w_b).
     """
     pair = list(config.get("qubit_freqs_GHz", [None, None]))
     run = {
@@ -151,14 +103,9 @@ def check_context(point: Dict[str, Any], config: Dict[str, Any],
         if abs(float(want) - float(value)) > tol:
             issues.append(f"{key}: point={want} vs run={value}")
 
-    # The chirp is LIST-valued, so it cannot join the scalar loop above -- float() on
-    # a list raises. Compare zero-padded, since [0.01] and [0.01, 0.0] are the same
-    # chirp.
-    #
-    # The `if run_chirp` guard is load-bearing: `check_context` runs BEFORE
-    # `apply_point`, so an empty run chirp means "unset, the point is about to supply
-    # it" -- matching apply_point's `is not None` semantics -- and must not warn on
-    # every legitimate use of a chirped point.
+    # The list-valued chirp is compared zero-padded ([0.01] == [0.01, 0.0]), and only
+    # when the run HAS one: check_context runs before apply_point, so an empty run
+    # chirp means "the point is about to supply it" and must not warn.
     run_chirp = list(config.get("chirp_coeffs_GHz") or [])
     if run_chirp:
         point_chirp = list(point.get("chirp_coeffs_GHz") or [])
@@ -174,15 +121,9 @@ def check_context(point: Dict[str, Any], config: Dict[str, Any],
 
 def apply_point(config: Dict[str, Any], point: Dict[str, Any],
                 set_t_g: bool = True) -> Dict[str, Any]:
-    """Return a copy of ``config`` with the point's settings applied.
-
-    Sets ``amp_scale``, ``wp_offset_GHz`` and ``chirp_coeffs_GHz`` (and ``t_g_ns``
-    unless ``set_t_g`` is False). Other context keys are not applied -- they describe
-    where the point was calibrated, and are for ``check_context`` to validate against.
-
-    Note the ``is not None`` test below: an explicitly stored empty chirp (``[]``)
-    counts as a setting and will clear a chirp the config carried, whereas a missing
-    key leaves the config's own value alone.
+    """Copy of ``config`` with the point's SETTING_KEYS applied (``t_g_ns`` only if
+    ``set_t_g``); context keys are for ``check_context``, not applied. A stored empty
+    chirp ``[]`` is a setting (clears the config's chirp); a missing key is not.
     """
     out = dict(config)
     for key in SETTING_KEYS:
@@ -210,8 +151,7 @@ def resolve(config: Dict[str, Any], name: str, *, t_g: Optional[float] = None,
         point = get_point(config, name)
     except KeyError as exc:
         raise SystemExit(str(exc).strip('"')) from None
-    # when the point supplies t_g itself there is nothing to disagree with; only
-    # compare gate lengths when the run overrides it (set_t_g False).
+    # compare gate lengths only when the run overrides t_g (set_t_g False)
     t_g_check = point.get("t_g_ns") if set_t_g else t_g
     issues = check_context(point, config, t_g_check, wa_GHz=wa_GHz, wb_GHz=wb_GHz,
                            spec_abs_GHz=spec_abs_GHz)

@@ -3,18 +3,13 @@
     chirp+DRAG   chirp on, DRAG played, the length the calibration fitted for it
     bare         no chirp, no DRAG, its OWN length refitted
 
-This is the comparison the curve figure plots. Both traces keep the calibrated carrier
-offset `wp_offset_GHz`, so the ONLY difference between them is the two corrections --
-carrier tuning is common to both and is not credited to DRAG.
+Both keep the calibrated carrier offset `wp_offset_GHz`, so the ONLY difference is the
+two corrections; carrier tuning is not credited to DRAG.
 
-Why a separate pass rather than reading the scan's own numbers:
-
-* the scan's `_column_expect` keys on 18 physics knobs and NOTHING about scoring, so
-  putting a scoring flag there would force every cached column to re-solve its whole
-  calibration for a change that happens after it;
-* only the bare trace needs a length refit (~24 serial solves). The chirp+DRAG trace's
-  `t_g` was already fitted for it by step 4 of the calibration, so refitting both would
-  double the cost of this pass for nothing.
+A separate pass rather than the scan's own numbers because the scan's `_column_expect`
+keys on physics knobs only (a scoring flag there would re-solve every cached column),
+and only the bare trace needs a length refit (~24 serial solves) -- the chirp+DRAG
+`t_g` was already fitted for it by step 4 of the calibration.
 
 Failed columns are carried through as `ok: false` rows, never dropped: the curve has to
 show where the drive ceiling bit rather than interpolate across it.
@@ -36,19 +31,25 @@ VARIANTS = (("chirp+DRAG", True, True, False),
             ("bare", False, False, True))
 
 
+def _key(r):
+    return f"{r['delta_GHz']:+.4f}|{r['target_eta']:.2f}"
+
+
 def _chirp_quality(row, quartic_warn=0.25):
     """Whether the chirp this column carries rests on a law that converged.
 
-    `r2` can be 0.998 while `quartic_fraction` is 20 -- a confident fit to a
-    series that is not a series, because `delta = k2 eta^2 (1 + (k4/k2) eta^2)`
-    is a TRUNCATION and `quartic_fraction` is how big the last kept term is next
-    to the first. When it is not small the unmeasured eta^6 term is plausibly the
-    same size, so the chirp is a candidate, not a calibration.
+    `r2` can be 0.998 while `quartic_fraction` is 20: ``delta = k2 eta^2 (1 + (k4/k2)
+    eta^2)`` is a TRUNCATION and `quartic_fraction` is its last kept term against the
+    first; when not small, the unmeasured eta^6 term is plausibly as large, so the chirp
+    is a candidate, not a calibration. `perturbative_ok` is computed here (the scan
+    stores the fraction, not the verdict). `min_abs_detuning_GHz` is the floor the
+    chirp<->DRAG fixed point reached -- it goes to zero when the loop chases its own
+    denominator.
 
-    `perturbative_ok` is computed rather than read: the scan stores
-    `quartic_fraction` on the row but not the verdict. `min_abs_detuning_GHz` is
-    the floor the chirp<->DRAG fixed point reached, which is the quantity that
-    goes to zero when the loop chases its own denominator.
+    `chirp_excluded` separates a chirp-free column's 1.00x as a RESULT (nothing to
+    chirp) from an ARTEFACT (`stark_crossing`: the ridge changed transition inside the
+    drive sweep, so no chirp could be measured at eta*). Rows predating the reason
+    carry None, which the gain table counts separately.
     """
     ch = row.get("chirp")
     if not isinstance(ch, dict):
@@ -59,16 +60,6 @@ def _chirp_quality(row, quartic_warn=0.25):
     q = ch.get("quartic_fraction")
     q = float(q) if q is not None else None
     free = ch.get("coeffs_GHz") is not None and len(ch.get("coeffs_GHz") or []) == 0
-    # WHY a column carries no chirp decides whether its 1.00x is a measurement.
-    #
-    #   no_measurable_shift  there was nothing to chirp. chirp == bare is a RESULT.
-    #   stark_crossing       the ridge changed transition inside the drive sweep, so
-    #                        no chirp could be measured at eta*. chirp == bare is an
-    #                        ARTEFACT, and averaging it in at 1.00x biases the chirp's
-    #                        benefit downwards exactly where the device is hardest.
-    #
-    # Older rows predate the distinction and carry no reason at all; they are left
-    # as None rather than guessed at, and the gain table counts them separately.
     reason = op.get("chirp_free_reason")
     return {"quartic_fraction": q,
             "perturbative_ok": (None if q is None else bool(q < quartic_warn)),
@@ -77,8 +68,6 @@ def _chirp_quality(row, quartic_warn=0.25):
             "chirp_free": bool(free),
             "chirp_free_reason": reason,
             "stark_crossing_eta": op.get("stark_crossing_eta"),
-            # The one flag the ratio code needs: is this column's chirp a measured
-            # no-op, or a chirp that could not be measured?
             "chirp_excluded": bool(free and reason == "stark_crossing")}
 
 
@@ -129,14 +118,13 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     from snail_solver.subharmonic_gate_scan import coherence_penalty, total_infidelity
 
-    # Reuse anything already scored: this pass costs minutes per solve, and widening
-    # the eta set should not re-pay for the eta already done. A cached trace is keyed
-    # on (delta, eta, variant) and only reused when it is actually populated.
+    # Reuse any populated trace already scored, keyed on (delta, eta, variant): solves
+    # cost minutes, and widening the eta set should not re-pay for the eta done.
     cached = {}
     if os.path.exists(OUT):
         try:
             for r in json.load(open(OUT)):
-                k = f"{r['delta_GHz']:+.4f}|{r['target_eta']:.2f}"
+                k = _key(r)
                 for v, t in (r.get("traces") or {}).items():
                     if t is not None:
                         cached[(k, v)] = t
@@ -156,7 +144,7 @@ if __name__ == "__main__":
         tlo = float(settings.get("tg_lo", 0.7) or 0.7)
         thi = float(settings.get("tg_hi", 1.3) or 1.3)
         for r in rows:
-            key = f"{r['delta_GHz']:+.4f}|{r['target_eta']:.2f}"
+            key = _key(r)
             meta[key] = {"delta_GHz": r["delta_GHz"], "target_eta": r["target_eta"],
                          "branch": r.get("branch"), "ok": bool(r.get("ok")),
                          "w_p_GHz": r.get("w_p_GHz"),
@@ -166,12 +154,6 @@ if __name__ == "__main__":
                          "drag_shed": r.get("drag_shed"),
                          "t1_us": t1, "t2_us": t2, "decoh_prefactor": pre,
                          "error": r.get("error"),
-                         # Whether the chirp this column carries rests on a shift
-                         # law that converged. r2 can be 0.998 while
-                         # quartic_fraction is 20 -- a confident fit to a series
-                         # that is not a series. Carried through so the analysis
-                         # can separate those columns instead of averaging a
-                         # meaningless chirp into the gain.
                          **_chirp_quality(r, float(settings.get("quartic_warn", 0.25) or 0.25))}
             if not r.get("ok"):
                 skipped.append(key)
@@ -205,9 +187,8 @@ if __name__ == "__main__":
             if s is None:
                 row["traces"][name] = None
                 continue
-            # Charge each trace for ITS OWN length. Applying one eps to both would hand
-            # the longer trace a free pass on decoherence, which is exactly the term
-            # that decides whether a correction was worth its gate time.
+            # Charge each trace for ITS OWN length: one eps for both would give the
+            # longer trace a free pass on the term that decides if a correction paid.
             coh = coherence_penalty(float(s["t_g_ns"]), t1_us=m["t1_us"],
                                     t2_us=m["t2_us"], prefactor=m["decoh_prefactor"])
             row["traces"][name] = {

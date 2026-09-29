@@ -1,25 +1,22 @@
 #!/usr/bin/env python
 r"""Flat-only chevrons: the plateau Hamiltonian by itself -- no ramps, no chirp, no DRAG.
 
-The gate Hamiltonian with its flat top cut out and held: the pump is switched on at
-``t = 0`` at constant ``|eta| = eta_flat`` (a ``ConstantPulse``; the "ramps are
-small" limit) at a FIXED carrier, scanned around the Stark-shifted frequency. Per
-subharmonic-scan column and per drive this maps
+The pump is switched on at ``t = 0`` at constant ``|eta| = eta_flat`` (a
+``ConstantPulse``: the "ramps are small" limit) at a FIXED carrier scanned around the
+Stark-shifted frequency. Per subharmonic-scan column and drive this maps
 
-* a NARROW chevron (offset x time -> P(|10>)) around the law's Stark-shifted carrier,
-  fitted with the pipeline's own Lorentzian (``tune_up.fit_chevron_center``) -- the
-  measured plateau Stark shift, and the law's error against it;
-* a WIDE collision map: time-AVERAGE of every leakage channel vs pump offset (a
-  sudden switch-on leaves large, fast, bounded dressing -- the SNAIL's ~1 GHz
-  counter-rotating terms among it -- that saturates a time-max everywhere; a real
-  collision accumulates, and the average sees it), with each
-  audited parasitic channel's predicted resonance offset overlaid;
+* a NARROW chevron (offset x time -> P(|10>)) around the law's carrier, fitted with
+  ``tune_up.fit_chevron_center`` -- the measured plateau Stark shift and the law's error;
+* a WIDE collision map: the time-AVERAGE of every leakage channel vs pump offset (the
+  sudden switch-on leaves fast bounded dressing, e.g. the SNAIL's ~1 GHz
+  counter-rotating terms, that saturates a time-max everywhere; a real collision
+  accumulates), with each audited channel's predicted resonance overlaid;
 * the leakage fingerprint AT the fitted resonance (matrix pencil vs the audit).
 
-The probe is ``find_stark_resonance.build_chevron_coupler(shape="constant")`` via
-``_chevron_worker`` -- the same constant probe the calibration uses, which refuses a
-chirp by construction. Stark laws are READ from the pass-A column caches; nothing in
-the running pipeline is written or changed.
+The probe is the calibration's own constant probe
+(``find_stark_resonance.build_chevron_coupler(shape="constant")`` via
+``_chevron_worker``). Stark laws are READ from the pass-A column caches; nothing in the
+running pipeline is written.
 
     .venv/bin/python scripts/flat_chevron_study.py --deltas=0.015,0.1 --jobs 12
 """
@@ -44,7 +41,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
-from plateau_collision_study import (DEFAULT_LAWS, GRID, INK, INK2, SERIES,  # noqa: E402
+from plateau_collision_study import (DEFAULT_LAWS, INK, INK2, SERIES,  # noqa: E402
                                      _style, column_config, eta_tag, load_column,
                                      parse_list)
 
@@ -119,32 +116,28 @@ def study_drive(cfg, law, wp0, eta, args, solver) -> Dict[str, Any]:
     c_law = pp.plateau_carrier_GHz(wp0, law["k2"], law["k4"], eta)
     i10 = channel_index("P10")
 
+    def narrow_scan(centre_GHz):
+        """(offsets, stack, P10 envelope, Lorentzian fit) of the narrow chevron."""
+        grid = centre_GHz + np.linspace(-args.narrow_MHz, args.narrow_MHz,
+                                        args.narrow_points) * 1e-3
+        S = chevron_stack(cfg, eta, grid, times, solver, args.jobs)
+        env = S[:, i10, :].max(axis=1)
+        return grid, S, env, fit_chevron_center(grid, env)
+
     # narrow chevron around the law's Stark-shifted carrier
-    narrow = c_law + np.linspace(-args.narrow_MHz, args.narrow_MHz, args.narrow_points) * 1e-3
     t0 = time.perf_counter()
-    S_n = chevron_stack(cfg, eta, narrow, times, solver, args.jobs)
-    env = S_n[:, i10, :].max(axis=1)
-    cen = fit_chevron_center(narrow, env)
+    narrow, S_n, env, cen = narrow_scan(c_law)
     it = int(np.argmin(np.abs(times - t_iswap)))
-    leak_res = float(S_n[int(np.argmin(np.abs(narrow - cen["center_GHz"]))),
-                         channel_index("P_leak"), :].max())
     c_meas = float(cen["center_GHz"])
-    # The grid is centred on the LAW, which near the subharmonic misses the plateau
-    # resonance by up to ~15 MHz -- far enough to cut the chevron off at the window
-    # edge. Re-centre on the measured peak and rescan until it sits in the middle.
-    #
-    # Only a fit that PASSED may move the window, and a rescan is kept only if its
-    # brightest column is still the same feature (within a half-width). Near the
-    # subharmonic a second resonance sits ~20 MHz from the target; a failed fit falls
-    # back to the grid argmax, which can lock onto it and walk the window away.
+    # The grid is centred on the LAW, which near the subharmonic can miss the plateau
+    # resonance by ~15 MHz and cut the chevron off; re-centre on the measured peak.
+    # Only a PASSED fit may move the window, and a rescan is kept only if its brightest
+    # column is the same feature (within a half-width): a second resonance ~20 MHz
+    # away can otherwise capture a failed fit's argmax and walk the window off.
     recentred = 0
     while (cen["ok"] and recentred < args.max_recentre
            and abs(c_meas - float(np.mean(narrow))) > 0.25e-3 * args.narrow_MHz):
-        n2 = c_meas + np.linspace(-args.narrow_MHz, args.narrow_MHz,
-                                  args.narrow_points) * 1e-3
-        S2 = chevron_stack(cfg, eta, n2, times, solver, args.jobs)
-        e2 = S2[:, i10, :].max(axis=1)
-        c2 = fit_chevron_center(n2, e2)
+        n2, S2, e2, c2 = narrow_scan(c_meas)
         vertex2 = float(n2[int(np.argmax(e2))])
         tol = max(float(cen["hwhm_GHz"]), 3e-3)
         if abs(vertex2 - c_meas) > tol:
@@ -158,8 +151,8 @@ def study_drive(cfg, law, wp0, eta, args, solver) -> Dict[str, Any]:
         recentred += 1
         if cen.get("refit_failed"):
             break
-    leak_res = float(S_n[int(np.argmin(np.abs(narrow - c_meas))),
-                         channel_index("P_leak"), :].max())
+    j = int(np.argmin(np.abs(narrow - c_meas)))        # the on-resonance column
+    leak_res = float(S_n[j, channel_index("P_leak"), :].max())
     qual = chevron_quality(cen, narrow, env, 2 * args.narrow_MHz, leak=leak_res)
 
     # wide collision map, centred on the measured resonance
@@ -170,10 +163,10 @@ def study_drive(cfg, law, wp0, eta, args, solver) -> Dict[str, Any]:
             if abs(c["resonant_offset_MHz"] - 1e3 * c_meas) <= args.wide_MHz]
 
     # leakage peaks in the wide map, labelled by the nearest predicted collision
+    from scipy.signal import find_peaks
     peaks = []
     for ch in LEAK_CHANNELS:
         y = S_w[:, channel_index(ch), :].mean(axis=1)
-        from scipy.signal import find_peaks
         floor = float(np.median(y))
         idx, props = find_peaks(y, prominence=args.peak_floor)
         for k, prom in zip(idx, props["prominences"]):
@@ -190,7 +183,6 @@ def study_drive(cfg, law, wp0, eta, args, solver) -> Dict[str, Any]:
                           "match_dist_MHz": d})
 
     # fingerprint at resonance
-    j = int(np.argmin(np.abs(narrow - c_meas)))
     cpl_r = constant_coupler(cfg, eta, float(narrow[j]), T)
     pred = pp.predict_plateau_channels(cpl_r, T)
     finger = {}
@@ -393,7 +385,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         doc = {"title": f"Flat-only chevrons (no ramps, no chirp), δ = {delta * 1e3:+.0f} MHz",
                "delta_GHz": delta, "w_p_GHz": col["w_p_GHz"], "law": law,
                "wp_offset0_GHz": wp0, "drives": drives,
-               "settings": {k: v for k, v in vars(args).items()}}
+               "settings": dict(vars(args))}
         plot_column(doc, os.path.join(args.out, f"{tag}.png"))
         with open(os.path.join(args.out, f"{tag}.json"), "w") as fh:
             json.dump(_jsonable(doc), fh)
