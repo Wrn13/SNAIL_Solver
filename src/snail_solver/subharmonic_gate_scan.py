@@ -20,8 +20,10 @@ so A's subharmonic and a direct drive on B collide at once. ``branch="above"``
 
 **``delta = 0`` is not a gate.** The A-subharmonic channel is exactly resonant there
 (``g/|det| -> inf``, and the detuning is inside the pulse bandwidth ``1/t_g``), so the
-default grid drops it, and any column carrying a non-perturbative channel is refused
-unless ``--force``.
+default grid drops it (``--keep-origin`` keeps it). A column carrying a
+non-perturbative channel is still calibrated -- the audit is a prediction, the pulse is
+the measurement -- and flagged ``audit_nonperturbative``; ``--refuse-nonperturbative``
+restores the old refusal.
 
 The eta scan
 ------------
@@ -366,7 +368,30 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
             # length-window BOUNDARY rather than a bracketed optimum. Bump either if
             # its contract changes again.
             "score_drag": 1,
-            "length_extend": 1}
+            "length_extend": 1,
+            # Present only when not the default, so every ranked cache still keys.
+            **({"drag_set": str(settings["drag_set"])}
+               if settings.get("drag_set", "ranked") != "ranked" else {}),
+            # A different law, so a different chirp; absent for the default.
+            **({"chirp_source": str(settings["chirp_source"])}
+               if settings.get("chirp_source", "law") != "law" else {})}
+
+
+#: ``--drag-set`` choices: ``ranked`` derives the channels per column by g/|det|
+#: (``select_drag_channels``); ``subharm-leak`` plays the fixed
+#: ``spectator_audit.FORCED_SUBHARM_LEAK`` set at every column, whatever its ratio.
+DRAG_SETS = ("ranked", "subharm-leak")
+
+
+def _forced_transitions(settings: Dict[str, Any]):
+    """The fixed DRAG set `settings` asks for, or None to rank."""
+    name = str(settings.get("drag_set", "ranked"))
+    if name == "ranked":
+        return None
+    if name == "subharm-leak":
+        from snail_solver.spectator_audit import FORCED_SUBHARM_LEAK
+        return FORCED_SUBHARM_LEAK
+    raise ValueError(f"unknown drag_set {name!r}; expected one of {DRAG_SETS}")
 
 
 #: (message fragment, failure type, stage) for the two relaxations a tune-up runs.
@@ -414,7 +439,7 @@ def audit_column(config: Dict[str, Any], col: Dict[str, Any],
     channels, audit = select_drag_channels(
         cfg, t_g0, max_channels=settings["max_drag_channels"],
         min_ratio=settings["min_ratio"], max_ratio=settings["max_ratio"],
-        spec_abs_GHz=None)
+        spec_abs_GHz=None, force_transitions=_forced_transitions(settings))
     audit["t_g0_ns"] = float(t_g0)
     return channels, audit
 
@@ -430,8 +455,12 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                  settings: Dict[str, Any], *,
                  solver: Optional[Dict[str, Any]] = None,
                  jobs: int = 0, force: bool = False,
+                 rabi_table: Optional[Dict[str, Any]] = None,
                  logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Calibrate and score ONE column. Returns the row (with its ``run_doc``).
+
+    `rabi_table` replays a STORED step 1 (``chirp_source="ridge"`` only): steps 2-4
+    are redone from the chevrons already measured, at a fraction of the cost.
 
     1. move ``w_b`` so the pump is ``w_p`` (``config_at_wp``, which also strips any
        device chirp calibrated at a different pump);
@@ -462,10 +491,15 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                 "n_drag_channels": len(channels),
                 "total_error": audit["total_error"]})
 
-    if audit["blocking"] and not force:
-        return _fail(row, t0, "NonPerturbativeChannel", "audit", "; ".join(
-            f"{b['name']} g={b['g_MHz']:.3f} MHz det={b['detuning_MHz']:.3f} MHz"
-            for b in audit["blocking"]))
+    if audit["blocking"]:
+        why = "; ".join(f"{b['name']} g={b['g_MHz']:.3f} MHz "
+                        f"det={b['detuning_MHz']:.3f} MHz" for b in audit["blocking"])
+        # The audit is a PREDICTION; the gate is calibrated anyway unless asked not to,
+        # so the curve shows what the pulse achieves there rather than a hole.
+        if settings.get("refuse_nonperturbative") and not force:
+            return _fail(row, t0, "NonPerturbativeChannel", "audit", why)
+        row["audit_nonperturbative"] = True
+        log.info(f"  audit: non-perturbative channel(s), calibrating anyway: {why}")
 
     cfg = config_at_wp(config, col["w_p_GHz"], branch=settings["branch"],
                        levels=settings["coupler_levels"])
@@ -496,6 +530,12 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
                 settings.get("drag_decouple_fallback", False)),
             probe_shape=settings["probe_shape"],
             moment_weighting=settings["moment_weighting"],
+            chirp_source=str(settings.get("chirp_source", "law")),
+            ridge_noise_MHz=settings.get("ridge_noise_MHz"),
+            rabi_table=rabi_table,
+            # A chirp can sweep a beat the unchirped audit cleared into the skip
+            # window; drop that channel rather than lose the column.
+            drop_swept_channels=bool(settings.get("drop_swept_channels", True)),
             do_time_rabi=False, jobs=jobs, solver=solver, logger=logger,
             **settings.get("map_kw", {}))
 
@@ -512,6 +552,8 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
         # weakest channel and retry. envelope_m (the grid-wide cap) is untouched;
         # m >= len(channels) still holds as channels are shed.
         retries = min(int(settings.get("drag_retries", 2)), max(len(used) - 1, 0))
+        if _forced_transitions(settings) is not None:
+            retries = 0                           # a FIXED set is never shed
         out = None
         if _divergence(exc) and retries:
             for _ in range(retries):
@@ -532,6 +574,14 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
         row["n_drag_channels"] = len(used)
         row["drag_shed"] = len(channels) - len(used)
 
+    # The tune-up may have dropped a channel its chirp swept into the skip window:
+    # score (and label) exactly what the calibrated pulse plays.
+    if out.get("drag_channels") is not None and len(out["drag_channels"]) < len(used):
+        swept = out["stages"].get("drag_swept_dropped") or []
+        used = list(out["drag_channels"])
+        row["drag_channels"] = channel_labels(used, audit)
+        row["n_drag_channels"] = len(used)
+        row["drag_swept_dropped"] = swept
     rec = out["operating_point"]
     chirp = [float(c) for c in (rec.get("chirp_coeffs_GHz") or ())]
     scfg = config_at_wp(config, col["w_p_GHz"], branch=settings["branch"],
@@ -653,9 +703,18 @@ def _column_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"delta={col['delta_GHz']:+.4f} GHz  w_p={col['w_p_GHz']:.4f}  "
                     f"Delta_sub={col['delta_sub_GHz']:+.4f}  "
                     f"A-subharm beat={col['subharm_beat_MHz']:+.1f} MHz")
+    table = None
+    if payload.get("rabi_table_path"):
+        from snail_solver.ridge_refit import load_npz_rabi
+        table = load_npz_rabi(payload["rabi_table_path"])
+        if logger:
+            logger.info(f"  replaying the stored Rabi table "
+                        f"{payload['rabi_table_path']}")
     row = solve_column(payload["config"], col, settings,
                        solver=payload["solver"], jobs=payload["jobs"],
-                       force=payload["force"], logger=logger)
+                       force=payload["force"], rabi_table=table, logger=logger)
+    if table is not None:
+        row["rabi_replayed_from"] = payload["rabi_table_path"]
     row.update(payload["expect"])
     row["cached"] = False
     if payload.get("cache_path"):
@@ -693,6 +752,9 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 eta_lo: float = 0.2, eta_hi: float = 1.0, amp_points: int = 41,
                 max_drag_channels: int = 3, min_ratio: float = 0.02,
                 max_ratio: float = 0.3, drag_retries: int = 2,
+                drag_set: str = "ranked", refuse_nonperturbative: bool = False,
+                chirp_source: str = "law",
+                replay_rabi_dirs: Sequence[str] = (),
                 column_workers: int = 1,
                 t1_us: Optional[float] = None, t2_us: Optional[float] = None,
                 decoh_prefactor: float = 1.0,
@@ -787,6 +849,9 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         # A sharded file holds PART of the grid; say which part.
         "shard": int(shard), "n_shards": int(n_shards),
         "drag_retries": int(drag_retries),
+        "drag_set": str(drag_set),
+        "refuse_nonperturbative": bool(refuse_nonperturbative),
+        "chirp_source": str(chirp_source),
         "t1_us": _opt_float(t1_us),
         "t2_us": _opt_float(t2_us),
         "decoh_prefactor": float(decoh_prefactor),
@@ -845,6 +910,18 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         return _scan_doc(base, device_path, settings, base_cols, etas, landmarks,
                          rows, time.perf_counter() - t_start)
 
+    def _replay(tag):
+        """The first stored ``col_<tag>_rabi.npz`` under `replay_rabi_dirs`, or None
+        (that column is then measured from scratch)."""
+        for d in replay_rabi_dirs:
+            cand = os.path.join(d, "columns", f"col_{tag}_rabi.npz")
+            if os.path.exists(cand):
+                return cand
+        return None
+
+    if replay_rabi_dirs and str(chirp_source) != "ridge":
+        raise ValueError("--replay-rabi needs --chirp-source ridge")
+
     if int(column_workers) > 1 and len(cols) > 1:
         from snail_solver.subharmonic_convergence import _run_pool
         pending, payloads = [], []
@@ -862,6 +939,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                              "settings": _settings_for(col, settings, base),
                              "solver": solver, "jobs": jobs, "force": force,
                              "expect": expect, "cache_path": path,
+                             "rabi_table_path": _replay(tag),
                              "log_path": (os.path.join(cache_dir, f"col_{tag}.log")
                                           if cache_dir else None)})
             pending.append((col, tag, None))
@@ -900,8 +978,16 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
             rows.append(cached)
             continue
 
+        _rp = _replay(tag)
+        _tbl = None
+        if _rp:
+            from snail_solver.ridge_refit import load_npz_rabi
+            _tbl = load_npz_rabi(_rp)
+            log.info(f"  replaying the stored Rabi table {_rp}")
         row = solve_column(base, col, _settings_for(col, settings, base), solver=solver,
-                           jobs=jobs, force=force, logger=log)
+                           jobs=jobs, force=force, rabi_table=_tbl, logger=log)
+        if _rp:
+            row["rabi_replayed_from"] = _rp
         row.update(expect)
         row["cached"] = False
         row["nearest_landmark"] = nearest_landmark(landmarks, col["delta_sub_GHz"])
@@ -983,10 +1069,14 @@ def render_column_figures(run_doc: Dict[str, Any], tag: str, figdir: str, *,
     chirp = stages.get("chirp")
     if ridge and chirp and op.get("t_g_ns"):
         try:
+            from snail_solver.tune_up import shape_config
+            _shape, _shape_kw = shape_config((run_doc or {}).get("device") or {})
             figs["chirp_ridge"] = plot_chirp_ridge(
                 table, chirp, float(op.get("wp_offset_GHz") or 0.0),
                 float(op["t_g_ns"]),
-                os.path.join(figdir, f"{tag}_ridge.png"), title=title)
+                os.path.join(figdir, f"{tag}_ridge.png"), title=title,
+                shape=_shape, shape_kw=_shape_kw,
+                ridge_law=stages.get("ridge_law"))
         except Exception as exc:                              # never fatal
             log.warning(f"  {tag}: ridge figure failed ({type(exc).__name__}: {exc})")
     return figs
@@ -1154,7 +1244,7 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
                   target_etas: Sequence[float], *, branch: str = "below",
                   coupler_levels: Optional[int] = None,
                   max_drag_channels: int = 3, min_ratio: float = 0.02,
-                  max_ratio: float = 0.3,
+                  max_ratio: float = 0.3, drag_set: str = "ranked",
                   eta_lo: float = 0.2, eta_hi: float = 1.0, amp_points: int = 41,
                   wp_points: int = 25, drop_origin: bool = True,
                   envelope_m: Optional[int] = None,
@@ -1180,7 +1270,8 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 "coupler_levels": levels, "eta_lo": float(eta_lo),
                 "eta_hi": float(eta_hi), "amp_points": int(amp_points),
                 "max_drag_channels": int(max_drag_channels),
-                "min_ratio": float(min_ratio), "max_ratio": float(max_ratio)}
+                "min_ratio": float(min_ratio), "max_ratio": float(max_ratio),
+                "drag_set": str(drag_set)}
     wa, wb, ws = _freqs(base)
     base_cols = columns_for(base, offsets_GHz, drop_origin=drop_origin)
     cols = [{**c, "target_eta": e} for c in base_cols for e in tetas]
@@ -1219,7 +1310,7 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
 
     lines.append("  perturbative feasibility, worst parasitic g/|det| per column")
     lines.append("  (<0.3 DRAG effective, 0.3-1 left uncorrected, >=1 NOT "
-                 "perturbative -> refused)")
+                 "perturbative -> flagged, still calibrated)")
     hdr = "".join(f"{c['delta_GHz'] * 1e3:>8.0f}" for c in base_cols)
     lines.append(f"    {'eta*':>5} {'t_g(ns)':>8}  {hdr}   MHz offset")
     for e in tetas:
@@ -1268,7 +1359,7 @@ def describe_grid(config: Dict[str, Any], offsets_GHz: Sequence[float],
         n_block += bool(au["blocking"])
     if n_block:
         print(f"\n  !! {n_block}/{len(cols)} columns carry a NON-PERTURBATIVE channel; "
-              f"they will be refused without --force.")
+              f"they are calibrated anyway and flagged audit_nonperturbative.")
     return ""
 
 
@@ -1386,7 +1477,7 @@ def main() -> None:
                          "[below]")
     ap.add_argument("--keep-origin", action="store_true",
                     help="keep delta = 0, where the A-subharmonic channel is exactly "
-                         "resonant. Needs --force to actually solve")
+                         "resonant. Calibrated like any other column")
     ap.add_argument("--eta-lo", type=float, default=0.2,
                     help="low end of the Rabi amplitude scan, as a FRACTION of "
                          "--target-eta [0.2]")
@@ -1413,7 +1504,27 @@ def main() -> None:
                          "(its quadrature would make the chirp<->DRAG fixed point "
                          "diverge). Reported in the audit [0.3]")
     ap.add_argument("--force", action="store_true",
-                    help="solve columns that carry a non-perturbative channel anyway")
+                    help="no-op unless --refuse-nonperturbative: every column is "
+                         "calibrated by default. Kept so older drivers still parse")
+    ap.add_argument("--refuse-nonperturbative", action="store_true",
+                    help="record a column carrying a non-perturbative channel as a "
+                         "NonPerturbativeChannel failure instead of calibrating it "
+                         "(the pre-2026-09-30 default)")
+    ap.add_argument("--chirp-source", choices=("law", "ridge"), default="law",
+                    help="law: chirp from the fitted k2|eta|^2 + k4|eta|^4. ridge: "
+                         "chirp from the measured ridge itself (ridge_chirp), which "
+                         "follows an avoided crossing and needs no converged series "
+                         "[law]")
+    ap.add_argument("--replay-rabi", default=None, metavar="DIR[,DIR...]",
+                    help="with --chirp-source ridge: reuse each column's stored "
+                         "columns/col_<tag>_rabi.npz from the first DIR that has it "
+                         "and redo only steps 2-4; a column with none is measured")
+    ap.add_argument("--drag-set", choices=DRAG_SETS, default="ranked",
+                    help="ranked: DRAG channels ranked by g/|det| per column. "
+                         "subharm-leak: always the A |0>-|1> subharmonic, the A "
+                         "|1>->|2> subharmonic and the |2> leakage, ignoring the ratio "
+                         "limits and the cap (only the skip window drops one); a "
+                         "diverging fixed point is never shed [ranked]")
     ap.add_argument("--coupler-levels", type=int, default=None,
                     help="override the device's coupler truncation")
     ap.add_argument("--wp-points", type=int, default=25)
@@ -1622,6 +1733,7 @@ def main() -> None:
                              coupler_levels=args.coupler_levels,
                              max_drag_channels=args.max_drag_channels,
                              min_ratio=args.min_ratio, max_ratio=args.max_ratio,
+                             drag_set=args.drag_set,
                              eta_lo=args.eta_lo,
                              eta_hi=args.eta_hi, amp_points=args.amp_points,
                              wp_points=args.wp_points,
@@ -1665,6 +1777,9 @@ def main() -> None:
         eta_lo=args.eta_lo, eta_hi=args.eta_hi, amp_points=args.amp_points,
         max_drag_channels=args.max_drag_channels, min_ratio=args.min_ratio,
         max_ratio=args.max_ratio, drag_retries=args.drag_retries,
+        drag_set=args.drag_set, refuse_nonperturbative=args.refuse_nonperturbative,
+        chirp_source=args.chirp_source,
+        replay_rabi_dirs=tuple(d for d in (args.replay_rabi or "").split(",") if d),
         contrast_min=args.contrast_min, quartic_warn=args.quartic_warn,
         leak_max=args.leak_max, probe_shape=args.probe_shape,
         moment_weighting=args.moment_weighting,

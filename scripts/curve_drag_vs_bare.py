@@ -57,18 +57,25 @@ def _chirp_quality(row, quartic_warn=0.25):
     op = row.get("operating_point")
     if not isinstance(op, dict):
         op = {}
+    ridge = op.get("chirp_source") == "ridge"
     q = ch.get("quartic_fraction")
-    q = float(q) if q is not None else None
+    # A ridge-law chirp (ridge_chirp) is read off the measurement, not a truncated
+    # series: there is no quartic fraction to fail, so it is never "not converged".
+    q = None if (q is None or ridge) else float(q)
     free = ch.get("coeffs_GHz") is not None and len(ch.get("coeffs_GHz") or []) == 0
     reason = op.get("chirp_free_reason")
     return {"quartic_fraction": q,
-            "perturbative_ok": (None if q is None else bool(q < quartic_warn)),
+            "chirp_source": op.get("chirp_source") or "law",
+            "perturbative_ok": (True if ridge else
+                                None if q is None else bool(q < quartic_warn)),
             "min_abs_detuning_GHz": ch.get("min_abs_detuning_GHz"),
             "shift_law_r2": ch.get("r2"),
             "chirp_free": bool(free),
             "chirp_free_reason": reason,
             "stark_crossing_eta": op.get("stark_crossing_eta"),
-            "chirp_excluded": bool(free and reason == "stark_crossing")}
+            "chirp_excluded": bool(free and reason in ("stark_crossing",
+                                                       "railed_ridge",
+                                                       "no_usable_ridge"))}
 
 
 def _one(job):
@@ -145,6 +152,12 @@ if __name__ == "__main__":
         thi = float(settings.get("tg_hi", 1.3) or 1.3)
         for r in rows:
             key = _key(r)
+            # A column refused or failed in one file and solved in another (a fill
+            # pass) is SOLVED: never let the failure shadow it, whatever the order.
+            if key in meta and meta[key]["ok"] and not r.get("ok"):
+                continue
+            if key in skipped and r.get("ok"):
+                skipped.remove(key)
             meta[key] = {"delta_GHz": r["delta_GHz"], "target_eta": r["target_eta"],
                          "branch": r.get("branch"), "ok": bool(r.get("ok")),
                          "w_p_GHz": r.get("w_p_GHz"),
@@ -152,6 +165,7 @@ if __name__ == "__main__":
                          "n_channels_designed": len(r.get("drag_channels") or []),
                          "drag_channels": r.get("drag_channels"),
                          "drag_shed": r.get("drag_shed"),
+                         "audit_nonperturbative": bool(r.get("audit_nonperturbative")),
                          "t1_us": t1, "t2_us": t2, "decoh_prefactor": pre,
                          "error": r.get("error"),
                          **_chirp_quality(r, float(settings.get("quartic_warn", 0.25) or 0.25))}

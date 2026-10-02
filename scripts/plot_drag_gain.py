@@ -6,6 +6,8 @@ plotting, because it is the one that SURVIVES the coupler truncation: across lev
 2.1%. The two traces share their systematic; their ratio does not.
 
 Colours are categorical slots 1-3 of the validated default palette, in fixed order.
+
+Usage:  plot_drag_gain.py curves.json OUT.png [DEVICE.json]
 """
 import json
 import sys
@@ -18,6 +20,11 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 CURVES, OUT = sys.argv[1], sys.argv[2]
+DEVICE = sys.argv[3] if len(sys.argv) > 3 else "devices/6Gate4.7SNAIL.json"
+try:
+    W_A_MHZ = float(json.load(open(DEVICE))["qubit_freqs_GHz"][0]) * 1e3
+except Exception:
+    W_A_MHZ = 3500.0                         # 6Gate4.7SNAIL
 SLOT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 MARK = ["o", "s", "^", "D"]
 INK, MUTED, GRID = "#1a1a19", "#5c5b55", "#d8d7d0"
@@ -36,9 +43,8 @@ for r in rows:
 fig, ax = plt.subplots(figsize=(11, 5.4))
 ax.grid(True, color=GRID, lw=0.6, alpha=0.9)
 ax.set_axisbelow(True)
-for s in ("top", "right"):
-    ax.spines[s].set_visible(False)
-for s in ("left", "bottom"):
+ax.spines["right"].set_visible(False)
+for s in ("left", "bottom", "top"):
     ax.spines[s].set_color(GRID)
 ax.tick_params(colors=MUTED, labelsize=9)
 
@@ -68,6 +74,12 @@ for i, eta in enumerate(sorted(by_eta)):
 
 ax.set_xlabel("pump detuning from the subharmonic   $\\delta$  (MHz)",
               color=INK, fontsize=10)
+# Absolute pump frequency on top: w_p = w_a/2 + delta (GHz).
+top = ax.secondary_xaxis("top", functions=(lambda d: (0.5 * W_A_MHZ + d) / 1e3,
+                                           lambda f: 1e3 * f - 0.5 * W_A_MHZ))
+top.set_xlabel("pump frequency   $\\omega_p/2\\pi$  (GHz)", color=INK, fontsize=10)
+top.tick_params(colors=MUTED, labelsize=9)
+top.spines["top"].set_color(GRID)
 ax.set_ylabel("fidelity gain\n$(1-F)_{\\mathrm{bare}}\\,/\\,(1-F)_{\\mathrm{chirp+DRAG}}$",
               color=INK, fontsize=10)
 ax.set_title("Where chirped recursive DRAG pays  (above branch, $w_s$ = 4.7 GHz)",

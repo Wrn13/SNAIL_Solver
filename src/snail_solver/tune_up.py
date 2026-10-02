@@ -145,7 +145,8 @@ def fixed_eta_amp_scale(config: Dict[str, Any], t_g: float,
                         target_eta: float) -> float:
     """``amp_scale`` that holds the physical peak |eta| at `target_eta` at this `t_g`.
 
-    Equals exactly 1.0 at ``t_g = auto_t_g(..., target_eta)``. LONGER t_g -> LARGER
+    Equals 1.0 at ``t_g = auto_t_g(..., target_eta)`` for the raised cosine
+    (``2 * area_factor`` in general). LONGER t_g -> LARGER
     amp_scale: `normalize_iswap` shrinks the amplitude as 1/t_g to hold the area.
     """
     return (float(target_eta) * float(t_g) * area_factor(config)) / _area(config)
@@ -269,7 +270,7 @@ def verify_eta_matches_ns(config: Dict[str, Any], target_eta: float, *,
     :func:`fixed_eta_amp_scale` -- the pulse `run_tune_up` builds, at other drives.
 
     `eta_fracs` are fractions of `target_eta` to probe; `shape` is the shaped gate
-    or "constant" (the Rabi-sweep probe, run for `window_tg` swaps).
+    or "constant" (the Rabi-sweep probe, run for ``window_tg * nominal_t_g(eta)``).
 
     Returns
     -------
@@ -571,9 +572,10 @@ def chevron_quality(cen: Dict[str, Any], offsets_GHz: np.ndarray, metric: np.nda
       for both, giving ``gap_frac == 0``.
     * ``nrmse`` -- fit rmse over contrast (the ratio :func:`fit_chevron_center`'s
       ``ok`` test thresholds at 0.1).
-    * ``secondary`` -- second-highest local maximum (above 30% of the range) as a
-      fraction of the global max; 0 for a unimodal chevron. This is what catches a
-      bimodal chevron when both estimators collapse onto the same wrong peak.
+    * ``secondary`` -- second-highest local maximum (above 30% of the range), its
+      height above the minimum as a fraction of the range; 0 for a unimodal
+      chevron. This is what catches a bimodal chevron when both estimators
+      collapse onto the same wrong peak.
     * ``hwhm_frac`` -- ``hwhm_MHz / span_MHz``; reported, not used to reject.
     * ``leak`` -- caller-supplied leakage at the resonance, if given.
 
@@ -600,8 +602,8 @@ def chevron_quality(cen: Dict[str, Any], offsets_GHz: np.ndarray, metric: np.nda
     rmse = float(cen.get("rmse", np.nan))
     nrmse = rmse / max(contrast, 1e-9) if np.isfinite(rmse) else float("nan")
 
-    # secondary peak: local maxima of y above 30% of the global max, excluding
-    # the global max itself.
+    # secondary peak: local maxima of y more than 30% of the way from min to max,
+    # excluding the global max itself.
     secondary = 0.0
     if y.size >= 5:
         y_max, y_min = float(np.nanmax(y)), float(np.nanmin(y))
@@ -701,18 +703,19 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
         <delta>(eta*) = k2 M2 eta*^2 + k4 M4 eta*^4   ->   k2 = K2/M2, k4 = K4/M4
 
     ``delta0`` is NOT rescaled, and downstream still receives a POINTWISE law. The
-    shift is smaller by ``M2`` (2.4x on a Hann), but higher peak drives become
-    reachable and ``extrapolation_ratio -> 1``.
+    shift is smaller by ``M2`` (1.4x on a Hann with ``"rabi"``), but higher peak
+    drives become reachable and ``extrapolation_ratio -> 1``.
 
     ``moment_weighting`` scales the chirp directly (the weightings span 2x). The
     default ``"rabi"`` is derived (the chevron centre averages the shift against
     ``sin theta(t)``) and confirmed by :func:`cross_check_probe_moments`; the others
-    are for comparison and UNDERESTIMATE the shift.
+    are for comparison: their smaller ``M2`` OVERESTIMATES k2, hence the chirp.
 
     Every point is an exact ``sesolve`` trajectory: ``amp_points * wp_points`` solves.
     The span and window are ADAPTIVE per row, since the linewidth
     ``Omega ~ 1 / (2 t_g(|eta|))`` grows with drive; a row re-measures wider if its
-    fitted width is too large for its window (widths ran ~2-4x the estimate).
+    fitted centre rails at the window edge (``span_growth="both"`` also widens a row
+    whose fitted width is too large for its window).
 
     Parameters
     ----------
@@ -724,7 +727,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     span_linewidths : float
         Half-span in estimated linewidths when `wp_span_MHz` is None.
     window_tg : float
-        Chevron window in SWAPS: each row runs ``window_tg * nominal_t_g(|eta|)``.
+        Chevron window of a constant-probe row, in units of that row's
+        ``nominal_t_g(|eta|)`` (2 swaps each at constant drive); a shaped rung runs
+        one pulse.
     r2_min : float
         Refuse a fit worse than this (a railed ridge yields a plausible wrong chirp).
     contrast_min, gap_frac_max, nrmse_max, secondary_max, leak_max : float
@@ -762,8 +767,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     chevrons = []
     shaped = str(probe_shape) != "constant"
     for i, e in enumerate(eta):
-        # window_tg swaps per row. A SHAPED rung is a full iSWAP at its own peak drive
-        # (amp_scale = 1.0 makes the peak exactly e), so its window is the pulse.
+        # window_tg x nominal_t_g(e) per constant row. A SHAPED rung is a full iSWAP
+        # over nominal_t_g(e) (amp_scale = 1.0 makes the peak exactly e only on a
+        # Hann: 2 * area_factor in general), so its window is the pulse.
         t_g_rung = nominal_t_g(config, float(e))
         window_ns = t_g_rung if shaped else float(window_tg) * t_g_rung
         span = (float(wp_span_MHz) if wp_span_MHz is not None
@@ -932,7 +938,8 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     # across the dropped tail (and the first across any dropped head) -- a floor that
     # UNDER-states a monotone law, so the chirp is conservative. Held rows get
     # HELD_ROW_WEIGHT, not zero: r2 is computed unweighted, so a zero-weight flat tail
-    # would still fail r2_min. Recorded in `n_held`: such a law is weaker evidence.
+    # would still fail r2_min. Recorded in `n_held` (on the RabiFitError table only;
+    # the success return drops it): such a law is weaker evidence.
     held = np.zeros(eta.size, dtype=bool)
     if int(np.isfinite(ridge).sum()) < 4 and np.isfinite(ridge).any():
         _good = np.flatnonzero(np.isfinite(ridge))
@@ -992,8 +999,8 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     # >= 0.874, leak <= 0.001, r2 = 0.585 on a 0.405 MHz signal). What matters is
     # whether a chirp would DO anything: the excursion |k2 eta^2 + k4 eta^4| against
     # the half-width 1/(2 t_g). Keep --zero-chirp-frac conservative (a 48% excursion
-    # was worth 2.81x; 10-15% columns are the recoverable ones). Off by default: it
-    # changes the pulse.
+    # was worth 2.81x; 10-15% columns are the recoverable ones). Off by default here
+    # (it changes the pulse), but run_tune_up passes chirp_free_max_frac when unset.
     _exc = abs(fit["k2"] * target_eta ** 2 + fit["k4"] * target_eta ** 4)
     _half_lw = 1e3 / (2.0 * float(partial.get("t_g_ref_ns") or nominal_t_g(
         config, target_eta)))
@@ -1232,47 +1239,67 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
                               max_iters: int = 12,
                               tol_GHz: float = 1e-12,
                               quartic_warn: float = 0.25,
-                              couple_drag: bool = True) -> Dict[str, Any]:
+                              couple_drag: bool = True,
+                              ridge_law: Optional[Dict[str, Any]] = None
+                              ) -> Dict[str, Any]:
     """Step 2: project the measured shift onto the Legendre chirp basis.
 
-    Evaluates the fitted shift along the pulse (``|eta(u)| = eta* cos^2(pi u / 2)``
-    for a Hann) and projects delta(u) onto Legendre polynomials by Gauss-Legendre
-    quadrature. delta(u) is a degree-8 polynomial in cos(pi u / 2), so the series
-    does not terminate below ``degree=8``; the default 8 reconstructs the k2/k4 curve
-    exactly, and a lower `degree` deliberately truncates. No deconvolution is needed
-    because the measured curve is the INSTANTANEOUS shift. Generalizes
-    ``stark_chirp.stark_chirp_seed`` (pure |eta|^2) with the measured k4; ``rel_diff``
-    reports the difference.
+    With `ridge_law` (:func:`ridge_chirp.law_from_table`) the shift along the pulse is
+    the law read off the measured ridge instead of ``k2|eta|^2 + k4|eta|^4``, and its
+    ``delta0`` is the static part; ``quartic_fraction`` is then NaN (no truncated
+    series) and ``chirp_source`` is ``"ridge"``.
+
+    Evaluates the fitted shift ``k2 |eta|^2 + k4 |eta|^4`` along the pulse (``|eta(u)|
+    = eta* cos^2(pi u / 2)`` for a Hann) and projects delta(u) onto Legendre
+    polynomials by Gauss-Legendre quadrature. delta(u) is a polynomial in cos(pi u / 2),
+    NOT in u, so the Legendre series never terminates: every `degree` truncates. It
+    converges fast (Hann, k2 term alone: peak error ~16% at degree 4, ~0.7% at 8,
+    ~4e-5 at 12). The table's ``k2``/``k4`` are already the instantaneous law (a
+    constant probe, or a shaped probe deconvolved by :func:`rabi_shift_table`), so no
+    deconvolution happens here. ``rel_diff`` compares against
+    ``stark_chirp.stark_chirp_seed``, a pure-|eta|^2 HANN shape with the same mean, so
+    it also picks up k4, a non-Hann `shape` and DRAG.
 
     DRAG is a fixed point, not a formula
     -------------------------------------
-    DRAG adds a quadrature ``q(t) = (d eta/dt) / Delta(t)``; the Stark shift follows
-    the TOTAL drive, but ``Delta(t) = Delta_0 - k delta(t)`` moves with the chirp
-    being computed, so the two are iterated to a fixed point. k2/k4 from the
-    DRAG-blind constant probe still apply (DRAG only adds drive). ``q`` scales as
-    1/t_g, so with DRAG on the chirp is length-dependent and ``run_tune_up``'s outer
-    loop re-solves both together.
+    DRAG turns the drive into ``eta - i (d eta/dt) / Delta(t)`` (per channel, nested,
+    see :func:`drag.apply_drag`), and the Stark shift follows the magnitude of that
+    TOTAL drive. But ``Delta(t) = 2 pi beat + (stark_scale - n_pump) delta(t)`` moves
+    with the chirp being computed, so with `couple_drag` the two are iterated to a
+    fixed point. k2/k4 from the DRAG-free probe still apply (DRAG only adds drive).
+    The correction scales as 1/t_g, so the coupled chirp is length-dependent and
+    ``run_tune_up``'s outer loop re-solves chirp and length together.
+    ``couple_drag=False`` keeps the DRAG-off chirp (see the comment in the loop).
 
     Returns
     -------
     dict
-        ``coeffs_GHz`` (length degree+1, c_0 = 0 when pinned), ``mean_shift_GHz``,
-        ``rel_diff`` vs the pure-|eta|^2 analytic seed, ``quartic_fraction``,
-        ``measured_eta_max`` and ``extrapolation_ratio`` (target_eta over the largest
-        measured |eta|; well above 1 means the chirp's peak is extrapolated),
-        ``perturbative_ok``, and with DRAG on ``drag_iters``, ``drag_delta_frac``
-        (how much of the shift the quadrature adds) and ``min_abs_detuning_GHz``.
+        ``coeffs_GHz`` (length degree+1, c_0 = 0 when pinned); ``stark_mean_GHz``
+        (the unpinned c_0, the pulse-mean Stark shift); ``static_GHz`` (the fit's
+        ``delta0``); ``mean_shift_GHz`` (their sum, the carrier offset);
+        ``rel_diff``; ``quartic_fraction``; ``perturbative_ok``; ``degree``;
+        ``target_eta``; ``measured_eta_max`` and ``extrapolation_ratio`` (target_eta
+        over the largest measured |eta|; well above 1 means the chirp's peak is
+        extrapolated). With DRAG on also ``drag_iters``, ``drag_coupled``,
+        ``min_abs_detuning_GHz`` (and ``_per_channel_GHz``), ``n_drag_channels``,
+        ``drag_correction_ratio`` (peak change of |drive| over peak |drive|),
+        ``drag_delta_frac`` (relative change in the norm of delta(t) from DRAG; 0 when
+        decoupled) and ``neglected_shift_frac`` (the DRAG shift a decoupled chirp
+        leaves out, over the peak shift; 0 when coupled).
 
     ``quartic_fraction = |k4 eta*^4 / k2 eta*^2|`` sizes the last kept term of the
-    truncated series; when not small, the unmeasured eta^6 term is plausibly as
-    large. ``perturbative_ok`` flags it at `quartic_warn` (0.25 -> next term ~6%).
-    It inherits the fit's instability; :func:`shift_curve_stability` is independent.
+    truncated POWER series in |eta| (not the Legendre series); when not small, the
+    unmeasured eta^6 term is plausibly as large. ``perturbative_ok`` flags it at
+    `quartic_warn` (0.25 -> next term ~6%). It inherits the fit's instability;
+    :func:`shift_curve_stability` is independent.
     """
     from snail_solver import stark_chirp as SC
 
-    fit = table["fit"]
+    fit = (dict(delta0=ridge_law["delta0"]) if ridge_law is not None
+           else table["fit"])
     eta_star = float(target_eta if target_eta is not None else table["target_eta"])
-    k2, k4 = float(fit["k2"]), float(fit["k4"])
+    k2, k4 = ((float("nan"), float("nan")) if ridge_law is not None
+              else (float(fit["k2"]), float(fit["k4"])))
     # eta_star may exceed the measured window: flag the extrapolation.
     measured_eta = table.get("eta")
     measured_eta_max = (float(np.nanmax(np.asarray(measured_eta, dtype=float)))
@@ -1289,6 +1316,9 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
     amp = eta_star * s
 
     def shift_GHz(a):                                      # MHz law -> GHz
+        if ridge_law is not None:
+            from snail_solver.ridge_chirp import shift_MHz
+            return np.asarray(shift_MHz(ridge_law, a), dtype=float) * 1e-3
         return (k2 * a ** 2 + k4 * a ** 4) * 1e-3
 
     delta_GHz = shift_GHz(amp)
@@ -1304,26 +1334,27 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
         from snail_solver import drag as _drag
         from snail_solver.envelope import Chirp, PumpTone
         t_g = float(t_g)
-        # The pulse the SOLVER will play, built the way it builds it and AT t_g (see
-        # `_shape_envelope`). abs() of the DRAG'd drive is the general form: recursive
-        # DRAG's correction has a real part (-eta''/(Da Db)), so sqrt(amp^2 + q^2)
-        # holds only for one channel.
+        # The base envelope built AT the real t_g, so its jet (eta, eta', ...; bound
+        # to `shape` below) is in physical time (see `_shape_envelope`). abs() of the
+        # DRAG'd drive is the general form: recursive DRAG's correction has a real
+        # part (-eta''/(Da Db)), so sqrt(amp^2 + q^2) holds only for one channel.
         env = _shape_envelope(shape, shape_kw, t_g)
         env.amp = eta_star
         order = _drag.required_order(channels)
         shape = env.jet_at(t_g * (u + 1.0) / 2.0, order, np)
         min_abs = float("inf")
         # couple_drag=False is ONE-SHOT mode, the first Picard iterate: the chirp is
-        # built from the bare envelope and DRAG applied on top without feedback. It
-        # cannot diverge (no chirp chasing its own denominator), the chirp equals the
-        # DRAG-off chirp (a clean ablation), and it stays length-independent. The
-        # un-cancelled Stark shift of the added quadrature is reported as
-        # `neglected_shift_frac` / `drag_correction_ratio`.
+        # built from the bare envelope and DRAG (whose Delta(t) sees that chirp) is
+        # applied on top without feeding back. It cannot diverge (no chirp chasing its
+        # own denominator), the chirp equals the DRAG-off chirp (a clean ablation), and
+        # it stays length-independent. The Stark shift of the added correction, which
+        # the chirp then leaves un-cancelled, is reported as `neglected_shift_frac`.
         iters = int(max_iters) if couple_drag else 1
         for it in range(iters):
-            # Iterate on LEGENDRE COEFFICIENTS (the detuning jet needs d/dt of the
-            # chirp), projected at a HIGHER degree than emitted: truncation ripple
-            # near |u| = 1 lands in a physical denominator and can flip the sign of
+            # The iterate is delta(t) on the quadrature nodes; each pass re-projects
+            # it to a Legendre chirp (the detuning jet needs d/dt of the chirp) at
+            # degree >= 24, above the emitted `degree`: truncation ripple near
+            # |u| = 1 lands in a physical denominator and can flip the sign of
             # Delta - Delta_0 on a 50 MHz beat.
             chirp = Chirp(_project(delta_GHz, u, w, max(int(degree), 24)), t_g)
             tone = PumpTone(w_p_GHz=0.0, envelope=env, chirp=chirp,
@@ -1365,7 +1396,9 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
 
     coeffs = _project(delta_GHz, u, w, degree)
     stark_mean_GHz = float(coeffs[0])
-    # The static part is a carrier retune: added to the offset only, never the chirp.
+    # The fit's static delta0 is a carrier retune: added to the offset, never the
+    # chirp. The pulse-mean c_0 goes to the offset too, and stays in the chirp as
+    # well unless `pin_c0`.
     mean_shift_GHz = stark_mean_GHz + float(fit.get("delta0", 0.0)) * 1e-3
     if pin_c0:
         coeffs[0] = 0.0
@@ -1373,13 +1406,18 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
     analytic = SC.stark_chirp_seed(stark_mean_GHz, degree=degree, pin_c0=pin_c0)
     denom = float(np.linalg.norm(analytic))
     rel_diff = float(np.linalg.norm(coeffs - analytic) / denom) if denom else float("nan")
-    quartic = (abs(k4 * eta_star ** 4) / abs(k2 * eta_star ** 2)
-               if k2 else float("inf"))
+    if ridge_law is not None:
+        quartic = float("nan")                  # no truncated series to judge
+    else:
+        quartic = (abs(k4 * eta_star ** 4) / abs(k2 * eta_star ** 2)
+                   if k2 else float("inf"))
     return {"coeffs_GHz": coeffs, "mean_shift_GHz": mean_shift_GHz,
+            "chirp_source": "ridge" if ridge_law is not None else "law",
             "stark_mean_GHz": stark_mean_GHz,
             "static_GHz": float(fit.get("delta0", 0.0)) * 1e-3,
             "rel_diff": rel_diff, "quartic_fraction": float(quartic),
-            "perturbative_ok": bool(quartic < quartic_warn), **extra,
+            "perturbative_ok": bool(ridge_law is not None
+                                    or quartic < quartic_warn), **extra,
             "degree": int(degree), "target_eta": eta_star,
             "measured_eta_max": measured_eta_max,
             "extrapolation_ratio": extrapolation_ratio}
@@ -1627,8 +1665,17 @@ def _law_at(fit: Dict[str, Any], eta: np.ndarray) -> Optional[np.ndarray]:
 
 def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz: float,
                      t_g: float, out: str = "figs/chirp_ridge.png",
-                     title: Optional[str] = None) -> str:
+                     title: Optional[str] = None,
+                     shape: Optional[str] = None,
+                     shape_kw: Optional[Dict[str, Any]] = None,
+                     ridge_law: Optional[Dict[str, Any]] = None) -> str:
     """Overlay the chirp's pump trajectory on the Rabi map itself, not just its fit.
+
+    `shape`/`shape_kw` (``shape_config(config)``) map time to drive along the pulse
+    actually played; omitted, a raised cosine is assumed, which misplaces the chirp
+    vertically on any other envelope. `ridge_law` (``stages.ridge_law``) supplies the
+    ridge the chirp was built from, including rows the tracker recovered (drawn red);
+    a replayed table carries no ``delta_MHz`` of its own.
 
     Qiu et al. 2023 (arXiv:2306.10162) Fig. 4b: pump frequency on x, drive on y, the
     Rabi metric as colour, with the chirp's instantaneous frequency riding the
@@ -1652,6 +1699,11 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     eta = np.asarray(table["eta"], dtype=float)
     ridge = np.asarray(table.get("delta_MHz", np.full(eta.shape, np.nan)),
                        dtype=float)
+    status = None
+    if ridge_law is not None and ridge_law.get("ridge_MHz") is not None:
+        eta = np.asarray(ridge_law["ridge_eta"], dtype=float)
+        ridge = np.asarray(ridge_law["ridge_MHz"], dtype=float)
+        status = list(ridge_law.get("ridge_status") or [])
     fit = table.get("fit") or {}
     target_eta = float(proj["target_eta"])
     measured_eta_max = float(proj.get("measured_eta_max", np.nanmax(eta)))
@@ -1660,9 +1712,16 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     row_off = [np.asarray(c["offsets_GHz"], dtype=float) * 1e3 for c in chevrons]
     row_met = [np.asarray(c["metric"], dtype=float) for c in chevrons]
     dropped = [c.get("dropped") for c in chevrons]
+    if status is not None and len(status) == len(chevrons):
+        dropped = [None if st in ("gated", "tracked") else st for st in status]
 
     ts = np.linspace(0.0, float(t_g), 400)
-    eta_t = np.asarray(RaisedCosine(target_eta, float(t_g)).value_at(ts))
+    if shape is not None:
+        _env = _shape_envelope(shape, shape_kw, float(t_g))
+        _env.amp = target_eta
+        eta_t = np.abs(np.asarray(_env.value_at(ts, np), dtype=complex))
+    else:
+        eta_t = np.asarray(RaisedCosine(target_eta, float(t_g)).value_at(ts))
     chirp_MHz = 1e3 * (float(wp_offset_GHz)
                        + np.asarray(Chirp(proj["coeffs_GHz"], float(t_g)).detuning(ts))
                        / TWO_PI)
@@ -1687,8 +1746,13 @@ def plot_chirp_ridge(table: Dict[str, Any], proj: Dict[str, Any], wp_offset_GHz:
     if law is not None:
         ax.plot(law, ys, "-", lw=1.4, color="white", alpha=0.85,
                label="fitted ridge")
-    ax.plot(ridge, eta, "o", ms=6, color="white", mec=_C_INK, mew=1.0,
+    _trk = (np.array([st == "tracked" for st in status]) if status is not None
+            and len(status) == len(ridge) else np.zeros(ridge.shape, bool))
+    ax.plot(ridge[~_trk], eta[~_trk], "o", ms=6, color="white", mec=_C_INK, mew=1.0,
            label="measured ridge")
+    if _trk.any():
+        ax.plot(ridge[_trk], eta[_trk], "o", ms=6, color="#e34948", mec=_C_INK,
+               mew=1.0, label="ridge, tracked through a rejected row")
     drop_eta = [e for e, d in zip(row_eta, dropped) if d]
     if drop_eta:
         ax.plot([0.0] * len(drop_eta), drop_eta, "x", ms=7, mew=1.6,
@@ -2328,10 +2392,25 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 drag_decouple_fallback: bool = False,
                 probe_shape: str = "constant", moment_weighting: str = "rabi",
                 post_chirp_points: int = 0,
+                chirp_source: str = "law",
+                ridge_noise_MHz: Optional[float] = None,
+                rabi_table: Optional[Dict[str, Any]] = None,
+                drop_swept_channels: bool = False,
                 solver: Optional[Dict[str, Any]] = None,
                 logger: Optional[logging.Logger] = None,
                 **map_kw) -> Dict[str, Any]:
     """Run the full tune-up and return an operating-point record.
+
+    ``chirp_source="ridge"`` builds the chirp from the measured ridge itself
+    (:mod:`snail_solver.ridge_chirp`) rather than the ``k2/k4`` truncation: a crossing
+    or a non-converging series no longer costs the chirp. Only a railed ridge, a ridge
+    with no usable row, or an excursion within ``chirp_free_max_frac`` of a
+    half-linewidth leaves the column chirp-free. ``rabi_table`` replays a STORED step
+    1 (ridge mode only), so steps 2-4 can be redone without re-measuring.
+    ``drop_swept_channels`` drops a DRAG channel whose beat the calibrated chirp
+    sweeps inside the skip window, instead of raising when the gate is built; the
+    drops are in ``stages.drag_swept_dropped`` and the survivors in the returned
+    ``drag_channels``.
 
     Order, and what is held fixed at each step::
 
@@ -2389,27 +2468,45 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     chirp_free = False
     chirp_free_reason = None
     stark_crossing_eta = None
+    ridge = str(chirp_source) == "ridge"
+    if str(chirp_source) not in ("law", "ridge"):
+        raise ValueError(f"chirp_source={chirp_source!r}: expected 'law' or 'ridge'")
+    if rabi_table is not None and not ridge:
+        raise ValueError("rabi_table replays step 1 for chirp_source='ridge' only: "
+                         "the law path re-derives its verdicts while measuring")
     try:
-        table = rabi_shift_table(config, target_eta, **common)
+        if rabi_table is not None:
+            log.info("step 1: REPLAYING a stored Rabi table (no chevrons solved)")
+            table = dict(rabi_table)
+        else:
+            table = rabi_shift_table(config, target_eta, **common)
     except StarkCrossingInSweep as exc:
         # No trustworthy ridge at eta*: calibrate bare (and DRAG) and EXCLUDE the chirp.
-        if not chirp_free_fallback:
+        if ridge:                    # the ridge law follows a crossing; judged below
+            table = exc.table
+            stark_crossing_eta = exc.crossing_eta
+        elif not chirp_free_fallback:
             raise
-        table = exc.table
-        chirp_free = True
-        chirp_free_reason = "stark_crossing"
-        stark_crossing_eta = exc.crossing_eta
-        log.info(f"step 1: {exc} Calibrating the column WITHOUT a chirp so the bare "
-                 f"and DRAG series survive; the chirp series is EXCLUDED here, not "
-                 f"reported as no-gain.")
+        else:
+            table = exc.table
+            chirp_free = True
+            chirp_free_reason = "stark_crossing"
+            stark_crossing_eta = exc.crossing_eta
+            log.info(f"step 1: {exc} Calibrating the column WITHOUT a chirp so the "
+                     f"bare and DRAG series survive; the chirp series is EXCLUDED "
+                     f"here, not reported as no-gain.")
     except RabiFitError as exc:
-        if not chirp_free_fallback:
+        if ridge:                    # no law needed; the ridge itself is judged below
+            table = exc.table
+        elif not chirp_free_fallback:
             raise
         _fit = ((exc.table or {}).get("fit") or {})
         _frac = _fit.get("chirp_excursion_frac_linewidth")
         table = exc.table
-        chirp_free = True
-        if _frac is not None and float(_frac) <= float(chirp_free_max_frac):
+        chirp_free = not ridge
+        if ridge:
+            pass
+        elif _frac is not None and float(_frac) <= float(chirp_free_max_frac):
             chirp_free_reason = "no_measurable_shift"
             log.info(
                 f"step 1: no usable shift law ({exc}). The chirp would sweep only "
@@ -2435,12 +2532,51 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 f"(--span-linewidths for a railed ridge, --wp-points/--amp-points "
                 f"for a noisy one, a shorter --eta-hi for a truncated series).")
 
+    # -- 1b: the chirp's law read off the ridge itself (chirp_source="ridge") ----
+    law = None
+    if ridge:
+        from snail_solver.ridge_chirp import law_from_table
+        _qkw = {"contrast_min": float(contrast_min)}
+        if map_kw.get("leak_max") is not None:
+            _qkw["leak_max"] = float(map_kw["leak_max"])
+        try:
+            law = law_from_table(table, config, target_eta,
+                                 probe_shape=probe_shape,
+                                 moment_weighting=moment_weighting,
+                                 noise_MHz=ridge_noise_MHz, t_g_ns=t_g0, **_qkw)
+        except ValueError as exc:
+            chirp_free, chirp_free_reason = True, "no_usable_ridge"
+            log.warning(f"step 1b: no ridge law ({exc}); calibrating CHIRP-FREE "
+                        f"(an exclusion: nothing measured to chirp along)")
+        else:
+            if law["railed"]:
+                chirp_free, chirp_free_reason = True, "railed_ridge"
+                log.warning(f"step 1b: {law['n_railed']} ridge row(s) sit on their "
+                            f"scan edge -- not a measurement; calibrating CHIRP-FREE")
+            elif law["excursion_frac_linewidth"] <= float(chirp_free_max_frac):
+                chirp_free, chirp_free_reason = True, "no_measurable_shift"
+                log.info(f"step 1b: the ridge law swings "
+                         f"{law['excursion_MHz']:.3f} MHz at eta*, "
+                         f"{law['excursion_frac_linewidth']:.1%} of a half-linewidth: "
+                         f"nothing to chirp (an honest 1.00x)")
+            else:
+                chirp_free, chirp_free_reason = False, None
+                log.info(f"step 1b: RIDGE law over {law['n_used']} rows, misfit "
+                         f"{law['resid_MHz']:.4f} MHz (tolerance "
+                         f"{law['noise_MHz']:.4f}), swing {law['excursion_MHz']:.3f} "
+                         f"MHz at eta* = {law['excursion_frac_linewidth']:.0%} of a "
+                         f"half-linewidth"
+                         + (f"; through the crossing at |eta| = "
+                            f"{stark_crossing_eta:.3f}" if stark_crossing_eta
+                            else ""))
+
     def project(t_g: float) -> Dict[str, Any]:
         """The chirp implied by the measured law at this gate length."""
         if chirp_free:
             # No law, no chirp; delta0 is still the static carrier retune. The
             # neutral keys let every downstream reader work unchanged.
-            static = float((table.get("fit") or {}).get("delta0", 0.0)) * 1e-3
+            static = (float(law["delta0"]) if law is not None else
+                      float((table.get("fit") or {}).get("delta0", 0.0))) * 1e-3
             return {"coeffs_GHz": [], "chirp_free": True, "mean_shift_GHz": static,
                     "quartic_fraction": 0.0, "rel_diff": 0.0,
                     "perturbative_ok": True, "extrapolation_ratio": 1.0,
@@ -2450,7 +2586,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         kw = dict(degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
                   drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
                   shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn,
-                  max_iters=int(chirp_max_passes))
+                  max_iters=int(chirp_max_passes), ridge_law=law)
         try:
             return chirp_from_measured_shift(
                 table, target_eta, couple_drag=bool(couple_drag), **kw)
@@ -2491,6 +2627,9 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         return float(chev["resonance_offset_GHz"]) - float(wp_offset)
 
     stages: Dict[str, Any] = {"rabi": table}
+    if law is not None:
+        stages["ridge_law"] = law
+    swept_dropped: List[Dict[str, Any]] = []
     history = []
     t_g = t_g0
     drag_decoupled: List[float] = []      # min|Delta| at each fallback, if any
@@ -2509,6 +2648,33 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
 
         # -- 2: the chirp implied by the law at the current length ------------
         proj = project(t_g)
+        # A chirp can sweep a DRAG beat into the skip window mid-pulse even when the
+        # unchirped beat is clear; the quadrature then diverges. Drop exactly that
+        # channel (the skip window's own rule, applied to the CHIRPED beat) and
+        # re-project, rather than lose the column when the gate is built.
+        while drop_swept_channels and drag_channels and proj.get(
+                "min_abs_detuning_per_channel_GHz"):
+            from snail_solver.sweep_common import _drag_skip_GHz
+            _skip = _drag_skip_GHz(config)
+            _res = _resolve_drag_channels(None, drag_n_pump, drag_channels)
+            _fl = proj["min_abs_detuning_per_channel_GHz"]
+            _keep = [c for c, f in zip(_res, _fl) if float(f) >= _skip]
+            if len(_keep) == len(_res):
+                break
+            for c, f in zip(_res, _fl):
+                if float(f) < _skip:
+                    swept_dropped.append({"beat_GHz": float(c.beat_GHz),
+                                          "n_pump": int(c.n_pump),
+                                          "min_abs_detuning_GHz": float(f),
+                                          "pass": int(it)})
+                    log.warning(f"step 2: the chirp sweeps the DRAG beat "
+                                f"{c.beat_GHz * 1e3:+.1f} MHz (k={c.n_pump}) to "
+                                f"{float(f) * 1e3:.3f} MHz, inside the "
+                                f"{_skip * 1e3:g} MHz skip window: DROPPING that "
+                                f"channel and re-projecting")
+            drag_channels = list(_keep)
+            _drag_on = drag_beat_GHz is not None or bool(drag_channels)
+            proj = project(t_g)
         chirp = [float(c) for c in proj["coeffs_GHz"]]
         wp_offset = float(proj["mean_shift_GHz"])
         msg = (f"  chirp {['%+.6f' % c for c in chirp]} GHz, "
@@ -2632,6 +2798,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 jobs=jobs, logger=log)
     if drag_info:
         stages["drag_loop"] = drag_info
+    if swept_dropped:
+        stages["drag_swept_dropped"] = swept_dropped
 
     if do_time_rabi:
         try:
@@ -2691,6 +2859,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         "chirp_free": bool(chirp_free),
         "chirp_free_reason": chirp_free_reason,
         "stark_crossing_eta": stark_crossing_eta,
+        "chirp_source": str(chirp_source),
         # True when the coupled fixed point diverged and DRAG fell back to decoupled.
         "drag_decoupled": bool(drag_decoupled),
         "drag_decoupled_min_abs_detuning_GHz": (min(drag_decoupled)
@@ -2714,7 +2883,10 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     log.info(f"done: t_g={t_g:.3f} ns  amp_scale={record['amp_scale']:.5f}  "
              f"wp_offset={wp_offset * 1e3:+.3f} MHz  transfer={length['transfer']:.5f}")
     return {"operating_point": record, "stages": stages, "t_g0_ns": t_g0,
-            "drag": drag_info}
+            "drag": drag_info,
+            # the channels the calibrated pulse plays (after any swept drop)
+            "drag_channels": (list(drag_channels) if drag_channels is not None
+                              else None)}
 
 
 # ===========================================================================
@@ -2805,22 +2977,22 @@ def main() -> None:
                          "parasite). The audit is printed before solving. Exclusive "
                          "with --drag-channel / --drag-beat-GHz.")
     ap.add_argument("--max-drag-channels", type=int, default=4,
-                    help="cap on --drag-auto's recursion depth [4]; sets the "
-                         "sine_power m (and hence the pulse area and t_g).")
+                    help="cap on --drag-auto's recursion depth [4]; the device's "
+                         "envelope_m must be >= the channels selected.")
     ap.add_argument("--force", action="store_true",
                     help="with --drag-auto, solve even when a parasite is NOT "
                          "PERTURBATIVE (g/|det| >= 1), which no pulse shape fixes.")
     ap.add_argument("--spec-abs-GHz", type=float, default=None)
     ap.add_argument("--chirp-degree", type=int, default=8,
-                    help="Legendre truncation for the chirp. delta(u) is an exact "
-                         "degree-8 polynomial in cos(pi u/2), so 8 reconstructs the "
-                         "k2/k4 law exactly; lower truncates")
+                    help="Legendre truncation for the chirp (in u). delta(u) is a "
+                         "polynomial in cos(pi u/2), not in u, so every degree "
+                         "truncates; 8 leaves ~0.7%% peak error on a Hann")
     ap.add_argument("--quartic-warn", type=float, default=0.25,
                     help="warn (never raise) when the quartic term is this fraction "
                          "of the quadratic at target_eta")
     ap.add_argument("--window-tg", type=float, default=2.0,
-                    help="chevron time window in units of t_g0; ~2 captures a full "
-                         "exchange even for the weakest (slowest) drive row")
+                    help="chevron time window in units of each row's own "
+                         "nominal_t_g(|eta|) (2 swaps per unit at constant drive)")
     ap.add_argument("--n-time", type=int, default=161,
                     help="chevron readout times (one solve covers all of them)")
     ap.add_argument("--eta-lo", type=float, default=0.3,
@@ -2866,7 +3038,7 @@ def main() -> None:
                     help="what a shaped rung's chevron centre averages. 'rabi' "
                          "[default] weights by sin(theta(t)), the accumulated Rabi "
                          "angle (derived). 'coupling' and 'uniform' are kept for "
-                         "comparison; they underestimate k2 by 19%% and 2.1x")
+                         "comparison; they overestimate k2 by 19%% and 2.1x")
     ap.add_argument("--cross-check-moments", action="store_true",
                     help="measure the law with BOTH probes at --target-eta (keep it "
                          "weak, <~ 0.5) and report which moment weighting reproduces "

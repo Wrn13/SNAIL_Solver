@@ -5895,7 +5895,8 @@ class TestEtaScanShapesTheChirpNotTheScore(unittest.TestCase):
         with mock.patch("snail_solver.subharmonic_gate_scan.audit_column",
                         lambda *a, **k: ((), {"blocking": block, "total_error": 1.0,
                                               "t_g0_ns": 140.0})):
-            row = GS.solve_column(cfg, col, self.SETTINGS)
+            row = GS.solve_column(cfg, col, {**self.SETTINGS,
+                                             "refuse_nonperturbative": True})
         self.assertFalse(row["ok"])
         self.assertEqual(row["error"]["type"], "NonPerturbativeChannel")
         self.assertNotIn("fidelity", row)

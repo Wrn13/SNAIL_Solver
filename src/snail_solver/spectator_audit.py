@@ -482,6 +482,15 @@ def _audit_beat_key(beat_GHz: float, dedupe_MHz: float = 0.5) -> int:
     return int(round(float(beat_GHz) * 1e3 / max(float(dedupe_MHz), 1e-6)))
 
 
+#: The fixed DRAG set of the subharmonic scan's ``--drag-set subharm-leak``: the A
+#: |0>-|1> subharmonic (its emission row, the one the ranked selector played), the A
+#: |1>->|2> subharmonic, and the |2> leakage (either enumeration: same beat, same pump).
+FORCED_SUBHARM_LEAK: Tuple[Tuple[str, ...], ...] = (
+    ("a1->0 (2 pump)",),
+    ("a1->2 (2 pump)",),
+    ("a1->0 b1->2 (1 pump)", "a1->2 b1->0 (1 pump)"))
+
+
 def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
                          max_channels: int = 4,
                          require: Sequence[str] = ("leakage", "coupler"),
@@ -491,7 +500,9 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
                          min_g_MHz: float = 1e-3, min_ratio: float = 0.02,
                          max_ratio: float = 0.3,
                          chirp_coeffs_GHz: Optional[Sequence[float]] = None,
-                         quotient_rule: bool = True) -> Tuple[tuple, Dict[str, Any]]:
+                         quotient_rule: bool = True,
+                         force_transitions: Optional[Sequence[Sequence[str]]] = None,
+                         ) -> Tuple[tuple, Dict[str, Any]]:
     """Audit every near-resonant channel; pick the ones recursive DRAG should correct.
 
     Unions two enumerations: :func:`interaction_channels` (every Hamiltonian process;
@@ -512,6 +523,12 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
     ``run_tune_up(drag_channels=...)``, and a dict with ``rows`` (each with
     ``selected``/``reason``), ``blocking``, ``n_selected``, ``envelope_m_min``,
     ``w_p_GHz``, ``eta_peak``, ``t_g_ns``, ``total_error`` and the selection settings.
+
+    `force_transitions` replaces the ranking with a FIXED set: one entry per channel,
+    each a sequence of acceptable audit ``transition`` strings (first match wins), in
+    play order. A forced channel ignores the ratio limits, the verdict and the cap; only
+    the skip window still drops it, since DRAG's ``1/beat`` is undefined there. An entry
+    with no matching row is listed in ``audit["forced_missing"]``.
     """
     from snail_solver import sweep_common as SC
     from snail_solver.device_utils import build_coupler
@@ -597,6 +614,27 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
 
     chosen: List[Dict[str, Any]] = []
     taken: set = set()
+    forced_missing: List[List[str]] = []
+    if force_transitions is not None:
+        for want in force_transitions:
+            want = [str(w) for w in want]
+            hit = next((r for w in want for r in cand
+                        if str(r.get("transition")) == w), None)
+            if hit is None:
+                forced_missing.append(want)
+                continue
+            if _ident(hit) in taken:
+                # Same beat and pump count as a forced channel already chosen: the
+                # identical substitution, so that channel corrects this one too.
+                hit["reason"] = "forced; same substitution as another forced channel"
+                continue
+            hit["selected"], hit["reason"] = True, "forced"
+            taken.add(_ident(hit))
+            chosen.append(hit)
+        mand, rest = [], []
+        for r in cand:
+            if not r["selected"] and not r["reason"]:
+                r["reason"] = "not in the forced set"
     for r in mand + rest:
         ident = _ident(r)
         if ident in taken:
@@ -641,6 +679,9 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
              "total_error": float(total_error_estimate(
                  [r for r in rows if r["category"] != "target"])),
              "max_channels": cap, "require": list(req),
+             "forced": (None if force_transitions is None
+                        else [list(w) for w in force_transitions]),
+             "forced_missing": forced_missing,
              "min_ratio": float(min_ratio), "max_ratio": float(max_ratio),
              "uncorrected": [r for r in rows
                              if r.get("too_strong") and r["category"] != "target"],
