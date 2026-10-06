@@ -21,8 +21,13 @@
 # in all. Interruptible: finished columns are cached per column, and a re-run of this
 # script resumes (a pass with a .done sentinel is skipped).
 #
+# Step 3's constant carrier correction is capped at RESIDUAL_CAP (1) linewidth, so a
+# weak peak away from the measured ridge cannot drag the whole chirp off it.
+#
 # Knobs: WP_POINTS (41), OFFSETS (all 71 ticks), ETA (1.3), WORKERS x JOBS (12 x 6),
-# PASSES ("A C"). Pass C needs pass A's chevrons, so run A first.
+# PASSES ("A C"), RESIDUAL_CAP (1), TAG (fine). Pass C needs pass A's chevrons, so
+# run A first. A pilot on a few columns (TAG=pilot OFFSETS=...) writes its own .h5;
+# the full run then serves those columns from the shared per-column cache.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
@@ -39,6 +44,8 @@ JOBS=${JOBS:-6}
 ETA=${ETA:-1.3}
 PASSES=${PASSES:-"A C"}
 OFFSETS=${OFFSETS:-'-0.19:0.16:71'}
+RESIDUAL_CAP=${RESIDUAL_CAP:-1}
+TAG=${TAG:-fine}
 
 # Same physics as scripts/run_5mhz_ridge.sh except the offset grid.
 COMMON=(--device "$DEVICE" --branch above --probe-shape gate
@@ -48,6 +55,7 @@ COMMON=(--device "$DEVICE" --branch above --probe-shape gate
         --t1-us 50 --t2-us 50
         --chirp-free-fallback --drag-decouple-fallback
         --keep-origin --target-eta "$ETA" --chirp-source ridge
+        --residual-cap "$RESIDUAL_CAP"
         --column-workers "$WORKERS" --jobs "$JOBS")
 
 run_pass() {                                   # run_pass DIR TAG FLAGS...
@@ -72,13 +80,13 @@ etag="eta$(printf '%g' "$ETA" | tr '.' 'p')"
 echo "[$(date +%H:%M:%S)] 5 MHz fine-grid run -> $OUT  eta=$ETA  (${WORKERS}x${JOBS})"
 for pass in $PASSES; do
     case "$pass" in
-        A) run_pass "$OUT/passA_fine" "${etag}_fine" \
+        A) run_pass "$OUT/passA_fine" "${etag}_${TAG}" \
                --max-drag-channels 0 --envelope-m 3 ;;
         C) if ! ls "$OUT"/passA_fine/columns/*_rabi.npz >/dev/null 2>&1; then
                echo "pass C replays pass A's fine chevrons; run pass A first" >&2
                exit 1
            fi
-           run_pass "$OUT/passC_fine" "${etag}_fine" \
+           run_pass "$OUT/passC_fine" "${etag}_${TAG}" \
                --max-drag-channels 3 --envelope-m 3 --drag-set subharm-leak \
                --replay-rabi "$OUT/passA_fine" ;;
         *) echo "unknown pass $pass" >&2; exit 1 ;;

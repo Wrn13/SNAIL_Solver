@@ -40,8 +40,9 @@ PYEOF
 
 phase_b() {                                   # phase_b DIR OUTJSON
     local dir="$1" outjson="$2" h5
-    # sorted: eta1p3_full < eta1p3_tracked < eta1p3_tracked2, so re-solves win
-    h5=$(ls "$dir"/*.h5 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
+    # C-locale sort: eta1p3_full < eta1p3_tracked < eta1p3_tracked2, so re-solves win
+    # (a locale sort ignores the "." and puts tracked2 BEFORE tracked)
+    h5=$(ls "$dir"/*.h5 2>/dev/null | LC_ALL=C sort | tr '\n' ',' | sed 's/,$//')
     [[ -z "$h5" ]] && { echo "no .h5 in $dir"; return 1; }
     echo "[$(date +%H:%M:%S)] Phase B  $dir  ($h5)"
     "$PY" scripts/curve_drag_vs_bare.py "$h5" "$outjson" "$WORKERS" \

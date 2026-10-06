@@ -1240,6 +1240,7 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
                               tol_GHz: float = 1e-12,
                               quartic_warn: float = 0.25,
                               couple_drag: bool = True,
+                              carrier_extra_GHz: float = 0.0,
                               ridge_law: Optional[Dict[str, Any]] = None
                               ) -> Dict[str, Any]:
     """Step 2: project the measured shift onto the Legendre chirp basis.
@@ -1332,8 +1333,14 @@ def chirp_from_measured_shift(table: Dict[str, Any], target_eta: Optional[float]
                              "the quadrature is (d eta/dt)/Delta(t) and so scales as "
                              "1/t_g, which breaks the length-independence of the chirp")
         from snail_solver import drag as _drag
+        from snail_solver.device_utils import carrier_shifted
         from snail_solver.envelope import Chirp, PumpTone
         t_g = float(t_g)
+        # The carrier sits at delta0 + carrier_extra (step 3's residual) on top of the
+        # law's own mean, which the chirp below carries: shift by the static rest.
+        _, channels = carrier_shifted(
+            None, 0, channels,
+            float(fit.get("delta0", 0.0)) * 1e-3 + float(carrier_extra_GHz))
         # The base envelope built AT the real t_g, so its jet (eta, eta', ...; bound
         # to `shape` below) is in physical time (see `_shape_envelope`). abs() of the
         # DRAG'd drive is the general form: recursive DRAG's correction has a real
@@ -1478,7 +1485,8 @@ def plot_rabi_table(table: Dict[str, Any], out: str = "figs/rabi_chevrons.png",
     if not chevrons:
         raise ValueError("no chevrons to plot")
     eta = np.asarray(table["eta"], dtype=float)
-    ridge = np.asarray(table["delta_MHz"], dtype=float)
+    # A replayed table has no ridge of its own until step 1b writes one back.
+    ridge = np.asarray(table.get("delta_MHz", np.full(eta.size, np.nan)), dtype=float)
     leakage = np.asarray(table.get("leakage", np.full(eta.size, np.nan)), dtype=float)
     fit = table.get("fit")
     n = len(chevrons)
@@ -2369,6 +2377,24 @@ def project_nodrag_mean(table: Dict[str, Any], target_eta: float,
 # ===========================================================================
 # Orchestrator
 # ===========================================================================
+def _played_floors_GHz(channels, coeffs_GHz, t_g: float, n: int = 2001,
+                       carrier_offset_GHz: float = 0.0) -> list:
+    """``min_t |Delta_j(t)|`` per channel, GHz, for the chirp as the gate plays it.
+
+    ``Delta_j(t) = Delta_0 - k_j (carrier + delta(t))`` with the EMITTED chirp: the
+    beat :func:`device_utils.build_coupler` builds and guards.
+    """
+    from snail_solver.device_utils import carrier_shifted
+    _, channels = carrier_shifted(None, 0, list(channels), carrier_offset_GHz)
+    channels = channels or []
+    from snail_solver.envelope import Chirp
+    ts = np.linspace(0.0, float(t_g), int(n))
+    d = (np.asarray(Chirp(list(coeffs_GHz), float(t_g)).detuning(ts, np), dtype=float)
+         / TWO_PI) if len(coeffs_GHz) else np.zeros_like(ts)
+    return [float(np.min(np.abs(float(c.beat_GHz) - int(c.n_pump) * d)))
+            if int(c.n_pump) else abs(float(c.beat_GHz)) for c in channels]
+
+
 def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 drag_beat_GHz: Optional[float] = None, drag_n_pump: int = 1,
                 drag_channels=None,
@@ -2396,6 +2422,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                 ridge_noise_MHz: Optional[float] = None,
                 rabi_table: Optional[Dict[str, Any]] = None,
                 drop_swept_channels: bool = False,
+                residual_cap_linewidths: Optional[float] = None,
                 solver: Optional[Dict[str, Any]] = None,
                 logger: Optional[logging.Logger] = None,
                 **map_kw) -> Dict[str, Any]:
@@ -2570,6 +2597,17 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                             f"{stark_crossing_eta:.3f}" if stark_crossing_eta
                             else ""))
 
+    if law is not None and "delta_MHz" not in table:
+        # load_npz_rabi strips the old fit, so a replayed table has no ridge: put
+        # back the one the law was built from (gated + tracked rows, NaN elsewhere).
+        _te = np.asarray(table["eta"], dtype=float)
+        _rd = np.full(_te.shape, np.nan)
+        for _e, _r in zip(law.get("ridge_eta") or [], law.get("ridge_MHz") or []):
+            _j = int(np.argmin(np.abs(_te - float(_e))))
+            if np.isclose(_te[_j], float(_e), rtol=1e-6, atol=1e-9):
+                _rd[_j] = float(_r)
+        table["delta_MHz"] = _rd
+
     def project(t_g: float) -> Dict[str, Any]:
         """The chirp implied by the measured law at this gate length."""
         if chirp_free:
@@ -2583,7 +2621,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
                     "measured_eta_max": float(target_eta),
                     "target_eta": float(target_eta), "degree": int(chirp_degree),
                     "stark_mean_GHz": 0.0, "static_GHz": static}
-        kw = dict(degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
+        kw = dict(carrier_extra_GHz=last_residual_GHz,
+                  degree=chirp_degree, drag_beat_GHz=drag_beat_GHz,
                   drag_n_pump=drag_n_pump, drag_channels=drag_channels, t_g=t_g,
                   shape=_shape_kind, shape_kw=_shape_kw, quartic_warn=quartic_warn,
                   max_iters=int(chirp_max_passes), ridge_law=law)
@@ -2634,6 +2673,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     t_g = t_g0
     drag_decoupled: List[float] = []      # min|Delta| at each fallback, if any
     chirp, wp_offset, length = None, 0.0, None
+    last_residual_GHz = 0.0        # step 3's carrier correction, fed to the next pass
+    two_cycle = None               # set when the loop alternates between two states
     # With DRAG off (or decoupled) the chirp is length-independent: one pass. The
     # d-th nested correction scales as 1/t_g^d, so K channels get more passes.
     _shape_kind, _shape_kw = shape_config(config)
@@ -2652,12 +2693,18 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         # unchirped beat is clear; the quadrature then diverges. Drop exactly that
         # channel (the skip window's own rule, applied to the CHIRPED beat) and
         # re-project, rather than lose the column when the gate is built.
-        while drop_swept_channels and drag_channels and proj.get(
-                "min_abs_detuning_per_channel_GHz"):
+        # Judged on the beat the GATE plays (`_played_floors_GHz`: the emitted,
+        # zero-mean chirp on the nominal beat, as `build_coupler` checks it), not the
+        # projection's own floors: those carry the pulse-mean shift, which the gate
+        # moves into the carrier instead, so at +5 MHz they read 9.9 MHz where the
+        # gate swept the beat to 0.01 MHz -- even on the decoupled fallback.
+        while drop_swept_channels and drag_channels and len(proj["coeffs_GHz"]):
             from snail_solver.sweep_common import _drag_skip_GHz
             _skip = _drag_skip_GHz(config)
             _res = _resolve_drag_channels(None, drag_n_pump, drag_channels)
-            _fl = proj["min_abs_detuning_per_channel_GHz"]
+            _fl = _played_floors_GHz(_res, proj["coeffs_GHz"], t_g,
+                                     carrier_offset_GHz=(float(proj["mean_shift_GHz"])
+                                                         + last_residual_GHz))
             _keep = [c for c, f in zip(_res, _fl) if float(f) >= _skip]
             if len(_keep) == len(_res):
                 break
@@ -2709,9 +2756,54 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
 
         # -- 3: what the assembled gate still wants ---------------------------
         residual_GHz = shaped_residual(t_g, chirp, wp_offset)
+        # A constant offset moves the WHOLE chirp. When the assembled gate's best
+        # transfer sits far from where the ridge put it (a weak peak near a crossing:
+        # +8..+15 MHz at -50..-35 MHz), following it drags the low-|eta| part of
+        # the chirp off a ridge that was measured. Cap it at a fraction of the
+        # linewidth 1/(2 t_g), so the chirp stays on the measured ridge.
+        residual_raw_GHz = residual_GHz
+        if residual_cap_linewidths is not None:
+            _cap = float(residual_cap_linewidths) / (2.0 * float(t_g))   # GHz
+            if abs(residual_GHz) > _cap:
+                residual_GHz = float(np.sign(residual_GHz)) * _cap
+                log.warning(f"step 3: shaped-chevron residual "
+                            f"{residual_raw_GHz * 1e3:+.3f} MHz exceeds the cap "
+                            f"{residual_cap_linewidths:g} linewidth(s) = "
+                            f"{_cap * 1e3:.3f} MHz; CLAMPED to "
+                            f"{residual_GHz * 1e3:+.3f} MHz so the chirp stays on "
+                            f"the measured ridge")
         wp_offset += residual_GHz
+        last_residual_GHz = residual_GHz
         log.info(f"step 3: shaped-chevron residual {residual_GHz * 1e3:+.3f} MHz "
                  f"-> wp_offset={wp_offset * 1e3:+.3f} MHz")
+        if drop_swept_channels and drag_channels and len(chirp):
+            from snail_solver.sweep_common import _drag_skip_GHz
+            _skip = _drag_skip_GHz(config)
+            _res = _resolve_drag_channels(None, drag_n_pump, drag_channels)
+            _fl = _played_floors_GHz(_res, chirp, t_g, carrier_offset_GHz=wp_offset)
+            _keep = [c for c, fl in zip(_res, _fl) if float(fl) >= _skip]
+            if len(_keep) < len(_res):
+                for c, fl in zip(_res, _fl):
+                    if float(fl) < _skip:
+                        swept_dropped.append({"beat_GHz": float(c.beat_GHz),
+                                              "n_pump": int(c.n_pump),
+                                              "min_abs_detuning_GHz": float(fl),
+                                              "pass": int(it), "after": "step 3"})
+                        log.warning(f"step 3: the corrected carrier sweeps the DRAG "
+                                    f"beat {c.beat_GHz * 1e3:+.1f} MHz (k={c.n_pump}) "
+                                    f"to {float(fl) * 1e3:.3f} MHz: DROPPING that "
+                                    f"channel and re-measuring the residual")
+                drag_channels = list(_keep)
+                _drag_on = drag_beat_GHz is not None or bool(drag_channels)
+                wp_offset -= residual_GHz
+                residual_GHz = shaped_residual(t_g, chirp, wp_offset)
+                if residual_cap_linewidths is not None:
+                    _cap = float(residual_cap_linewidths) / (2.0 * float(t_g))
+                    residual_GHz = float(np.clip(residual_GHz, -_cap, _cap))
+                wp_offset += residual_GHz
+                last_residual_GHz = residual_GHz
+                log.info(f"step 3: residual without them {residual_GHz * 1e3:+.3f} "
+                         f"MHz -> wp_offset={wp_offset * 1e3:+.3f} MHz")
 
         # -- 4: the length, everything else frozen ----------------------------
         log.info("step 4: length scan at fixed |eta| (the only free parameter)")
@@ -2745,12 +2837,40 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
         dt = abs(t_g - prev_t_g)
         history.append({"iter": it, "t_g_ns": t_g, "max_dc_GHz": dc,
                         "d_t_g_ns": dt, "wp_offset_GHz": wp_offset,
-                        "residual_GHz": residual_GHz, "chirp_GHz": list(chirp)})
+                        "residual_GHz": residual_GHz,
+                        "residual_raw_GHz": residual_raw_GHz,
+                        "chirp_GHz": list(chirp)})
         if not _drag_on or not couple_drag:
             break
         log.info(f"  pass {it + 1}: max|dc|={dc:.2e} GHz, |d t_g|={dt:.4f} ns")
         if dc < chirp_tol_GHz and dt < 1e-3 * t_g0:
             break
+        # A 2-cycle (the capped residual flipping sign each pass) never converges,
+        # but each pass is deterministic: stop on the member whose gate sat closer
+        # to its own resonance (smaller raw step-3 residual). The other member is
+        # reproduced exactly by one more pass.
+        if two_cycle is not None:
+            break
+        if len(history) >= 3 and len(chirp) == len(history[-3]["chirp_GHz"]):
+            h0 = history[-3]
+            if (np.max(np.abs(np.array(chirp) - np.array(h0["chirp_GHz"])),
+                       initial=0.0) < chirp_tol_GHz
+                    and abs(t_g - h0["t_g_ns"]) < 1e-3 * t_g0
+                    and abs(wp_offset - h0["wp_offset_GHz"]) < 1e-6):
+                here, other = history[-1], history[-2]
+                keep = min((here, other), key=lambda h: abs(h["residual_raw_GHz"]))
+                two_cycle = {"members": [{k: h[k] for k in ("t_g_ns", "wp_offset_GHz",
+                                                             "residual_raw_GHz")}
+                                         for h in (other, here)],
+                             "kept_residual_raw_GHz": keep["residual_raw_GHz"]}
+                log.warning(f"  the chirp<->length loop is a 2-cycle (raw residual "
+                            f"{other['residual_raw_GHz'] * 1e3:+.3f} / "
+                            f"{here['residual_raw_GHz'] * 1e3:+.3f} MHz); keeping the "
+                            f"member with the smaller one")
+                if keep is here:
+                    break
+                if it + 1 >= n_outer:
+                    break      # cannot reach the other member: keep this one
     else:
         raise RuntimeError(
             f"the chirp<->length loop did not converge in {n_outer} passes (last "
@@ -2764,6 +2884,8 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     stages["residual_GHz"] = residual_GHz
     drag_info = ({"history": history, "iters": len(history)}
                  if _drag_on else None)
+    if drag_info and two_cycle is not None:
+        drag_info["two_cycle"] = two_cycle
 
     # Direct test of "DRAG shifts the resonance only by adding drive".
     if _drag_on and drag_beat_GHz is not None:

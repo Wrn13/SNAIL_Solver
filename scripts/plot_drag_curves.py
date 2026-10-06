@@ -1,7 +1,7 @@
 """One figure per target eta: the bare pulse, chirp only, and the chirp+DRAG gate.
 
 One panel, the traces side by side; colour and style both carry the variant, and
-in-window resonances are dashed lines. Every 5 MHz tick of the scanned range gets a
+in-window resonances are dashed lines. Every tick of the scanned range (its own spacing) gets a
 slot (an unsolved one stays empty), and the top axis gives the absolute pump
 frequency. Gate lengths (fitted per trace) are listed per column in `table.txt`.
 
@@ -144,8 +144,11 @@ BASE_ROWS = load_baseline(BASELINE)
 CAVEATS = {}
 
 
-def full_grid(eta, rows, step_MHz=5.0):
+def full_grid(eta, rows, step_MHz=None):
     """`rows` on every `step_MHz` tick of their range, stubs where nothing was solved.
+
+    `step_MHz` defaults to the scan's own spacing (the gcd of the solved columns'
+    spacings: 5 MHz for the 5 MHz curve, 3 for the 3 MHz one).
 
     The range is the union of this run's and the baseline's columns at `eta`, so a
     column only the baseline solved still gets its slot. A stub carries ``stub`` and
@@ -157,6 +160,8 @@ def full_grid(eta, rows, step_MHz=5.0):
     if not ticks:
         return []
     lo, hi = ticks[0], ticks[-1]
+    if step_MHz is None:
+        step_MHz = float(np.gcd.reduce(np.diff(ticks))) if len(ticks) > 1 else 5.0
     grid = np.round(np.arange(lo, hi + 0.5 * step_MHz, step_MHz)).astype(int)
     out = []
     for dm in list(grid) + [t for t in ticks if t not in set(grid)]:

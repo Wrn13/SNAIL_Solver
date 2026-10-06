@@ -65,6 +65,27 @@ def auto_t_g(g3_GHz: float, lam_a: float, lam_b: float, target_eta: float) -> fl
 DRAG_FLOOR_GHz: float = 5e-4
 
 
+def carrier_shifted(drag_beat_GHz: Optional[float], drag_n_pump: int,
+                    drag_channels: Optional[Sequence[Any]],
+                    carrier_offset_GHz: float) -> Tuple[Optional[float], Optional[list]]:
+    """DRAG beats moved by the pump's CARRIER offset: ``Delta_0 - n_pump * offset``.
+
+    The beats are audited at the nominal pump; the gate plays it at
+    ``nominal + carrier_offset_GHz`` with the zero-mean chirp on top, so a process
+    carrying ``n_pump`` pump quanta beats at ``Delta_0 - n_pump (offset + delta(t))``.
+    ``n_pump = 0`` (pump-independent) beats do not move. Returns the legacy
+    single-channel beat and the channel list, each ``None`` when absent.
+    """
+    import dataclasses
+    off = float(carrier_offset_GHz or 0.0)
+    beat = (None if drag_beat_GHz is None
+            else float(drag_beat_GHz) - int(drag_n_pump) * off)
+    chans = (None if not drag_channels else
+             [dataclasses.replace(c, beat_GHz=float(c.beat_GHz) - int(c.n_pump) * off)
+              for c in drag_channels])
+    return beat, chans
+
+
 def check_drag_detuning(tone, floor_GHz: float = DRAG_FLOOR_GHz) -> float:
     """Raise ValueError if a chirp drives a DRAG beat through (or near) zero mid-pulse.
 
@@ -208,6 +229,9 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
         # (tune_up's amplitude/length decoupling relies on it; see `tune_up.area_factor`)
         env_kw = {"m": int(config.get("envelope_m", 3)),
                   "t_rise": float(config.get("envelope_rise_frac", 0.5)) * t_g}
+    # DRAG beats follow the carrier (they were audited at the nominal pump)
+    drag_beat_GHz, drag_channels = carrier_shifted(drag_beat_GHz, drag_n_pump,
+                                                   drag_channels, wp_offset_GHz)
     tone = PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g, **env_kw),
                     is_eta=True,
                     drag=(drag_beat_GHz is not None),

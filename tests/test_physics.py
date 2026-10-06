@@ -2004,8 +2004,11 @@ class TestTuneUpRecursiveDrag(unittest.TestCase):
                 got = chirp_from_measured_shift(
                     self._table(), 1.8, degree=8, drag_beat_GHz=beat,
                     drag_n_pump=k, t_g=self.T_G, pin_c0=False)["coeffs_GHz"]
-                want = self._old_implementation(self._table(), 1.8, 8, beat, k,
-                                                self.T_G)
+                # the old code ignored the carrier: feed it the beat the new code
+                # plays, moved by the table's static delta0 (MHz) on k pump quanta
+                carrier = self._table()["fit"]["delta0"] * 1e-3
+                want = self._old_implementation(self._table(), 1.8, 8,
+                                                beat - k * carrier, k, self.T_G)
                 np.testing.assert_allclose(got, want,
                                            rtol=1e-11, atol=1e-16)
 

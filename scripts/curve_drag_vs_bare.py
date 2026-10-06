@@ -140,7 +140,7 @@ if __name__ == "__main__":
         except Exception as exc:                       # a corrupt cache is not fatal
             print(f"(ignoring unreadable {OUT}: {exc})", flush=True)
 
-    jobs, meta, skipped = [], {}, []
+    jobs, meta, skipped = {}, {}, []
     for src in SRC_LIST:
         rows, dev, settings = _scan_of(src)
         if dev is None:
@@ -172,11 +172,14 @@ if __name__ == "__main__":
             if not r.get("ok"):
                 skipped.append(key)
                 continue
+            # Keyed, so a later file's solved row (a re-solve) REPLACES an earlier
+            # one's job instead of both being scored and the last to finish winning.
             for v in VARIANTS:
                 if (key, v[0]) in cached:
                     continue
-                jobs.append({"key": key, "row": r, "device": dev, "variant": v,
-                             "tg_points": tgp, "tg_lo": tlo, "tg_hi": thi})
+                jobs[(key, v[0])] = {"key": key, "row": r, "device": dev, "variant": v,
+                                     "tg_points": tgp, "tg_lo": tlo, "tg_hi": thi}
+    jobs = list(jobs.values())
 
     print(f"{len(meta)} column(s): {len(meta) - len(skipped)} calibrated x "
           f"{len(VARIANTS)} variants; {len(jobs)} solves to run on {WORKERS} workers "

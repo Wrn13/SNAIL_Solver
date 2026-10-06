@@ -374,7 +374,9 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
                if settings.get("drag_set", "ranked") != "ranked" else {}),
             # A different law, so a different chirp; absent for the default.
             **({"chirp_source": str(settings["chirp_source"])}
-               if settings.get("chirp_source", "law") != "law" else {})}
+               if settings.get("chirp_source", "law") != "law" else {}),
+            **({"residual_cap": float(settings["residual_cap_linewidths"])}
+               if settings.get("residual_cap_linewidths") is not None else {})}
 
 
 #: ``--drag-set`` choices: ``ranked`` derives the channels per column by g/|det|
@@ -536,6 +538,7 @@ def solve_column(config: Dict[str, Any], col: Dict[str, Any],
             # A chirp can sweep a beat the unchirped audit cleared into the skip
             # window; drop that channel rather than lose the column.
             drop_swept_channels=bool(settings.get("drop_swept_channels", True)),
+            residual_cap_linewidths=settings.get("residual_cap_linewidths"),
             do_time_rabi=False, jobs=jobs, solver=solver, logger=logger,
             **settings.get("map_kw", {}))
 
@@ -754,6 +757,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
                 max_ratio: float = 0.3, drag_retries: int = 2,
                 drag_set: str = "ranked", refuse_nonperturbative: bool = False,
                 chirp_source: str = "law",
+                residual_cap_linewidths: Optional[float] = None,
                 replay_rabi_dirs: Sequence[str] = (),
                 column_workers: int = 1,
                 t1_us: Optional[float] = None, t2_us: Optional[float] = None,
@@ -852,6 +856,7 @@ def run_wp_scan(config: Dict[str, Any], offsets_GHz: Sequence[float],
         "drag_set": str(drag_set),
         "refuse_nonperturbative": bool(refuse_nonperturbative),
         "chirp_source": str(chirp_source),
+        "residual_cap_linewidths": _opt_float(residual_cap_linewidths),
         "t1_us": _opt_float(t1_us),
         "t2_us": _opt_float(t2_us),
         "decoh_prefactor": float(decoh_prefactor),
@@ -1515,6 +1520,10 @@ def main() -> None:
                          "chirp from the measured ridge itself (ridge_chirp), which "
                          "follows an avoided crossing and needs no converged series "
                          "[law]")
+    ap.add_argument("--residual-cap", type=float, default=None, metavar="LW",
+                    help="clamp step 3's constant carrier correction to LW "
+                         "linewidths 1/(2 t_g), so a weak peak far from the measured "
+                         "ridge cannot drag the whole chirp off it [no cap]")
     ap.add_argument("--replay-rabi", default=None, metavar="DIR[,DIR...]",
                     help="with --chirp-source ridge: reuse each column's stored "
                          "columns/col_<tag>_rabi.npz from the first DIR that has it "
@@ -1779,6 +1788,7 @@ def main() -> None:
         max_ratio=args.max_ratio, drag_retries=args.drag_retries,
         drag_set=args.drag_set, refuse_nonperturbative=args.refuse_nonperturbative,
         chirp_source=args.chirp_source,
+        residual_cap_linewidths=args.residual_cap,
         replay_rabi_dirs=tuple(d for d in (args.replay_rabi or "").split(",") if d),
         contrast_min=args.contrast_min, quartic_warn=args.quartic_warn,
         leak_max=args.leak_max, probe_shape=args.probe_shape,

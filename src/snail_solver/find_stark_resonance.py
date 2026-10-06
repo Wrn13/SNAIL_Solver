@@ -41,7 +41,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from snail_solver.device_utils import check_drag_detuning, load_device, target_eta_area
+from snail_solver.device_utils import (carrier_shifted, check_drag_detuning,
+                                      load_device, target_eta_area)
 
 TWO_PI: float = 2.0 * np.pi
 
@@ -125,12 +126,31 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
         # be a different pulse than the one being calibrated.
         t_g = float(t_g_ns if t_g_ns is not None else window_ns)
         env = envelope_from_config(config, t_g, amp=1.0)
-        tone = PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
-                        drag=(drag_beat_GHz is not None),
-                        delta_drag_GHz=drag_beat_GHz,
-                        chirp=make_chirp(chirp_coeffs_GHz, t_g),
-                        drag_n_pump=int(drag_n_pump),
-                        drag_channels=(list(drag_channels) if drag_channels else None))
+        # each scanned offset moves the carrier, and with it every pump-carrying beat
+        drag_beat_GHz, drag_channels = carrier_shifted(
+            drag_beat_GHz, drag_n_pump, drag_channels, wp_offset_GHz)
+
+        def _tone(beat, chans):
+            return PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
+                            drag=(beat is not None), delta_drag_GHz=beat,
+                            chirp=make_chirp(chirp_coeffs_GHz, t_g),
+                            drag_n_pump=int(drag_n_pump),
+                            drag_channels=(list(chans) if chans else None))
+        tone = _tone(drag_beat_GHz, drag_channels)
+        if drag_beat_GHz is not None or drag_channels:
+            # A probe offset that sweeps a beat into the skip window switches that
+            # channel off at THIS point only: the scan crosses offsets the gate never
+            # plays, and the gate's own beats are checked separately (tune-up).
+            from snail_solver.sweep_common import _drag_skip_GHz
+            skip_rad = _drag_skip_GHz(config) * TWO_PI
+            floors = tone.drag_detuning_floors()
+            if floors and min(floors) < skip_rad:
+                if drag_channels:
+                    drag_channels = [c for c, f in zip(tone.drag_channels_resolved(),
+                                                       floors) if f >= skip_rad]
+                else:
+                    drag_beat_GHz = None
+                tone = _tone(drag_beat_GHz, drag_channels)
         if drag_beat_GHz is not None or drag_channels:
             check_drag_detuning(tone)      # chirp must not sweep the pump onto the beat
         cpl.set_pump(tone, normalize_iswap=(0, 1))
