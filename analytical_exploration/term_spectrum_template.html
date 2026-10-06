@@ -1,0 +1,578 @@
+<title>SNAIL Term Spectrum</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one instrument panel. Controls (sweeps, window, orders), then a full-width
+   spectrum (stems on a log strength axis), then the table of every term in view.
+   Orders 1-5 are an ordinal blue ramp (lower order = more prominent); Kerr is orange;
+   terms kept in H_eff get a dark ring. */
+:root {
+  --page: #f6f6f3;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #7a7974;
+  --grid: #e5e4de;
+  --axis: #c3c2b7;
+  --band: rgba(42, 120, 214, 0.07);
+  --ring: rgba(11, 11, 11, 0.10);
+  --accent: #2a78d6;
+  --warn: #c2410c;
+  --kerr: #eb6834;
+  --r1: #104281; --r2: #1c5cab; --r3: #2a78d6; --r4: #5598e7; --r5: #86b6ef;
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0f0f0e; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #8f8d86;
+    --grid: #2c2c2a; --axis: #45453f; --band: rgba(57, 135, 229, 0.12); --ring: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5; --warn: #f0915f; --kerr: #d95926;
+    --r1: #b7d3f6; --r2: #86b6ef; --r3: #5598e7; --r4: #2a78d6; --r5: #1c5cab; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0f0f0e; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #8f8d86;
+  --grid: #2c2c2a; --axis: #45453f; --band: rgba(57, 135, 229, 0.12); --ring: rgba(255, 255, 255, 0.10);
+  --accent: #3987e5; --warn: #f0915f; --kerr: #d95926;
+  --r1: #b7d3f6; --r2: #86b6ef; --r3: #5598e7; --r4: #2a78d6; --r5: #1c5cab; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--page); color: var(--ink); font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 48px; display: grid; gap: 18px; }
+header { display: grid; gap: 6px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.sub { color: var(--ink-2); margin: 0; max-width: 80ch; }
+.params { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin: 0; overflow-wrap: anywhere; }
+.panel { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 16px; min-width: 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 16px 28px; align-items: end; }
+.ctl { display: grid; gap: 6px; min-width: 0; }
+.ctl-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 500; }
+.sweeps { flex: 1 1 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 14px 32px; }
+.sweep-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 12px; min-width: 0; }
+.pump-row { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.pump-row input { flex: 1; min-width: 0; accent-color: var(--accent); }
+.pump-row input:disabled { opacity: 0.5; }
+.step { font: inherit; font-size: 12px; width: 28px; height: 28px; flex: none; display: grid; place-items: center; cursor: pointer;
+        border: 1px solid var(--axis); border-radius: 7px; background: transparent; color: var(--ink); }
+.step:hover:not(:disabled) { background: var(--band); }
+.step:disabled { color: var(--muted); opacity: 0.45; cursor: default; }
+.exchange-row { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; }
+.lock { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.lock input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.exchange { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 12px; color: var(--ink-2); }
+.warn { color: var(--warn); }
+.readout { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
+.readout b { font-weight: 500; }
+.seg { display: inline-flex; border: 1px solid var(--axis); border-radius: 7px; overflow: hidden; }
+.seg button { font: inherit; font-size: 13px; background: transparent; color: var(--ink-2); border: 0; padding: 5px 11px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--axis); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.orders-ctl { flex: 1 1 420px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip { font: inherit; font-size: 13px; display: inline-flex; gap: 7px; align-items: center; padding: 4px 10px 4px 8px;
+        border: 1px solid var(--axis); border-radius: 999px; background: transparent; color: var(--ink); cursor: pointer; }
+.chip .sw { width: 10px; height: 10px; border-radius: 50%; background: var(--c); }
+.chip[aria-pressed="false"] { color: var(--muted); border-style: dashed; }
+.chip[aria-pressed="false"] .sw { background: transparent; box-shadow: inset 0 0 0 2px var(--c); }
+.chip:disabled { opacity: 0.45; cursor: not-allowed; }
+.hint { font-size: 12px; color: var(--muted); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chart-wrap { position: relative; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { font-family: var(--font-sans); fill: var(--muted); font-size: 11px; }
+svg .lbl { fill: var(--ink-2); font-family: var(--font-mono); font-size: 10.5px; }
+svg .axis-title { fill: var(--ink-2); font-size: 12px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--ring);
+       box-shadow: 0 6px 24px rgba(0,0,0,.14); border-radius: 8px; padding: 9px 11px; font-size: 12.5px; max-width: 340px; display: grid; gap: 4px; }
+.tip .t-head { display: flex; gap: 8px; align-items: center; font-weight: 600; }
+.tip .sw { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.tip .t-sig { font-family: var(--font-mono); font-weight: 500; }
+.tip .t-pump { font-family: var(--font-mono); color: var(--muted); font-size: 11.5px; }
+.tip dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 12px; margin: 0; font-variant-numeric: tabular-nums; }
+.tip dt { color: var(--muted); }
+.tip dd { margin: 0; font-family: var(--font-mono); }
+.tip .ops { font-family: var(--font-mono); color: var(--ink-2); font-size: 11.5px; }
+.note { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; max-width: 92ch; }
+.tbl-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; align-items: baseline; margin-bottom: 10px; }
+.tbl-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
+.tbl-head span { color: var(--muted); font-size: 12.5px; }
+.tbl-scroll { overflow: auto; max-height: 460px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+     padding: 6px 10px; border-bottom: 1px solid var(--axis); position: sticky; top: 0; background: var(--surface); white-space: nowrap; }
+th button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; text-transform: inherit; letter-spacing: inherit; }
+td { padding: 5px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+th.num { text-align: right; }
+td.sig { font-family: var(--font-mono); white-space: nowrap; }
+td.ops { font-family: var(--font-mono); color: var(--ink-2); font-size: 12px; }
+tr.hot td { background: var(--band); }
+.ord { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; }
+.ord .sw { width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
+@media (max-width: 640px) { .wrap { padding-inline: 16px; } td.ops { min-width: 180px; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>SNAIL Term Spectrum</h1>
+    <p class="sub">Every term of the linear-frame Hamiltonian and of its Schrieffer–Wolff expansion, placed at its detuning δ in the linear frame (it rotates as e<sup>−iδt</sup>). Operators are â₁, â₂ for the two modes and ŝ for the SNAIL, with η (η*) for each pump factor. Order <i>n</i> is everything generated at the <i>n</i>-th step, where each Kerr or g₃X̂³ term counts once. A term stays in the effective Hamiltonian if |δ| is inside the shaded band or if it is resonant (strength > |δ|); every other term is removed by the next step.</p>
+    <p class="params" id="params"></p>
+  </header>
+
+  <section class="panel controls" aria-label="Controls">
+    <div class="sweeps">
+      <div class="ctl">
+        <div class="sweep-head">
+          <label class="ctl-label" for="pump">Pump frequency ω<sub>p</sub>/2π</label>
+          <span class="readout" id="pump-readout"></span>
+        </div>
+        <div class="pump-row">
+          <button type="button" class="step" data-step="ip" data-dir="-1">◀</button>
+          <input type="range" id="pump" min="0" max="100" step="1" value="50">
+          <button type="button" class="step" data-step="ip" data-dir="1">▶</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <div class="sweep-head">
+          <label class="ctl-label" for="modeb" id="modeb-label">Mode frequency</label>
+          <span class="readout" id="modeb-readout"></span>
+        </div>
+        <div class="pump-row">
+          <button type="button" class="step" data-step="ib" data-dir="-1">◀</button>
+          <input type="range" id="modeb" min="0" max="60" step="1" value="30">
+          <button type="button" class="step" data-step="ib" data-dir="1">▶</button>
+        </div>
+      </div>
+      <div class="exchange-row">
+        <label class="lock"><input type="checkbox" id="lock"> <span id="lock-label">Lock pump to the exchange resonance</span></label>
+        <span class="exchange" id="exchange"></span>
+      </div>
+    </div>
+    <div class="ctl">
+      <span class="ctl-label" id="range-label">Frequency window</span>
+      <div class="seg" role="group" aria-labelledby="range-label" id="range"></div>
+    </div>
+    <div class="ctl orders-ctl">
+      <span class="ctl-label" id="order-label">Orders</span>
+      <div class="chips" role="group" aria-labelledby="order-label" id="orders"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="chart-wrap" id="chart-wrap">
+      <svg id="chart" role="img" aria-label="Term strength versus detuning"></svg>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <p class="note" id="note"></p>
+  </section>
+
+  <section class="panel">
+    <div class="tbl-head">
+      <h2>Terms in view</h2>
+      <span id="tbl-count"></span>
+    </div>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr>
+          <th>Order</th><th>Term</th>
+          <th class="num"><button data-sort="w" type="button">δ (MHz)</button></th>
+          <th class="num"><button data-sort="g" type="button">Strength (MHz)</button></th>
+          <th class="num"><button data-sort="r" type="button">Strength / |δ|</button></th>
+          <th>Operators</th><th>Note</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>const DATA = /*__DATA__*/null;</script>
+<script>
+(() => {
+  const ORDERS = [
+    { o: 0, name: "Kerr", c: "--kerr" },
+    { o: 1, name: "Order 1", c: "--r1" },
+    { o: 2, name: "Order 2", c: "--r2" },
+    { o: 3, name: "Order 3", c: "--r3", line: true },
+    { o: 4, name: "Order 4", c: "--r4", line: true },
+    { o: 5, name: "Order 5", c: "--r5", line: true },
+  ];
+  const RANGES = [
+    { key: "full", label: "Full", span: null },
+    { key: "2g", label: "±2 GHz", span: 2.0 },
+    { key: "300", label: "±300 MHz", span: 0.3 },
+  ];
+  const dev = DATA.device, T = DATA.terms, STEP = DATA.step, TIE = 1e-9, LINE = DATA.line;
+  const NP = Math.round((DATA.p_range[1] - DATA.p_range[0]) / STEP) + 1, NB = Math.round((DATA.b_range[1] - DATA.b_range[0]) / STEP) + 1;
+  const dpAt = (i) => DATA.p_range[0] + i * STEP, dbAt = (i) => DATA.b_range[0] + i * STEP;
+  const YLO = -3, YHI = 5;  // log10 MHz: 1 kHz to 100 GHz; stronger terms are pinned to the top
+  const sym = dev.sym, sweep = DATA.sweep, si = DATA.sweep_index;
+  const qubits = dev.modes.filter((m) => sym[m] !== "ŝ");
+  const state = { ip: Math.round(-DATA.p_range[0] / STEP), ib: Math.round(-DATA.b_range[0] / STEP),
+                  lock: false, range: "full", on: new Set([0, 1, 2, 3, 4, 5]), sort: "absw", hover: null };
+  try {
+    const saved = JSON.parse(localStorage.getItem("term-spectrum") || "null");
+    if (saved) {
+      state.range = saved.range || state.range; state.lock = !!saved.lock;
+      if (saved.on) state.on = new Set(saved.on);
+    }
+  } catch (e) {}
+  const save = () => { try { localStorage.setItem("term-spectrum", JSON.stringify({ range: state.range, lock: state.lock, on: [...state.on] })); } catch (e) {} };
+
+  const $ = (id) => document.getElementById(id);
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const fmt = (m) => { const a = Math.abs(m);
+    return (a >= 100 ? m.toFixed(0) : a >= 10 ? m.toFixed(1) : a >= 1 ? m.toFixed(2) : a >= 0.01 ? m.toFixed(3) : m.toPrecision(2)).replace("-", "−"); };
+  const signed = (mhz) => (mhz >= 0 ? "+" : "−") + Math.abs(mhz).toFixed(0);
+  const detuning = (t, dp, db) => t.w0 + t.s * dp + t.d[si] * db;  // GHz, linear frame
+  const RR = DATA.resonance_ratio;
+  const fixed = T.map((t, i) => [t, i]).filter(([t]) => t.o < 2);
+  const ordOf = (o) => ORDERS[o];
+
+  // Precomputed orders 3-5 along the exchange-locked line: per point and order,
+  // [count, (term | kept << 15, q) x count] as 16-bit words; q is a log-quantized strength.
+  const words = (() => {
+    const bin = atob(LINE.blob), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Uint16Array(bytes.buffer);
+  })();
+  const deq = (q, [lo, hi]) => (q === 0 ? 0 : Math.pow(10, lo + ((q - 1) / 65534) * (hi - lo)));
+  const lineStep = LINE.dbs.length > 1 ? LINE.dbs[1] - LINE.dbs[0] : STEP;
+  function lineRows(db) {
+    const li = Math.round((db - LINE.dbs[0]) / lineStep);
+    if (li < 0 || li >= LINE.dbs.length) return { rows: [], db: null };
+    let k = LINE.offsets[li];
+    const rows = [];
+    for (let n = 3; n <= 5; n++) {
+      const cnt = words[k++];
+      for (let j = 0; j < cnt; j++, k += 2) rows.push({ i: words[k] & 0x7fff, kept: words[k] >> 15 === 1, o: n, g: deq(words[k + 1], LINE.qa) });
+    }
+    return { rows, db: LINE.dbs[li] };
+  }
+
+  $("params").textContent =
+    dev.modes.map((m) => `${sym[m]}: ω/2π = ${dev.omega[m].toFixed(3)} GHz, λ = ${dev.lam[m]}, α = ${(dev.alpha[m] * 1e3).toFixed(0)} MHz`).join("  ·  ") +
+    `  ·  g₃ = ${dev.g[3] * 1e3} MHz, η = ${dev.eta}`;
+  $("note").textContent =
+    `Strength is the largest matrix element |⟨m|h|n⟩| out of any state with at most ${DATA.max_exc} total excitations (exact, no Fock cutoff). ` +
+    `The shaded band is |δ| < ${DATA.slow_cutoff * 1e3} MHz. Ringed marks and shaded rows are kept in the effective Hamiltonian: inside the band, ` +
+    `or resonant (strength > ${RR === 1 ? "" : RR + " × "}|δ|), since removing those would need a generator larger than 1. ` +
+    `Kerr, order 1 and order 2 are computed live at any frequency; orders 3–5 are precomputed along the exchange-locked line (the ${LINE.top_k} strongest terms per order and point). ` +
+    `Terms weaker than 1 kHz are hidden; terms above 100 GHz are pinned to the top as ▲.`;
+
+  // Sweep controls: slider plus arrows that step one grid point
+  const sweeps = [
+    { key: "ip", input: $("pump"), n: NP, step: `${Math.round(STEP * 1e3)} MHz` },
+    { key: "ib", input: $("modeb"), n: NB, step: `${Math.round(STEP * 1e3)} MHz` },
+  ];
+  $("modeb-label").textContent = `Mode ${sym[sweep]} frequency`;
+  const [m1, m2] = qubits.length === 2 ? qubits : [null, null];
+  const omegaAt = (m, db) => dev.omega[m] + (m === sweep ? db : 0);
+  const exchangeTarget = (db) => Math.abs(omegaAt(m2, db) - omegaAt(m1, db)) - dev.wp0;  // as a pump offset
+  let lockClamped = false;
+  function applyLock() {
+    lockClamped = false;
+    if (!state.lock || !m1) return;
+    const raw = Math.round((exchangeTarget(dbAt(state.ib)) - DATA.p_range[0]) / STEP);
+    state.ip = Math.min(NP - 1, Math.max(0, raw));
+    lockClamped = raw !== state.ip;
+    $("pump").value = state.ip;
+  }
+  if (m1) {
+    $("lock-label").textContent = `Lock ω_p to the exchange resonance |ω${sym[m2].slice(1)} − ω${sym[m1].slice(1)}|`;
+    $("lock").checked = state.lock;
+    $("lock").addEventListener("change", () => { state.lock = $("lock").checked; save(); render(); });
+  } else {
+    $("lock").closest(".lock").hidden = true;
+  }
+  sweeps.forEach((S) => {
+    S.input.max = S.n - 1; S.input.value = state[S.key];
+    S.input.addEventListener("input", () => { state[S.key] = +S.input.value; render(); });
+    document.querySelectorAll(`[data-step="${S.key}"]`).forEach((b) => {
+      const dir = +b.dataset.dir;
+      b.title = `${dir > 0 ? "+" : "−"}${S.step}`;
+      b.setAttribute("aria-label", `${dir > 0 ? "Raise" : "Lower"} by ${S.step}`);
+      b.addEventListener("click", () => {
+        state[S.key] = Math.min(S.n - 1, Math.max(0, state[S.key] + dir));
+        S.input.value = state[S.key]; render();
+      });
+    });
+  });
+  RANGES.forEach((r) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = r.label; b.dataset.key = r.key;
+    b.addEventListener("click", () => { state.range = r.key; save(); render(); });
+    $("range").appendChild(b);
+  });
+  ORDERS.forEach((O) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip"; b.style.setProperty("--c", `var(${O.c})`);
+    b.innerHTML = `<span class="sw"></span>${O.name}`; b.dataset.o = O.o;
+    b.addEventListener("click", () => { if (state.on.has(O.o)) state.on.delete(O.o); else state.on.add(O.o); save(); render(); });
+    $("orders").appendChild(b);
+  });
+  const hint = document.createElement("span");
+  hint.className = "hint"; hint.id = "order-hint";
+  $("orders").appendChild(hint);
+  document.querySelectorAll("th button[data-sort]").forEach((b) => b.addEventListener("click", () => {
+    const k = b.dataset.sort;
+    state.sort = state.sort === k ? "abs" + k : k === "w" ? "absw" : k;
+    renderTable();
+  }));
+
+  // Fixed x axis over the whole sweep: carriers are linear, so extremes sit at the corners
+  const corners = [[dpAt(0), dbAt(0)], [dpAt(0), dbAt(NB - 1)], [dpAt(NP - 1), dbAt(0)], [dpAt(NP - 1), dbAt(NB - 1)]];
+  let wmin = Infinity, wmax = -Infinity;
+  // orders 3-5 live on the locked line, where the pump offset has a kink at omega_2 = omega_1
+  const linePts = m1 ? [LINE.dbs[0], LINE.dbs[LINE.dbs.length - 1], dev.omega[m1] - dev.omega[m2]].filter((b) => b >= LINE.dbs[0] && b <= LINE.dbs[LINE.dbs.length - 1]) : [];
+  T.forEach((t) => {
+    const pts = t.o > 2 ? linePts.map((b) => [exchangeTarget(b), b]) : corners;
+    pts.forEach(([p, b]) => { const w = detuning(t, p, b); wmin = Math.min(wmin, w); wmax = Math.max(wmax, w); });
+  });
+
+  // Order 2: R_2 = [S_1, H_s] + (1/2)[S_1, F_1] = sum_{i<j} c_ij [h_i, h_j] over first-order bins and H_anh,
+  // c_ij = (1/2)(1/d_j - 1/d_i) both fast, -1/d_i only i fast, +1/d_j only j fast (d = detuning).
+  // A bin is slow if |d| < slow_cutoff or strength > RR |d|; if the order-2 term at a fast bin's signature
+  // is itself resonant, that bin becomes slow and R_2 is recomputed (HighOrderExpansion's restart rule).
+  // Mirrors browser_second_order in term_spectrum.py, which is checked against HighOrderExpansion.
+  function secondOrder(dp, db) {
+    const dl = DATA.bins.map(([s, d], k) => DATA.bin_w0[k] + s * dp + d[si] * db);
+    const sc = DATA.slow_cutoff;
+    const fast = DATA.bins.map(([, , g], k) => Math.abs(dl[k]) >= sc - TIE && g <= RR * Math.abs(dl[k]));
+    for (;;) {
+      const acc = new Map(), count = new Map();
+      for (const [i, j, kind, t, f] of DATA.pairs) {
+        const a = dl[i], b = dl[j], fa = fast[i], fb = fast[j];
+        const c = fa && fb ? 0.5 * (1 / b - 1 / a) : fa ? -1 / a : fb ? 1 / b : 0;
+        if (c === 0) continue;
+        if (kind === 0) {
+          for (let k = 0; k < f.length; k += 3) {
+            let m = acc.get(f[k]); if (!m) acc.set(f[k], (m = new Map()));
+            const v = m.get(0) || [0, 0]; v[0] += c * f[k + 1]; v[1] += c * f[k + 2]; m.set(0, v);
+            count.set(f[k], (count.get(f[k]) || 0) + 1);
+          }
+        } else {
+          let m = acc.get(t); if (!m) acc.set(t, (m = new Map()));
+          for (let k = 0; k < f.length; k += 4) {
+            const key = f[k] * 64 + f[k + 1], v = m.get(key) || [0, 0];
+            v[0] += c * f[k + 2]; v[1] += c * f[k + 3]; m.set(key, v);
+          }
+          count.set(t, (count.get(t) || 0) + 1);
+        }
+      }
+      const g2 = new Map();
+      acc.forEach((m, t) => { let g = 0; m.forEach((v) => { g = Math.max(g, Math.hypot(v[0], v[1])); }); g2.set(t, g * 1e3 * (T[t].wt || 1)); });
+      let restart = false;
+      DATA.bins.forEach(([, , , t2], b) => {
+        if (fast[b] && t2 >= 0 && (g2.get(t2) || 0) / 1e3 > RR * Math.abs(dl[b])) { fast[b] = false; restart = true; }
+      });
+      if (restart) continue;
+      const slowSig = new Set(DATA.bins.filter((_, b) => !fast[b]).map(([s, d]) => `${s}|${d}`));
+      const out = [];
+      g2.forEach((g, t) => out.push({ t: T[t], i: t, o: 2, g, pairs: count.get(t), slowSig }));
+      return { rows: out, slowSig };
+    }
+  }
+
+  function frameRows() {
+    const dp = dpAt(state.ip), db = dbAt(state.ib);
+    const sc = DATA.slow_cutoff;
+    const second = secondOrder(dp, db);
+    const rows = fixed.map(([t, i]) => ({ t, i, o: t.o, g: t.g })).concat(second.rows);
+    let lineDb = null;
+    if (state.lock && m1) {
+      const L = lineRows(db);
+      lineDb = L.db;
+      L.rows.forEach((r) => { if (r.g > 0) rows.push({ t: T[r.i], i: r.i, o: r.o, g: r.g, kept: r.kept }); });
+    }
+    rows.forEach((r) => {
+      r.w = detuning(r.t, dp, db);
+      r.id = `${r.o}|${r.i}`;
+      if (r.kept == null) {  // live orders: same rule as HighOrderExpansion
+        const sigKey = `${r.t.s}|${r.t.d}`;
+        r.kept = r.t.o === 0 || r.t.x === "static" || Math.abs(r.w) < sc || second.slowSig.has(sigKey) ||
+                 (r.o === 2 && r.g / 1e3 > RR * Math.abs(r.w));
+      }
+      const why = !r.kept ? "" : Math.abs(r.w) < sc || r.t.x === "static" || r.t.o === 0 ? "kept in H_eff" : "kept in H_eff (resonant)";
+      r.note = [r.t.x === "pair terms" && r.pairs ? `${r.pairs} pair${r.pairs > 1 ? "s" : ""}` : r.t.x === "static" ? "static" : r.t.x, why]
+        .filter(Boolean).join(", ");
+    });
+    return { rows, lineDb };
+  }
+  function currentRows() {
+    const R = RANGES.find((r) => r.key === state.range);
+    const lineOk = state.lock && !!m1;
+    const F = frameRows();
+    F.rows = F.rows.filter((r) => state.on.has(r.o) && (!ordOf(r.o).line || lineOk) &&
+                             r.g >= Math.pow(10, YLO) && (R.span == null || Math.abs(r.w) <= R.span));
+    return F;
+  }
+  function niceTicks(lo, hi, n) {
+    const step0 = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+    const step = [1, 2, 2.5, 5, 10].map((s) => s * mag).find((s) => s >= step0);
+    const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-12; v += step) out.push(+v.toFixed(10));
+    return out;
+  }
+
+  function render() {
+    applyLock();
+    const dp = dpAt(state.ip), db = dbAt(state.ib);
+    const wp = dev.wp0 + dp, wb = dev.omega[sweep] + db;
+    $("pump-readout").innerHTML = `<b>${wp.toFixed(3)} GHz</b> · ${signed(dp * 1e3)} MHz`;
+    $("modeb-readout").innerHTML = `<b>${wb.toFixed(3)} GHz</b> · ${signed(db * 1e3)} MHz`;
+    $("pump").setAttribute("aria-valuetext", `${wp.toFixed(3)} GHz`);
+    $("modeb").setAttribute("aria-valuetext", `${wb.toFixed(3)} GHz`);
+    if (m1) {
+      const det = dp - exchangeTarget(db);
+      $("exchange").innerHTML = `Exchange detuning ω_p − |ω${sym[m2].slice(1)} − ω${sym[m1].slice(1)}| = ${signed(det * 1e3)} MHz` +
+        (lockClamped ? ` <span class="warn">(resonance is outside the pump sweep)</span>` : "");
+    }
+    const locked = state.lock && !!m1;
+    $("pump").disabled = locked;
+    document.querySelectorAll("[data-step]").forEach((b) => {
+      const S = sweeps.find((x) => x.key === b.dataset.step), v = state[S.key] + +b.dataset.dir;
+      b.disabled = v < 0 || v > S.n - 1 || (locked && S.key === "ip");
+    });
+    document.querySelectorAll("#range button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.key === state.range));
+    document.querySelectorAll("#orders .chip[data-o]").forEach((b) => {
+      const O = ordOf(+b.dataset.o), off = O.line && !locked;
+      b.disabled = off;
+      b.title = off ? "Orders 3–5 are precomputed along the exchange-locked line: turn on the lock" : "";
+      b.setAttribute("aria-pressed", state.on.has(O.o) && !off);
+    });
+    $("order-hint").textContent = locked ? "" : "Orders 3–5 need the exchange lock.";
+    drawChart();
+    renderTable();
+  }
+
+  const svg = $("chart");
+  const W = 1140, H = 440, M = { l: 62, r: 18, t: 26, b: 46 };
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+  let view = [];
+
+  function drawChart() {
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const { rows } = currentRows();
+    const R = RANGES.find((r) => r.key === state.range);
+    const xlo = R.span == null ? Math.floor(wmin) : -R.span, xhi = R.span == null ? Math.ceil(wmax) : R.span;
+    const unitMHz = R.span != null && R.span <= 0.5;
+    const X = (w) => M.l + (Math.min(xhi, Math.max(xlo, w)) - xlo) / (xhi - xlo) * (W - M.l - M.r);
+    const Y = (g) => M.t + (YHI - Math.min(YHI, Math.log10(g))) / (YHI - YLO) * (H - M.t - M.b);
+    const base = H - M.b;
+    const sc = DATA.slow_cutoff;
+    el("rect", { x: X(Math.max(-sc, xlo)), y: M.t, width: Math.max(1.5, X(Math.min(sc, xhi)) - X(Math.max(-sc, xlo))), height: base - M.t, fill: css("--band") }, svg);
+    for (let e = YLO; e <= YHI; e++) {
+      const y = Y(Math.pow(10, e));
+      el("line", { x1: M.l, x2: W - M.r, y1: y, y2: y, stroke: css("--grid"), "stroke-width": 1 }, svg);
+      const t = el("text", { x: M.l - 8, y: y + 4, "text-anchor": "end" }, svg);
+      t.textContent = e >= 3 ? `${Math.pow(10, e - 3)} GHz` : e >= 0 ? `${Math.pow(10, e)} MHz` : `${+(Math.pow(10, e + 3)).toPrecision(1)} kHz`;
+    }
+    niceTicks(xlo, xhi, unitMHz ? 6 : 10).forEach((v) => {
+      const x = X(v);
+      el("line", { x1: x, x2: x, y1: base, y2: base + 5, stroke: css("--axis"), "stroke-width": 1 }, svg);
+      const t = el("text", { x, y: base + 18, "text-anchor": "middle" }, svg);
+      t.textContent = (unitMHz ? (v * 1e3).toFixed(0) : Math.abs(v) < 1e-9 ? "0" : v.toString()).replace("-", "−");
+      if (Math.abs(v) < 1e-9) el("line", { x1: x, x2: x, y1: M.t, y2: base, stroke: css("--axis"), "stroke-width": 1 }, svg);
+    });
+    el("line", { x1: M.l, x2: W - M.r, y1: base, y2: base, stroke: css("--axis"), "stroke-width": 1 }, svg);
+    const xt = el("text", { x: (M.l + W - M.r) / 2, y: H - 8, "text-anchor": "middle", class: "axis-title" }, svg);
+    xt.textContent = `Detuning δ/2π in the linear frame (${unitMHz ? "MHz" : "GHz"})`;
+    const yt = el("text", { x: 14, y: (M.t + base) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 14 ${(M.t + base) / 2})` }, svg);
+    yt.textContent = "Strength";
+
+    // weakest first so strong terms sit on top; higher orders under lower ones at equal strength
+    view = rows.slice().sort((a, b) => a.g - b.g || b.o - a.o).map((r) => ({ r, x: X(r.w), y: Y(r.g) }));
+    const gStems = el("g", {}, svg), gDots = el("g", {}, svg);
+    const surf = css("--surface");
+    view.forEach((v) => {
+      const col = css(ordOf(v.r.o).c);
+      el("line", { x1: v.x, x2: v.x, y1: base, y2: v.y, stroke: col, "stroke-width": 2, "stroke-linecap": "round", opacity: 0.5 }, gStems);
+      const ring = v.r.kept ? css("--ink") : surf;
+      if (v.r.g > Math.pow(10, YHI)) {  // off the top: an up-pointing marker at the edge
+        el("path", { d: `M${v.x - 5.5},${v.y + 4} L${v.x + 5.5},${v.y + 4} L${v.x},${v.y - 5} Z`, fill: col, stroke: ring, "stroke-width": 2, "stroke-linejoin": "round" }, gDots);
+      } else {
+        el("circle", { cx: v.x, cy: v.y, r: 4.5, fill: col, stroke: ring, "stroke-width": 2 }, gDots);
+      }
+    });
+    const placed = [];
+    for (const v of view.slice().sort((a, b) => b.r.g - a.r.g)) {
+      if (placed.length >= 8) break;
+      const w = [...v.r.t.l].length * 6.4, x0 = Math.min(Math.max(v.x - w / 2, M.l), W - M.r - w), y0 = v.y - 10;
+      if (y0 < M.t - 14) continue;
+      if (placed.some((p) => x0 < p.x1 + 6 && x0 + w > p.x0 - 6 && Math.abs(y0 - p.y) < 14)) continue;
+      if (view.some((u) => u !== v && Math.abs(u.x - (x0 + w / 2)) < w / 2 && u.y > y0 - 12 && u.y < y0 + 4)) continue;
+      placed.push({ x0, x1: x0 + w, y: y0 });
+      el("text", { x: x0, y: y0, class: "lbl" }, svg).textContent = v.r.t.l;
+    }
+    if (state.hover != null) {
+      const v = view.find((u) => u.r.id === state.hover);
+      if (v) el("circle", { cx: v.x, cy: v.y, r: 8, fill: "none", stroke: css("--ink"), "stroke-width": 1.5 }, svg);
+    }
+  }
+
+  const tip = $("tip"), wrap = $("chart-wrap");
+  function pick(evt) {
+    const rect = svg.getBoundingClientRect(), s = rect.width / W;
+    const px = (evt.clientX - rect.left) / s, py = (evt.clientY - rect.top) / s;
+    let best = null, bd = (18 / s) ** 2;
+    for (const v of view) { const d = (v.x - px) ** 2 + (v.y - py) ** 2; if (d < bd) { bd = d; best = v; } }
+    return best;
+  }
+  const opsText = (t, n) => t.ops.slice(0, n).join("  +  ") + ((t.nops || t.ops.length) > n ? `  + ${(t.nops || t.ops.length) - n} more` : "");
+  function showTip(v, evt) {
+    const r = v.r, t = r.t, O = ordOf(r.o);
+    const ratio = Math.abs(r.w) > 0 ? r.g / Math.abs(r.w * 1e3) : Infinity;
+    tip.innerHTML = `<div class="t-head"><span class="sw" style="background:var(${O.c})"></span>${O.name}</div>
+      <div class="t-sig">${t.l}</div>
+      <div class="t-pump">signature ${t.sig}</div>
+      <dl><dt>δ/2π</dt><dd>${fmt(r.w * 1e3)} MHz</dd><dt>Strength</dt><dd>${fmt(r.g)} MHz</dd>
+      <dt>Strength/|δ|</dt><dd>${isFinite(ratio) ? ratio.toPrecision(3) : "static (δ = 0)"}</dd>${r.note ? `<dt>Note</dt><dd>${r.note}</dd>` : ""}</dl>
+      <div class="ops">${opsText(t, 8)}</div>`;
+    tip.hidden = false;
+    const wr = wrap.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
+    let x = evt.clientX - wr.left + 14, y = evt.clientY - wr.top + 14;
+    if (x + tw > wr.width) x = evt.clientX - wr.left - tw - 14;
+    if (y + th > wr.height) y = Math.max(0, evt.clientY - wr.top - th - 14);
+    tip.style.left = Math.max(0, x) + "px"; tip.style.top = y + "px";
+  }
+  svg.addEventListener("pointermove", (evt) => {
+    const v = pick(evt);
+    if (!v) { if (state.hover != null) { state.hover = null; drawChart(); } tip.hidden = true; svg.style.cursor = ""; return; }
+    svg.style.cursor = "crosshair";
+    if (state.hover !== v.r.id) { state.hover = v.r.id; drawChart(); }
+    showTip(v, evt);
+  });
+  svg.addEventListener("pointerleave", () => { tip.hidden = true; if (state.hover != null) { state.hover = null; drawChart(); } });
+
+  function renderTable() {
+    const { rows: base, lineDb } = currentRows();
+    const rows = base.map((r) => ({ ...r, ratio: Math.abs(r.w) > 0 ? r.g / Math.abs(r.w * 1e3) : Infinity }));
+    const key = { w: (r) => r.w, absw: (r) => Math.abs(r.w), g: (r) => -r.g, absg: (r) => r.g, r: (r) => -r.ratio, absr: (r) => r.ratio }[state.sort];
+    rows.sort((a, b) => key(a) - key(b) || b.g - a.g);
+    const lineNote = lineDb != null && Math.abs(lineDb - dbAt(state.ib)) > 1e-9 ? ` · orders 3–5 from the nearest precomputed point, δ = ${signed(lineDb * 1e3)} MHz` : "";
+    $("tbl-count").textContent = `${rows.length} terms · sorted by ${{ w: "δ", absw: "|δ|", g: "strength, largest first", absg: "strength, smallest first", r: "strength/|δ|, largest first", absr: "strength/|δ|, smallest first" }[state.sort]} · shaded rows stay in H_eff${lineNote}`;
+    const tb = $("tbody"); tb.textContent = "";
+    const frag = document.createDocumentFragment();
+    rows.slice(0, 600).forEach((r) => {
+      const t = r.t, O = ordOf(r.o);
+      const tr = document.createElement("tr");
+      if (r.kept) tr.className = "hot";
+      tr.innerHTML = `<td><span class="ord" style="--c:var(${O.c})"><span class="sw"></span>${r.o === 0 ? "Kerr" : r.o}</span></td>
+        <td class="sig">${t.l}</td><td class="num">${fmt(r.w * 1e3)}</td><td class="num">${fmt(r.g)}</td>
+        <td class="num">${isFinite(r.ratio) ? r.ratio.toPrecision(3) : "static"}</td>
+        <td class="ops">${opsText(t, 5)}</td><td>${r.note}</td>`;
+      frag.appendChild(tr);
+    });
+    tb.appendChild(frag);
+    if (rows.length > 600) $("tbl-count").textContent += " · showing the first 600";
+  }
+
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawChart);
+  new MutationObserver(drawChart).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  render();
+})();
+</script>

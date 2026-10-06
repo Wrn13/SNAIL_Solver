@@ -147,3 +147,7 @@ figs/
 # cannot reference a runtime variable (see the note in slurm/snail_sweep.slurm)
 *.out
 *.err
+
+# term_spectrum outputs (regenerate with analytical_exploration/term_spectrum.py)
+analytical_exploration/term_spectrum.html
+analytical_exploration/term_spectrum_cache.pkl
