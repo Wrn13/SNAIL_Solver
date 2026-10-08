@@ -8,13 +8,13 @@ from __future__ import annotations
 import warnings
 from typing import Dict, List, Mapping, Sequence, Tuple
 import numpy as np
-from magnus2 import Device, LinearFrameMagnus, format_signature
+from tdsw import Device, LinearFrameSW, format_signature
 
 
 def scan(dev: Device, sources: Sequence[Tuple[int, ...]], cut: Sequence[int], window: float,
          stark: bool, near_cutoff: float = 0.5) -> List[Tuple]:
     warnings.simplefilter("ignore")
-    L = LinearFrameMagnus(dev, slow_cutoff=0.02, near_cutoff=near_cutoff)
+    L = LinearFrameSW(dev, slow_cutoff=0.02, near_cutoff=near_cutoff)
     names = L.names
     idx = list(np.ndindex(*cut))
     Hs = L.static_slow_part()

@@ -1,4 +1,7 @@
-"""Second-order effective Hamiltonian of a g_n X(t)^n coupler in the linear frame.
+"""Time-dependent Schrieffer-Wolff effective Hamiltonian of a g_n X(t)^n coupler in the linear frame.
+
+LinearFrameSW gives the closed-form second-order result (plus the leading alpha correction);
+HighOrderExpansion carries the same time-dependent Schrieffer-Wolff expansion to arbitrary order.
 
 Model
 -----
@@ -54,12 +57,13 @@ Assumptions that are not derived here
 * Only number-diagonal H_s (H_anh plus static slow bins) enters the
   O(1/Omega^2) correction; [h, h_slow] cross terms with time-dependent slow
   bins are not included.
-* Third and higher orders in g_n are not included.
+* LinearFrameSW stops at second order in g_n (plus the O(alpha/Omega^2) correction);
+  higher orders are HighOrderExpansion's.
 
 Usage
 -----
-    from magnus2 import Device, LinearFrameMagnus, example_device
-    L = LinearFrameMagnus(example_device(), slow_cutoff=0.1, phidot=0.004)
+    from tdsw import Device, LinearFrameSW, example_device
+    L = LinearFrameSW(example_device(), slow_cutoff=0.1, phidot=0.004)
     H = L.effective_static()                       # NOPoly, number-diagonal
     L.level_energy({"a": 1}, H=H) - L.level_energy({}, H=H)
     L.rung_resolved_shifts([{}, {"a": 1}], {"a": 7, "b": 7, "c": 7})
@@ -68,7 +72,7 @@ Usage
     E = HighOrderExpansion(L, max_order=5, q_final=2)   # orders 1..5; resonant terms kept slow
     E.effective(3)                                 # slow H through order 3
     E.R[4], E.resonant                             # all order-4 terms; signatures kept as resonant
-    Ls = LinearFrameMagnus(example_device(), symbolic=True)   # closed forms in SymPy
+    Ls = LinearFrameSW(example_device(), symbolic=True)   # closed forms in SymPy
 """
 from __future__ import annotations
 
@@ -510,8 +514,8 @@ class SlowPairTerm:
     op: NOPoly
 
 
-class LinearFrameMagnus:
-    """Second-order effective Hamiltonian of sum_n g_n X^n in the linear frame.
+class LinearFrameSW:
+    """Second-order time-dependent Schrieffer-Wolff effective Hamiltonian of sum_n g_n X^n in the linear frame.
 
     Parameters
     ----------
@@ -883,12 +887,12 @@ class HighOrderExpansion:
     order. Once slow, a signature stays slow at all orders; if it was already removed at a
     lower order the expansion restarts with it slow throughout.
 
-    Consistency with LinearFrameMagnus: order 2 static = second_order() static part, and
+    Consistency with LinearFrameSW: order 2 static = second_order() static part, and
     order 3 static = anharmonic_correction() for number-diagonal H_s (tested).
 
     Parameters
     ----------
-    L : LinearFrameMagnus
+    L : LinearFrameSW
         Device, slow_cutoff and phidot (numeric mode only; near_cutoff is not used).
     max_order : int
         Highest order computed.
@@ -902,10 +906,10 @@ class HighOrderExpansion:
         Quanta of the source states used for the resonance test.
     """
 
-    def __init__(self, L: LinearFrameMagnus, max_order: int = 5, q_final: Optional[int] = None,
+    def __init__(self, L: LinearFrameSW, max_order: int = 5, q_final: Optional[int] = None,
                  resonance_ratio: Optional[float] = 1.0, n_exc: int = 2) -> None:
         if L.symbolic:
-            raise ValueError("HighOrderExpansion needs a numeric LinearFrameMagnus")
+            raise ValueError("HighOrderExpansion needs a numeric LinearFrameSW")
         self.L, self.max_order, self.q_final = L, max_order, q_final
         self.resonance_ratio, self.n_exc = resonance_ratio, n_exc
         self.d = max(max(L.dev.g), 2)
@@ -1009,7 +1013,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     dev = Device.from_json(args.device) if args.device else example_device()
     states = [{}, {"a": 1}, {"b": 1}, {"a": 1, "b": 1}, {"a": 2}, {"b": 2}, {"c": 1}]
     for pd in args.phidot:
-        L = LinearFrameMagnus(dev, slow_cutoff=args.slow_cutoff, near_cutoff=args.near_cutoff,
+        L = LinearFrameSW(dev, slow_cutoff=args.slow_cutoff, near_cutoff=args.near_cutoff,
                               phidot=pd, phiddot=args.phiddot)
         print(f"\n=== phidot = {pd:+.4f} ===")
         print("slow first-order signatures:")

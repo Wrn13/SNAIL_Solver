@@ -92,7 +92,6 @@ svg .axis-title { fill: var(--ink-2); font-size: 12px; }
 .tip dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 12px; margin: 0; font-variant-numeric: tabular-nums; }
 .tip dt { color: var(--muted); }
 .tip dd { margin: 0; font-family: var(--font-mono); }
-.tip .ops { font-family: var(--font-mono); color: var(--ink-2); font-size: 11.5px; }
 .note { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; max-width: 92ch; }
 .tbl-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; align-items: baseline; margin-bottom: 10px; }
 .tbl-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
@@ -106,17 +105,17 @@ td { padding: 5px 10px; border-bottom: 1px solid var(--grid); vertical-align: to
 td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 th.num { text-align: right; }
 td.sig { font-family: var(--font-mono); white-space: nowrap; }
-td.ops { font-family: var(--font-mono); color: var(--ink-2); font-size: 12px; }
+td.sg { font-family: var(--font-mono); color: var(--ink-2); font-size: 12px; white-space: nowrap; }
 tr.hot td { background: var(--band); }
 .ord { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; }
 .ord .sw { width: 8px; height: 8px; border-radius: 50%; background: var(--c); }
-@media (max-width: 640px) { .wrap { padding-inline: 16px; } td.ops { min-width: 180px; } }
+@media (max-width: 640px) { .wrap { padding-inline: 16px; } }
 </style>
 
 <div class="wrap">
   <header>
     <h1>SNAIL Term Spectrum</h1>
-    <p class="sub">Every term of the linear-frame Hamiltonian and of its Schrieffer–Wolff expansion, placed at its detuning δ in the linear frame (it rotates as e<sup>−iδt</sup>). Operators are â₁, â₂ for the two modes and ŝ for the SNAIL, with η (η*) for each pump factor. Order <i>n</i> is everything generated at the <i>n</i>-th step, where each Kerr or g₃X̂³ term counts once. A term stays in the effective Hamiltonian if |δ| is inside the shaded band or if it is resonant (strength > |δ|); every other term is removed by the next step.</p>
+    <p class="sub">Every term of the linear-frame Hamiltonian and of its Schrieffer–Wolff expansion, placed at its detuning δ in the linear frame (it rotates as e<sup>−iδt</sup>). A term is one normal-ordered monomial with its own coefficient: â₁, â₂ are the two modes, ŝ the SNAIL, and η<sup>k</sup> (η*<sup>k</sup>) marks <i>k</i> net pump photons absorbed (emitted), whose amplitude is already in the coefficient. Order <i>n</i> is everything generated at the <i>n</i>-th step, where each Kerr or g₃X̂³ term counts once. Monomials with the same pump number and net quanta per mode share a detuning and form one signature; a signature stays in the effective Hamiltonian if |δ| is inside the shaded band or if it is resonant (its strength > |δ|), and is otherwise removed by the next step as a whole.</p>
     <p class="params" id="params"></p>
   </header>
 
@@ -177,9 +176,10 @@ tr.hot td { background: var(--band); }
         <thead><tr>
           <th>Order</th><th>Term</th>
           <th class="num"><button data-sort="w" type="button">δ (MHz)</button></th>
+          <th class="num">Coefficient (MHz)</th>
           <th class="num"><button data-sort="g" type="button">Strength (MHz)</button></th>
           <th class="num"><button data-sort="r" type="button">Strength / |δ|</button></th>
-          <th>Operators</th><th>Note</th>
+          <th>Signature</th><th>Note</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -224,6 +224,11 @@ tr.hot td { background: var(--band); }
   const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
   const fmt = (m) => { const a = Math.abs(m);
     return (a >= 100 ? m.toFixed(0) : a >= 10 ? m.toFixed(1) : a >= 1 ? m.toFixed(2) : a >= 0.01 ? m.toFixed(3) : m.toPrecision(2)).replace("-", "−"); };
+  // complex coefficient [re, im] in MHz
+  const fmtC = ([re, im]) => { const a = Math.hypot(re, im), tiny = 1e-6 * a;
+    if (Math.abs(im) <= tiny) return fmt(re);
+    if (Math.abs(re) <= tiny) return fmt(im) + "i";
+    return `${fmt(re)} ${im < 0 ? "−" : "+"} ${fmt(Math.abs(im))}i`; };
   const signed = (mhz) => (mhz >= 0 ? "+" : "−") + Math.abs(mhz).toFixed(0);
   const detuning = (t, dp, db) => t.w0 + t.s * dp + t.d[si] * db;  // GHz, linear frame
   const RR = DATA.resonance_ratio;
@@ -231,7 +236,9 @@ tr.hot td { background: var(--band); }
   const ordOf = (o) => ORDERS[o];
 
   // Precomputed orders 3-5 along the exchange-locked line: per point and order,
-  // [count, (term | kept << 15, q) x count] as 16-bit words; q is a log-quantized strength.
+  // [count, total, (term | kept << 15, q, phase) x count] as 16-bit words; total counts the monomials
+  // above 1 kHz before the top-K cut; q is a log-quantized strength,
+  // phase the coefficient's argument in units of 2 pi / 65536.
   const words = (() => {
     const bin = atob(LINE.blob), bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -241,25 +248,32 @@ tr.hot td { background: var(--band); }
   const lineStep = LINE.dbs.length > 1 ? LINE.dbs[1] - LINE.dbs[0] : STEP;
   function lineRows(db) {
     const li = Math.round((db - LINE.dbs[0]) / lineStep);
-    if (li < 0 || li >= LINE.dbs.length) return { rows: [], db: null };
+    if (li < 0 || li >= LINE.dbs.length) return { rows: [], total: {}, db: null, forced: new Set() };
     let k = LINE.offsets[li];
-    const rows = [];
+    const rows = [], total = {};
     for (let n = 3; n <= 5; n++) {
       const cnt = words[k++];
-      for (let j = 0; j < cnt; j++, k += 2) rows.push({ i: words[k] & 0x7fff, kept: words[k] >> 15 === 1, o: n, g: deq(words[k + 1], LINE.qa) });
+      total[n] = words[k++];
+      for (let j = 0; j < cnt; j++, k += 3) {
+        const i = words[k] & 0x7fff, g = deq(words[k + 1], LINE.qa), ph = words[k + 2] / 65536 * 2 * Math.PI, a = g / T[i].wt;
+        rows.push({ i, kept: words[k] >> 15 === 1, o: n, g, c: [a * Math.cos(ph), a * Math.sin(ph)] });
+      }
     }
-    return { rows, db: LINE.dbs[li] };
+    return { rows, total, db: LINE.dbs[li], forced: new Set(LINE.resonant[li].map((k) => sigKey(...LINE.resonant_sigs[k]))) };
   }
 
   $("params").textContent =
     dev.modes.map((m) => `${sym[m]}: ω/2π = ${dev.omega[m].toFixed(3)} GHz, λ = ${dev.lam[m]}, α = ${(dev.alpha[m] * 1e3).toFixed(0)} MHz`).join("  ·  ") +
     `  ·  g₃ = ${dev.g[3] * 1e3} MHz, η = ${dev.eta}`;
   $("note").textContent =
-    `Strength is the largest matrix element |⟨m|h|n⟩| out of any state with at most ${DATA.max_exc} total excitations (exact, no Fock cutoff). ` +
-    `The shaded band is |δ| < ${DATA.slow_cutoff * 1e3} MHz. Ringed marks and shaded rows are kept in the effective Hamiltonian: inside the band, ` +
-    `or resonant (strength > ${RR === 1 ? "" : RR + " × "}|δ|), since removing those would need a generator larger than 1. ` +
-    `Kerr, order 1 and order 2 are computed live at any frequency; orders 3–5 are precomputed along the exchange-locked line (the ${LINE.top_k} strongest terms per order and point). ` +
-    `Terms weaker than 1 kHz are hidden; terms above 100 GHz are pinned to the top as ▲.`;
+    `Each mark is one monomial c·O. Its strength is |c| times the largest matrix element of O or O† out of any state with at most ${DATA.max_exc} total excitations ` +
+    `(exact, no Fock cutoff), so a term and its Hermitian partner at −δ have the same strength. ` +
+    `The shaded band is |δ| < ${DATA.slow_cutoff * 1e3} MHz. Ringed marks and shaded rows are kept in the effective Hamiltonian. That is decided per signature, as in the expansion: ` +
+    `inside the band, or resonant, meaning the signature's largest matrix element (all its monomials summed, out of states with at most ${DATA.max_exc} excitations) exceeds ` +
+    `${RR === 1 ? "" : RR + " × "}|δ|, since removing it would need a generator larger than 1. ` +
+    `Kerr, order 1 and order 2 are computed live at any frequency; orders 3–5 are precomputed along the exchange-locked line (the ${LINE.top_k} strongest monomials per order and point, ` +
+    `strength and phase stored to 16 bits); there, orders 1–2 also keep every signature the full expansion found resonant at orders 3–5. Monomials weaker than 1 kHz, and those with no matrix element out of states with at most ${DATA.max_exc} excitations, are hidden; ` +
+    `terms above 100 GHz are pinned to the top as ▲.`;
 
   // Sweep controls: slider plus arrows that step one grid point
   const sweeps = [
@@ -333,72 +347,83 @@ tr.hot td { background: var(--band); }
 
   // Order 2: R_2 = [S_1, H_s] + (1/2)[S_1, F_1] = sum_{i<j} c_ij [h_i, h_j] over first-order bins and H_anh,
   // c_ij = (1/2)(1/d_j - 1/d_i) both fast, -1/d_i only i fast, +1/d_j only j fast (d = detuning).
-  // A bin is slow if |d| < slow_cutoff or strength > RR |d|; if the order-2 term at a fast bin's signature
-  // is itself resonant, that bin becomes slow and R_2 is recomputed (HighOrderExpansion's restart rule).
+  // Each pair carries its monomial coefficients (the terms shown) and, for a non-static total signature,
+  // its matrix elements (the signature's strength). A bin or order-2 signature is slow if |d| < slow_cutoff
+  // or its strength > RR |d|; if an order-2 signature that is slow is a fast bin, that bin becomes slow and
+  // R_2 is recomputed (HighOrderExpansion's restart rule); a signature once slow stays slow across restarts.
   // Mirrors browser_second_order in term_spectrum.py, which is checked against HighOrderExpansion.
-  function secondOrder(dp, db) {
-    const dl = DATA.bins.map(([s, d], k) => DATA.bin_w0[k] + s * dp + d[si] * db);
+  const sigKey = (s, d) => `${s}|${d}`;
+  // forced: signatures that turn resonant at orders 3-5 on the precomputed line (slow from the start there)
+  function secondOrder(dp, db, forced = new Set()) {
+    const det = (w0, s, d) => w0 + s * dp + d[si] * db;
+    const dl = DATA.bins.map(([s, d], k) => det(DATA.bin_w0[k], s, d));
+    const d2 = DATA.sig2.map(([s, d], k) => det(DATA.sig2_w0[k], s, d));
     const sc = DATA.slow_cutoff;
-    const fast = DATA.bins.map(([, , g], k) => Math.abs(dl[k]) >= sc - TIE && g <= RR * Math.abs(dl[k]));
+    const isFast = (w, g) => Math.abs(w) >= sc - TIE && g <= RR * Math.abs(w);
+    const fast = DATA.bins.map(([s, d, g], k) => isFast(dl[k], g) && !forced.has(sigKey(s, d)));
+    const slow2 = new Set();  // like HighOrderExpansion.resonant, kept across restarts
     for (;;) {
-      const acc = new Map(), count = new Map();
-      for (const [i, j, kind, t, f] of DATA.pairs) {
+      const mono = new Map(), count = new Map(), el = new Map();
+      for (const [i, j, k2, e, m] of DATA.pairs) {
         const a = dl[i], b = dl[j], fa = fast[i], fb = fast[j];
         const c = fa && fb ? 0.5 * (1 / b - 1 / a) : fa ? -1 / a : fb ? 1 / b : 0;
         if (c === 0) continue;
-        if (kind === 0) {
-          for (let k = 0; k < f.length; k += 3) {
-            let m = acc.get(f[k]); if (!m) acc.set(f[k], (m = new Map()));
-            const v = m.get(0) || [0, 0]; v[0] += c * f[k + 1]; v[1] += c * f[k + 2]; m.set(0, v);
-            count.set(f[k], (count.get(f[k]) || 0) + 1);
-          }
-        } else {
-          let m = acc.get(t); if (!m) acc.set(t, (m = new Map()));
-          for (let k = 0; k < f.length; k += 4) {
-            const key = f[k] * 64 + f[k + 1], v = m.get(key) || [0, 0];
-            v[0] += c * f[k + 2]; v[1] += c * f[k + 3]; m.set(key, v);
-          }
-          count.set(t, (count.get(t) || 0) + 1);
+        for (let k = 0; k < m.length; k += 3) {
+          const v = mono.get(m[k]) || [0, 0]; v[0] += c * m[k + 1]; v[1] += c * m[k + 2]; mono.set(m[k], v);
+          count.set(m[k], (count.get(m[k]) || 0) + 1);
+        }
+        if (k2 < 0) continue;
+        let E = el.get(k2); if (!E) el.set(k2, (E = new Map()));
+        for (let k = 0; k < e.length; k += 4) {
+          const key = e[k] * 4096 + e[k + 1], v = E.get(key) || [0, 0];
+          v[0] += c * e[k + 2]; v[1] += c * e[k + 3]; E.set(key, v);
         }
       }
-      const g2 = new Map();
-      acc.forEach((m, t) => { let g = 0; m.forEach((v) => { g = Math.max(g, Math.hypot(v[0], v[1])); }); g2.set(t, g * 1e3 * (T[t].wt || 1)); });
+      const g2 = new Map();  // order-2 signature strength, GHz
+      el.forEach((E, k2) => { let g = 0; E.forEach((v) => { g = Math.max(g, Math.hypot(v[0], v[1])); }); g2.set(k2, g); });
+      g2.forEach((g, k2) => { if (!isFast(d2[k2], g)) slow2.add(k2); });
       let restart = false;
-      DATA.bins.forEach(([, , , t2], b) => {
-        if (fast[b] && t2 >= 0 && (g2.get(t2) || 0) / 1e3 > RR * Math.abs(dl[b])) { fast[b] = false; restart = true; }
-      });
+      DATA.bins.forEach(([, , , k2], b) => { if (fast[b] && slow2.has(k2)) { fast[b] = false; restart = true; } });
       if (restart) continue;
-      const slowSig = new Set(DATA.bins.filter((_, b) => !fast[b]).map(([s, d]) => `${s}|${d}`));
+      const slowSig = new Set(DATA.bins.filter((_, b) => !fast[b]).map(([s, d]) => sigKey(s, d)));
+      slow2.forEach((k2) => slowSig.add(sigKey(...DATA.sig2[k2])));
+      forced.forEach((k) => slowSig.add(k));
+      const sigG = new Map();  // signature strength (MHz) for the tooltip
+      DATA.bins.forEach(([s, d, g]) => sigG.set(sigKey(s, d), { 1: g * 1e3 }));
+      g2.forEach((g, k2) => { const k = sigKey(...DATA.sig2[k2]); sigG.set(k, { ...(sigG.get(k) || {}), 2: g * 1e3 }); });
       const out = [];
-      g2.forEach((g, t) => out.push({ t: T[t], i: t, o: 2, g, pairs: count.get(t), slowSig }));
-      return { rows: out, slowSig };
+      mono.forEach((v, t) => {
+        const c = [v[0] * 1e3, v[1] * 1e3];
+        out.push({ t: T[t], i: t, o: 2, c, g: Math.hypot(c[0], c[1]) * T[t].wt, pairs: count.get(t) });
+      });
+      return { rows: out, slowSig, sigG };
     }
   }
 
   function frameRows() {
     const dp = dpAt(state.ip), db = dbAt(state.ib);
     const sc = DATA.slow_cutoff;
-    const second = secondOrder(dp, db);
-    const rows = fixed.map(([t, i]) => ({ t, i, o: t.o, g: t.g })).concat(second.rows);
-    let lineDb = null;
-    if (state.lock && m1) {
-      const L = lineRows(db);
+    const L = state.lock && m1 ? lineRows(db) : null;
+    const second = secondOrder(dp, db, L ? L.forced : undefined);
+    const rows = fixed.map(([t, i]) => ({ t, i, o: t.o, g: t.g, c: t.c })).concat(second.rows);
+    let lineDb = null, lineCut = null;
+    if (L) {
       lineDb = L.db;
-      L.rows.forEach((r) => { if (r.g > 0) rows.push({ t: T[r.i], i: r.i, o: r.o, g: r.g, kept: r.kept }); });
+      lineCut = [3, 4, 5].map((n) => [n, L.rows.filter((r) => r.o === n).length, L.total[n]]).filter(([, k, t]) => t > k);
+      L.rows.forEach((r) => { if (r.g > 0) rows.push({ t: T[r.i], i: r.i, o: r.o, g: r.g, c: r.c, kept: r.kept }); });
     }
     rows.forEach((r) => {
       r.w = detuning(r.t, dp, db);
       r.id = `${r.o}|${r.i}`;
-      if (r.kept == null) {  // live orders: same rule as HighOrderExpansion
-        const sigKey = `${r.t.s}|${r.t.d}`;
-        r.kept = r.t.o === 0 || r.t.x === "static" || Math.abs(r.w) < sc || second.slowSig.has(sigKey) ||
-                 (r.o === 2 && r.g / 1e3 > RR * Math.abs(r.w));
-      }
-      const why = !r.kept ? "" : Math.abs(r.w) < sc || r.t.x === "static" || r.t.o === 0 ? "kept in H_eff" : "kept in H_eff (resonant)";
-      r.note = [r.t.x === "pair terms" && r.pairs ? `${r.pairs} pair${r.pairs > 1 ? "s" : ""}` : r.t.x === "static" ? "static" : r.t.x, why]
+      const k = sigKey(r.t.s, r.t.d), static_ = r.t.x === "static";
+      if (r.o <= 2) r.sigG = (second.sigG.get(k) || {})[r.o];
+      if (r.kept == null)  // live orders: the signature's verdict, same rule as HighOrderExpansion
+        r.kept = static_ || Math.abs(r.w) < sc - TIE || second.slowSig.has(k);
+      const why = !r.kept ? "" : static_ ? "kept in H_eff (static)" : Math.abs(r.w) < sc - TIE ? "kept in H_eff (in band)" : "kept in H_eff (resonant signature)";
+      r.note = [r.o === 0 ? "Kerr" : "", r.o === 2 && r.pairs ? `from ${r.pairs} commutator${r.pairs > 1 ? "s" : ""}` : "", why]
         .filter(Boolean).join(", ");
     });
-    return { rows, lineDb };
+    return { rows, lineDb, lineCut };
   }
   function currentRows() {
     const R = RANGES.find((r) => r.key === state.range);
@@ -522,16 +547,16 @@ tr.hot td { background: var(--band); }
     for (const v of view) { const d = (v.x - px) ** 2 + (v.y - py) ** 2; if (d < bd) { bd = d; best = v; } }
     return best;
   }
-  const opsText = (t, n) => t.ops.slice(0, n).join("  +  ") + ((t.nops || t.ops.length) > n ? `  + ${(t.nops || t.ops.length) - n} more` : "");
   function showTip(v, evt) {
     const r = v.r, t = r.t, O = ordOf(r.o);
     const ratio = Math.abs(r.w) > 0 ? r.g / Math.abs(r.w * 1e3) : Infinity;
     tip.innerHTML = `<div class="t-head"><span class="sw" style="background:var(${O.c})"></span>${O.name}</div>
       <div class="t-sig">${t.l}</div>
       <div class="t-pump">signature ${t.sig}</div>
-      <dl><dt>δ/2π</dt><dd>${fmt(r.w * 1e3)} MHz</dd><dt>Strength</dt><dd>${fmt(r.g)} MHz</dd>
-      <dt>Strength/|δ|</dt><dd>${isFinite(ratio) ? ratio.toPrecision(3) : "static (δ = 0)"}</dd>${r.note ? `<dt>Note</dt><dd>${r.note}</dd>` : ""}</dl>
-      <div class="ops">${opsText(t, 8)}</div>`;
+      <dl><dt>δ/2π</dt><dd>${fmt(r.w * 1e3)} MHz</dd><dt>Coefficient</dt><dd>${fmtC(r.c)} MHz</dd>
+      <dt>Strength</dt><dd>${fmt(r.g)} MHz</dd>
+      <dt>Strength/|δ|</dt><dd>${isFinite(ratio) ? ratio.toPrecision(3) : "static (δ = 0)"}</dd>
+      ${r.sigG != null && t.x !== "static" ? `<dt>Signature strength</dt><dd>${fmt(r.sigG)} MHz</dd>` : ""}${r.note ? `<dt>Note</dt><dd>${r.note}</dd>` : ""}</dl>`;
     tip.hidden = false;
     const wr = wrap.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
     let x = evt.clientX - wr.left + 14, y = evt.clientY - wr.top + 14;
@@ -549,11 +574,13 @@ tr.hot td { background: var(--band); }
   svg.addEventListener("pointerleave", () => { tip.hidden = true; if (state.hover != null) { state.hover = null; drawChart(); } });
 
   function renderTable() {
-    const { rows: base, lineDb } = currentRows();
+    const { rows: base, lineDb, lineCut } = currentRows();
     const rows = base.map((r) => ({ ...r, ratio: Math.abs(r.w) > 0 ? r.g / Math.abs(r.w * 1e3) : Infinity }));
     const key = { w: (r) => r.w, absw: (r) => Math.abs(r.w), g: (r) => -r.g, absg: (r) => r.g, r: (r) => -r.ratio, absr: (r) => r.ratio }[state.sort];
     rows.sort((a, b) => key(a) - key(b) || b.g - a.g);
-    const lineNote = lineDb != null && Math.abs(lineDb - dbAt(state.ib)) > 1e-9 ? ` · orders 3–5 from the nearest precomputed point, δ = ${signed(lineDb * 1e3)} MHz` : "";
+    const cutNote = lineCut && lineCut.length ? ` · orders 3–5 list only the strongest: ` +
+      lineCut.map(([n, k, t]) => `order ${n} ${k} of ${t}`).join(", ") + ` monomials above 1 kHz` : "";
+    const lineNote = cutNote + (lineDb != null && Math.abs(lineDb - dbAt(state.ib)) > 1e-9 ? ` · orders 3–5 from the nearest precomputed point, mode offset ${signed(lineDb * 1e3)} MHz` : "");
     $("tbl-count").textContent = `${rows.length} terms · sorted by ${{ w: "δ", absw: "|δ|", g: "strength, largest first", absg: "strength, smallest first", r: "strength/|δ|, largest first", absr: "strength/|δ|, smallest first" }[state.sort]} · shaded rows stay in H_eff${lineNote}`;
     const tb = $("tbody"); tb.textContent = "";
     const frag = document.createDocumentFragment();
@@ -562,9 +589,9 @@ tr.hot td { background: var(--band); }
       const tr = document.createElement("tr");
       if (r.kept) tr.className = "hot";
       tr.innerHTML = `<td><span class="ord" style="--c:var(${O.c})"><span class="sw"></span>${r.o === 0 ? "Kerr" : r.o}</span></td>
-        <td class="sig">${t.l}</td><td class="num">${fmt(r.w * 1e3)}</td><td class="num">${fmt(r.g)}</td>
+        <td class="sig">${t.l}</td><td class="num">${fmt(r.w * 1e3)}</td><td class="num">${fmtC(r.c)}</td><td class="num">${fmt(r.g)}</td>
         <td class="num">${isFinite(r.ratio) ? r.ratio.toPrecision(3) : "static"}</td>
-        <td class="ops">${opsText(t, 5)}</td><td>${r.note}</td>`;
+        <td class="sg">${t.sig}</td><td>${r.note}</td>`;
       frag.appendChild(tr);
     });
     tb.appendChild(frag);

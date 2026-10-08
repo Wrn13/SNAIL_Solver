@@ -1,6 +1,6 @@
-"""Falsification tests for magnus2.
+"""Falsification tests for tdsw.
 
-Run with ``pytest test_magnus2.py`` or ``python test_magnus2.py`` (no pytest needed).
+Run with ``pytest test_tdsw.py`` or ``python test_tdsw.py`` (no pytest needed).
 
 The Floquet benchmark uses commensurate toy frequencies (omega0 = 1, period 2 pi) so
 that the exact one-period propagator of the linear-frame Hamiltonian exists; its
@@ -14,7 +14,7 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 from scipy.linalg import expm
 
-from magnus2 import Device, HighOrderExpansion, LinearFrameMagnus, NOPoly, Arith, opposite
+from tdsw import Device, HighOrderExpansion, LinearFrameSW, NOPoly, Arith, opposite
 
 TOY = dict(modes=["a", "c"], omega={"a": 7.0, "c": 11.0}, lam={"a": 0.3, "c": 1.0},
            alpha={"a": -0.25, "c": 0.0}, g={3: 0.01}, omega_p=2.0, eta=0.5)
@@ -83,7 +83,7 @@ def test_two_level_sign_convention() -> None:
     eps, Delta, alpha = 0.01, 1.3, -0.2
     dev = Device(modes=["q"], omega={"q": Delta}, lam={"q": 1.0}, alpha={"q": alpha},
                  g={1: eps}, omega_p=100.0, eta=0.0)
-    L = LinearFrameMagnus(dev, slow_cutoff=0.05)
+    L = LinearFrameSW(dev, slow_cutoff=0.05)
     e = L.rung_resolved_shifts([{}, {"q": 1}], {"q": 8})
     exact = 2 * alpha * eps ** 2 / (Delta * (Delta + alpha))
     lead = 2 * alpha * eps ** 2 / Delta ** 2
@@ -95,7 +95,7 @@ def test_two_level_sign_convention() -> None:
 
 def _floquet(dev: Device, cutoffs: Sequence[int], omega0: float, n_steps: int
              ) -> Tuple[np.ndarray, np.ndarray]:
-    L = LinearFrameMagnus(dev, slow_cutoff=1e-9)
+    L = LinearFrameSW(dev, slow_cutoff=1e-9)
     assert not L.slow, "toy must have no carrier-free first-order terms"
     sigs = list(L.fast)
     Ms = np.array([L.fast[s].op.to_matrix(cutoffs) for s in sigs])
@@ -125,7 +125,7 @@ def _wrap(x: float, w: float) -> float:
     return (x + w / 2) % w - w / 2
 
 
-def _effective_matrix(L: LinearFrameMagnus, cutoffs: Sequence[int], anh: bool) -> np.ndarray:
+def _effective_matrix(L: LinearFrameSW, cutoffs: Sequence[int], anh: bool) -> np.ndarray:
     H = L.effective_static(include_anharmonic_correction=anh).to_matrix(cutoffs)
     _, pairs = L.second_order()
     for p in pairs:
@@ -140,7 +140,7 @@ def test_floquet_quasienergies() -> None:
     cut = [8, 8]
     states = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1)]
     eps_F, VF = _floquet(dev, cut, 1.0, 6000)
-    L = LinearFrameMagnus(dev, slow_cutoff=0.5, near_cutoff=0.5)
+    L = LinearFrameSW(dev, slow_cutoff=0.5, near_cutoff=0.5)
     errs: Dict[str, List[float]] = {"op": [], "op+alpha": [], "rung": []}
     vac = np.ravel_multi_index((0, 0), cut)
     fv = eps_F[_match(VF, vac)]
@@ -183,8 +183,8 @@ def test_constant_chirp_is_detuned_pump() -> None:
     cut = [8, 8]
     states = [(0, 0), (1, 0), (2, 0), (0, 1)]
     dev = toy_device()
-    L = LinearFrameMagnus(dev, slow_cutoff=0.2, near_cutoff=0.2, phidot=phidot)
-    Lref = LinearFrameMagnus(toy_device(omega_p=2.0 + phidot), slow_cutoff=0.2, near_cutoff=0.2)
+    L = LinearFrameSW(dev, slow_cutoff=0.2, near_cutoff=0.2, phidot=phidot)
+    Lref = LinearFrameSW(toy_device(omega_p=2.0 + phidot), slow_cutoff=0.2, near_cutoff=0.2)
     r = L.rung_resolved_shifts([{"a": n[0], "c": n[1]} for n in states], {"a": 8, "c": 8})
     rref = Lref.rung_resolved_shifts([{"a": n[0], "c": n[1]} for n in states], {"a": 8, "c": 8})
     assert np.allclose(r, rref, atol=1e-14)
@@ -199,8 +199,8 @@ def test_constant_chirp_is_detuned_pump() -> None:
 def test_phiddot_drops_out_of_static_second_order() -> None:
     """Static part of (1/2)[K, F] is independent of phiddot (derivation check)."""
     dev = toy_device()
-    L0 = LinearFrameMagnus(dev, slow_cutoff=0.5, phiddot=0.0)
-    L1 = LinearFrameMagnus(dev, slow_cutoff=0.5, phiddot=0.3)
+    L0 = LinearFrameSW(dev, slow_cutoff=0.5, phiddot=0.0)
+    L1 = LinearFrameSW(dev, slow_cutoff=0.5, phiddot=0.3)
     S0 = L0.static_from_kick(L0.kick_operator(include_envelope=False))
     S1 = L1.static_from_kick(L1.kick_operator(include_envelope=False))
     ref = L0.effective_static(True) - L0.static_slow_part()
@@ -214,8 +214,8 @@ def test_phiddot_drops_out_of_static_second_order() -> None:
 
 def test_symbolic_matches_numeric() -> None:
     dev = toy_device()
-    Ls = LinearFrameMagnus(dev, symbolic=True, slow_cutoff=0.5, phidot=0.1)
-    Ln = LinearFrameMagnus(dev, symbolic=False, slow_cutoff=0.5, phidot=0.1)
+    Ls = LinearFrameSW(dev, symbolic=True, slow_cutoff=0.5, phidot=0.1)
+    Ln = LinearFrameSW(dev, symbolic=False, slow_cutoff=0.5, phidot=0.1)
     Hs = Ls.numeric(Ls.effective_static(True))
     Hn = Ln.effective_static(True)
     cut = [6, 6]
@@ -224,7 +224,7 @@ def test_symbolic_matches_numeric() -> None:
 
 def test_operator_equals_rung_resolved_when_alpha_zero() -> None:
     dev = toy_device(alpha={"a": 0.0, "c": 0.0})
-    L = LinearFrameMagnus(dev, slow_cutoff=0.5)
+    L = LinearFrameSW(dev, slow_cutoff=0.5)
     states = [{}, {"a": 1}, {"a": 2}, {"c": 1}, {"a": 1, "c": 1}]
     r = L.rung_resolved_shifts(states, {"a": 9, "c": 9})
     H = L.effective_static(False)
@@ -237,9 +237,9 @@ def _diag(P: NOPoly) -> NOPoly:
 
 
 def test_high_order_reproduces_second_order_and_kerr() -> None:
-    """Orders 2 and 3 of HighOrderExpansion against the independent LinearFrameMagnus formulas."""
+    """Orders 2 and 3 of HighOrderExpansion against the independent LinearFrameSW formulas."""
     dev = toy_device()
-    L = LinearFrameMagnus(dev, slow_cutoff=0.5, phidot=0.1)
+    L = LinearFrameSW(dev, slow_cutoff=0.5, phidot=0.1)
     E = HighOrderExpansion(L, max_order=3)
     cut = [6, 6]
     assert np.allclose(_diag(E.H[2]).to_matrix(cut), L.second_order()[0].to_matrix(cut), atol=1e-15)
@@ -254,7 +254,7 @@ def test_high_order_floquet_converges() -> None:
     eps_F, VF = _floquet(dev, cut, 1.0, 6000)
     vac = np.ravel_multi_index((0, 0), cut)
     fv = eps_F[_match(VF, vac)]
-    E = HighOrderExpansion(LinearFrameMagnus(dev, slow_cutoff=1e-9), max_order=5)
+    E = HighOrderExpansion(LinearFrameSW(dev, slow_cutoff=1e-9), max_order=5)
     assert not E.resonant
     errs = []
     for order in range(1, 6):
@@ -269,7 +269,7 @@ def test_high_order_floquet_converges() -> None:
 
 def test_high_order_truncation_is_exact_on_low_states() -> None:
     dev = toy_device()
-    L = LinearFrameMagnus(dev, slow_cutoff=0.5, phidot=0.1)
+    L = LinearFrameSW(dev, slow_cutoff=0.5, phidot=0.1)
     E, Ef = HighOrderExpansion(L, max_order=4), HighOrderExpansion(L, max_order=4, q_final=2)
     for n in (3, 4):
         for s in [n for n in np.ndindex(3, 3) if sum(n) <= 2]:
@@ -285,7 +285,7 @@ def test_resonant_term_is_kept_slow() -> None:
     wb = 1.5 * wa - 0.170
     dev = Device(["a", "b", "s"], {"a": wa, "b": wb, "s": 4.7}, {"a": .1, "b": .1, "s": 1.0},
                  {"a": -.15, "b": -.15, "s": 0.0}, {3: .06}, wb - wa, 1.5)
-    L = LinearFrameMagnus(dev, slow_cutoff=0.02)
+    L = LinearFrameSW(dev, slow_cutoff=0.02)
     E = HighOrderExpansion(L, max_order=4, q_final=2)
     sig = (3, (0, 0, -1))
     assert E.resonant.get(sig) == 2 and sig in E.H[2].by_signature()
