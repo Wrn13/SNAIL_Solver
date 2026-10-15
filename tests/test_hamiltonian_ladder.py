@@ -56,3 +56,40 @@ def test_loader_matches_table():
     from ladder import stored
     cols = stored.columns(check_table=True)          # raises on any mismatch
     assert len(cols) == 71
+
+
+def _device():
+    return (3.5, 3.5 + 1.61, 4.7), (0.1, 0.1, 1.0), (-0.12, -0.12, 0.0), {3: 0.06}, (3, 3, 9)
+
+
+def test_undisplaced_frame_is_the_plain_first_order_operator():
+    """With nothing displaced, H' is levels' first-order V (up to the eta^3 c-number)."""
+    import scipy.sparse as sps
+    from ladder import displaced as D
+    from ladder.levels import matrix_expansion
+    f, lam, al, g, dims = _device()
+    V0, b = D.displaced_hamiltonian(f, lam, al, g, dims, 1.3, disp_window_GHz=None)
+    ref = matrix_expansion(f, lam, al, g, dims, 1.3, 1, 1e6)[1]
+    assert b == {}
+    Z = sps.csr_matrix((81, 81), dtype=complex)
+    for k in set(V0) | set(ref):
+        d = (V0.get(k, Z) - ref.get(k, Z)).toarray()
+        assert np.allclose(d - np.eye(81) * d.diagonal().mean(), 0, atol=1e-12)
+
+
+def test_displacement_cancels_the_fast_linear_coupler_drive():
+    """Harmonic balance: the pump-driven classical drive on the coupler is cancelled.
+
+    What remains of <1_s|H'|0_s> on the qubit vacuum is the pump-independent
+    normal-ordering term of X_q^3 (3 g3 sum lam^2), the same at eta = 0."""
+    from ladder import displaced as D
+    f, lam, al, g, dims = _device()
+    V, b = D.displaced_hamiltonian(f, lam, al, g, dims, 1.3)
+    V0, _ = D.displaced_hamiltonian(f, lam, al, g, dims, 0.0)
+    Vb, _ = D.displaced_hamiltonian(f, lam, al, g, dims, 1.3, disp_window_GHz=None)
+    assert abs(b[2]) > 0.05                    # the SNAIL subharmonic response is displaced
+    assert 3 not in b                          # 3 w_p = w_s stays slow
+    el = lambda bins, k: complex(bins[(k, (0, 0, -1))][1, 0]) if (k, (0, 0, -1)) in bins else 0j
+    for k in b:
+        assert abs(el(V, k) - el(V0, k)) < 1e-9
+    assert abs(el(Vb, 2) - el(V0, 2)) > 0.1    # it was there before displacing
