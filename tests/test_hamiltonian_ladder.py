@@ -93,3 +93,54 @@ def test_displacement_cancels_the_fast_linear_coupler_drive():
     for k in b:
         assert abs(el(V, k) - el(V0, k)) < 1e-9
     assert abs(el(Vb, 2) - el(V0, 2)) > 0.1    # it was there before displacing
+
+
+def test_fvv_recursion_converges_on_a_periodic_toy():
+    """Bock-Ernst-Uhrig eq. (27) on a single-frequency H(t): the stroboscopic propagator
+    e^{-i Lambda(T)} e^{-i F T} e^{i Lambda(0)} converges order by order to the exact one."""
+    import scipy.sparse as sps
+    from scipy.linalg import expm
+    from ladder import fvv
+    rng = np.random.default_rng(1)
+    A = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    H0 = (A + A.conj().T) / 2
+    A1 = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    eps = 0.05
+    V = {(0, (0,)): sps.csr_matrix(eps * H0), (1, (0,)): sps.csr_matrix(eps * A1),
+         (-1, (0,)): sps.csr_matrix(eps * A1.conj().T)}
+    car = lambda s: float(s[0])
+    N = 4000
+    U = np.eye(4, dtype=complex)
+    for j in range(N):
+        t = (j + 0.5) / N
+        U = expm(-2j * np.pi * sum(M.toarray() * np.exp(-2j * np.pi * car(s) * t)
+                                   for s, M in V.items()) / N) @ U
+    F, L = fvv.fme_expansion(V, car, 1e-9, 4, "fvv")
+    errs = []
+    for n in range(1, 5):
+        Fm = sum(F[k][(0, (0,))].toarray() for k in range(1, n + 1) if (0, (0,)) in F[k])
+        Lt = lambda t: sum((M.toarray() * np.exp(-2j * np.pi * car(s) * t)
+                            for k in range(1, n) for s, M in L[k].items()),
+                           np.zeros((4, 4), complex))
+        errs.append(np.abs(expm(-1j * Lt(1.0)) @ expm(-2j * np.pi * Fm) @ expm(1j * Lt(0.0))
+                           - U).max())
+    assert all(b < a for a, b in zip(errs, errs[1:])) and errs[-1] < 1e-3
+
+
+def test_fvv_gauge_equals_the_sw_recursion_and_eq_29b():
+    import scipy.sparse as sps
+    from ladder import displaced as D, fvv
+    f, lam, al, g, _ = _device()
+    dims = (3, 3, 4)
+    V, _ = D.displaced_hamiltonian(f, lam, al, g, dims, 1.0, disp_window_GHz=None)
+    car = D.carrier_of(f)
+    F, _ = fvv.fme_expansion(V, car, 0.6, 3, "fvv")
+    H = D.sw_recursion(V, car, 0.6, 3)
+    Z = sps.csr_matrix((36, 36), dtype=complex)
+    for n in (1, 2, 3):
+        for s in set(F[n]) | set(H[n]):
+            assert abs((F[n].get(s, Z) - H[n].get(s, Z)).toarray()).max() < 1e-12
+    neg = lambda s: (-s[0], tuple(-q for q in s[1]))
+    F2 = sum(((V[s] @ V[neg(s)] - V[neg(s)] @ V[s]) / (-2 * car(s))
+              for s in V if abs(car(s)) >= 0.6 and neg(s) in V), Z)
+    assert abs((F[2][(0, (0, 0, 0))] - F2).toarray()).max() < 1e-12
