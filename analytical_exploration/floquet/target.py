@@ -1,4 +1,5 @@
-"""The target: figs_ridge_tracked/table.txt's `1-F bare` and `1-F chirp`, per column.
+"""The stored fidelities the FVV models are compared against: the `1-F bare` and
+`1-F chirp` columns of figs_ridge_tracked/table.txt, per column (delta).
 
 Both series come from ``curves_nodrag_ridge_tracked_flagged.json`` (pass A ridge, no
 DRAG). ``chirp`` is that run's ``chirp+DRAG`` trace, which plays no DRAG in pass A, and
@@ -110,3 +111,35 @@ def config_for(rec: Dict[str, Any], base: Optional[Dict[str, Any]] = None) -> Di
     return config_at_wp(base or base_device(), rec["w_p_GHz"], branch=rec["branch"],
                         levels=int(rec["coupler_levels"]),
                         chirp_coeffs_GHz=rec.get("chirp_coeffs_GHz") or [])
+
+
+def column(delta_GHz: float) -> Dict[str, Any]:
+    """The stored column at this delta (GHz)."""
+    for rec in columns(check_table=False):
+        if abs(rec["delta_GHz"] - float(delta_GHz)) < 1e-9:
+            return rec
+    raise KeyError(f"no stored column at delta = {delta_GHz} GHz")
+
+
+def pulse(rec: Dict[str, Any], *, bare: bool = False, peak_eta: Optional[float] = None,
+          levels: Optional[int] = None):
+    """(coupler, t_g) for this column's stored pulse, built the way `score_gate` builds it.
+
+    bare: the flat carrier at its own stored length. peak_eta: rescale the target |eta|
+    (the amplitude is recomputed for the length, so only the drive strength changes).
+    levels: replay on a different coupler truncation."""
+    from snail_solver.device_utils import build_coupler
+    from snail_solver.tune_up import fixed_eta_amp_scale
+    rec = dict(rec)
+    if levels:
+        rec["coupler_levels"] = int(levels)
+    cfg = config_for(rec)
+    op = dict(rec["op"])
+    t_g = float(rec["tg_bare"] if bare else op["t_g_ns"])
+    chirp = [] if bare else rec["chirp_coeffs_GHz"]
+    target = float(peak_eta if peak_eta is not None else op["target_eta"])
+    amp = float(fixed_eta_amp_scale(cfg, t_g, target))
+    cpl, _w_p, _peak = build_coupler(cfg, t_g, amp, float(op["wp_offset_GHz"]),
+                                     op.get("spec_abs_GHz"), op.get("drag_beat_GHz"),
+                                     chirp_coeffs_GHz=chirp)
+    return cpl, t_g
