@@ -1,176 +1,268 @@
-"""The Floquet-Magnus expansion, solved order by order in Fourier space (eqs. 8b, 27-31).
+"""The Floquet-Magnus expansion of Bock, Ernst & Uhrig (arXiv:2609.17121), as written.
 
-Inserting U = e^{-i Lambda(t)} e^{-i F (t - t0)} e^{+i Lambda(t0)} (eq. 3) into the
-Schrodinger equation gives
+A periodic Hamiltonian (hbar = 1, angular units)
 
-    dLambda/dt = sum_k B_k/k! ( [-i Lambda, H]_k - [i Lambda, F]_k )                (8b)
+    H(t) = sum_m H_m e^{i m w t}                                                   (2)
 
-with B_k the Bernoulli numbers (B_1 = -1/2). In Fourier space, with our coefficients
-carrying e^{-i Omega t} (the paper's m w is -Omega), this becomes (27)
+has the propagator
 
-    -i Omega_sigma Lambda_sigma = -F_sigma + H_sigma
-        + sum_{k>=1} B_k/k! (-i)^k  sum [Lambda, [..., [Lambda, H]]]_sigma
-        - sum_{k>=1} B_k/k! (+i)^k  sum [Lambda, [..., [Lambda, F]]]_sigma
+    U(t, t0) = e^{-i Lambda(t)} e^{-i F (t - t0)} e^{+i Lambda(t0)}                 (3)
 
-Every Lambda in the k-fold commutators is summed over its Fourier index, and the
-signatures add up to sigma. Collecting terms of equal order gives F^(n) and Lambda^(n)
-from lower orders only (28a-f).
+with F static and Lambda(t) = sum_m Lambda_m e^{i m w t} periodic (5). Inserting (3) into
+the Schrodinger equation gives (8b), whose Fourier coefficients are (27) = (43):
 
-F_sigma is nonzero only on secular signatures. In the paper that is m = 0. Here it is
-every |Omega| < `window_GHz` (see the package docstring). Lambda_sigma on the secular
-signatures is the gauge freedom (28c-f):
+    i m w Lambda_m = -F delta_{m,0} + H_m + (i/2) { sum_n1 [Lambda_n1, H_{m-n1}] + [Lambda_m, F] }
+        + sum_{j>=2} (-i)^j B_j / j! { sum [Lambda_n1, ..., Lambda_nj, H_{m-n1-...-nj}]
+                                       + (-1)^{j+1} sum [Lambda_n1, ..., Lambda_{m-n1-...}, F] }
 
-    "fvv"  Lambda_sigma = 0 on every secular sigma                    (24), (29), (30)
-    "aht"  Lambda(t0 = 0) = 0: Lambda_0 = -sum_fast Lambda_sigma      (31)
+Taking m = 0 and m != 0 separately gives F (44) and Lambda_{m != 0} (45). Equating orders
+gives (46a-f) = (28a-f). The gauge is Lambda_0:
 
-AHT's F then carries the t0-dependent non-secular terms of (31b). With incommensurate
-frequencies and a chirped pump, that F is not a function of |eta| alone, so only FVV
-survives `model`'s adiabatic step.
+    "fvv"   Lambda_0^(n) = 0                                  (24), (29), (30), App. B.1
+    "aht"   Lambda_0^(n) = -sum_{m != 0} Lambda_m^(n) e^{i m w t0}         (31), App. A
+
+Here H and every coefficient are dense matrices keyed by the integer Fourier index m.
+`floquet_magnus` solves (44)-(45) order by order. The explicit formulas of the paper
+(28a-f, 29, 30, 47, 48) are implemented separately below, and the tests check that the
+recursion reproduces each of them.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import factorial
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 import numpy as np
 
-from floquet.fourier import Bins, Signature, add, bracket, comm, conj, lin, prune, zero
+Coeffs = Dict[int, np.ndarray]           # m -> the m-th Fourier coefficient
 
-#: signed Bernoulli numbers B_k (B_1 = -1/2), eq. (9); odd k >= 3 vanish
+#: signed Bernoulli numbers B_k (eq. 9: x / (e^x - 1) = sum B_n x^n / n!), B_1 = -1/2
 BERNOULLI = {0: 1.0, 1: -0.5, 2: 1 / 6, 4: -1 / 30, 6: 1 / 42, 8: -1 / 30, 10: 5 / 66}
 GAUGES = ("fvv", "aht")
+_TOL = 1e-15
+
+
+def _clean(c: Coeffs) -> Coeffs:
+    return {m: M for m, M in c.items() if np.max(np.abs(M)) > _TOL}
+
+
+def _comm(A: Coeffs, B: Coeffs) -> Coeffs:
+    """Fourier coefficients of [A(t), B(t)]: indices add (a convolution)."""
+    out: Coeffs = {}
+    for ma, Ma in A.items():
+        for mb, Mb in B.items():
+            C = Ma @ Mb - Mb @ Ma
+            out[ma + mb] = out[ma + mb] + C if ma + mb in out else C
+    return _clean(out)
+
+
+def _lin(*terms) -> Coeffs:
+    out: Coeffs = {}
+    for c, A in terms:
+        for m, M in A.items():
+            out[m] = out[m] + c * M if m in out else c * M
+    return _clean(out)
+
+
+def bracket(H: Coeffs, n: int, m: int) -> Optional[np.ndarray]:
+    """Eq. (26): [n, m] := [H_n, H_m]."""
+    if n not in H or m not in H:
+        return None
+    return H[n] @ H[m] - H[m] @ H[n]
 
 
 @dataclass
 class Expansion:
-    """F^(n) (secular coefficients, GHz) and Lambda^(n) (dimensionless) by order n."""
-    F: Dict[int, Bins] = field(default_factory=dict)
-    Lambda: Dict[int, Bins] = field(default_factory=dict)
+    """F^(n) (static, angular units) and Lambda^(n)_m by order n, for drive frequency w."""
+    omega: float
+    F: Dict[int, np.ndarray] = field(default_factory=dict)
+    Lambda: Dict[int, Coeffs] = field(default_factory=dict)
     gauge: str = "fvv"
 
     @property
     def order(self) -> int:
         return max(self.F) if self.F else 0
 
-    def F_upto(self, n: Optional[int] = None) -> Bins:
-        """F^[n] = sum_{m <= n} F^(m) (12b)."""
+    def F_upto(self, n: Optional[int] = None) -> np.ndarray:
+        """F^[n] = sum_{k <= n} F^(k), eq. (12b)."""
         n = self.order if n is None else n
-        return lin(*[(1.0, self.F[m]) for m in range(1, n + 1)])
+        return sum(self.F[k] for k in range(1, n + 1))
 
-    def Lambda_upto(self, n: int) -> Bins:
-        """Lambda^[n] = sum_{m <= n} Lambda^(m) (12a)."""
-        return lin(*[(1.0, self.Lambda[m]) for m in range(1, n + 1) if m in self.Lambda])
+    def Lambda_upto(self, n: int) -> Coeffs:
+        """Lambda^[n] = sum_{k <= n} Lambda^(k), eq. (12a)."""
+        return _lin(*[(1.0, self.Lambda[k]) for k in range(1, n + 1) if k in self.Lambda])
+
+    def Lambda_at(self, t: float, upto: int) -> np.ndarray:
+        """Lambda^[upto](t) = sum_m Lambda_m e^{i m w t}, eq. (5)."""
+        L = self.Lambda_upto(upto)
+        dim = self.F[1].shape[0]
+        return sum((M * np.exp(1j * m * self.omega * t) for m, M in L.items()),
+                   np.zeros((dim, dim), complex))
+
+    def propagator(self, t: float, t0: float = 0.0, order: Optional[int] = None) -> np.ndarray:
+        """Eq. (3) with F to `order` and Lambda to `order - 1` (the n-th order evolution
+        operator needs n orders of F and n - 1 of Lambda)."""
+        from scipy.linalg import expm
+        n = self.order if order is None else order
+        F = self.F_upto(n)
+        L = (lambda s: self.Lambda_at(s, n - 1)) if n > 1 else (lambda s: 0 * F)
+        return expm(-1j * L(t)) @ expm(-1j * F * (t - t0)) @ expm(1j * L(t0))
+
+    def stroboscopic(self, t0: float = 0.0, order: Optional[int] = None) -> np.ndarray:
+        """F~ = e^{-i Lambda(t0)} F e^{+i Lambda(t0)}, eq. (4): U(t0 + T, t0) = e^{-i F~ T}."""
+        from scipy.linalg import expm
+        n = self.order if order is None else order
+        K = expm(-1j * self.Lambda_at(t0, n - 1)) if n > 1 else np.eye(self.F[1].shape[0])
+        return K @ self.F_upto(n) @ K.conj().T
 
 
-def floquet_magnus(H: Bins, carrier: Callable[[Signature], float], order: int, *,
-                   window_GHz: float = 0.6, gauge: str = "fvv") -> Expansion:
-    """Eq. (27), order by order: F^(n) and Lambda^(n) for n = 1..order.
+def floquet_magnus(H: Coeffs, omega: float, order: int, *, gauge: str = "fvv",
+                   t0: float = 0.0) -> Expansion:
+    """Eqs. (44) and (45), solved order by order (the integration-free scheme, App. A).
 
-    H is counted as first order. T[k][q] holds the k-fold nested commutators
-    [Lambda, [..., [Lambda, H]]] of total order q, and U[k][q] the same with F at the
-    centre. Both are built recursively from Lambda^(m < n), which is the paper's
-    integration-free scheme (App. A)."""
+    H is first order. A[j][q] collects the j-fold nested commutators
+    [Lambda_n1, ..., Lambda_nj, H_.] of total order q, and B[j][q] the same with F at the
+    centre. Both are built from Lambda^(k < n), so each order needs only lower ones."""
     if gauge not in GAUGES:
         raise ValueError(f"gauge {gauge!r}: expected one of {GAUGES}")
-    secular = lambda sig: abs(carrier(sig)) < window_GHz
-    n_modes = len(next(iter(H))[1])
-    ex = Expansion(gauge=gauge)
-    T: Dict[int, Dict[int, Bins]] = {0: {1: H}}
-    U: Dict[int, Dict[int, Bins]] = {0: {}}
+    H = _clean({int(m): np.asarray(M, complex) for m, M in H.items()})
+    dim = next(iter(H.values())).shape[0]
+    zero = np.zeros((dim, dim), complex)
+    ex = Expansion(omega=float(omega), gauge=gauge)
+    A: Dict[int, Dict[int, Coeffs]] = {0: {1: H}}
+    B: Dict[int, Dict[int, Coeffs]] = {0: {}}
     for n in range(1, order + 1):
         rhs = [(1.0, H)] if n == 1 else []
-        for k in range(1, n):
-            T.setdefault(k, {})[n] = lin(*[(1.0, comm(ex.Lambda[m], T[k - 1][n - m]))
-                                           for m in range(1, n) if n - m in T[k - 1]])
-            U.setdefault(k, {})[n] = lin(*[(1.0, comm(ex.Lambda[m], U[k - 1][n - m]))
-                                           for m in range(1, n) if n - m in U[k - 1]])
-            Bk = BERNOULLI.get(k, 0.0)
-            if Bk:
-                rhs.append((Bk / factorial(k) * (-1j) ** k, T[k][n]))
-                rhs.append((-Bk / factorial(k) * (1j) ** k, U[k][n]))
-        R = lin(*rhs)
-        Fn: Bins = {}
-        Ln: Bins = {}
-        for sig, M in R.items():
-            if secular(sig):
-                Fn[sig] = M                              # F_sigma = RHS_sigma
-            else:
-                Ln[sig] = (1j / carrier(sig)) * M        # -i Omega Lambda_sigma = RHS_sigma
-        if gauge == "aht" and Ln:
-            L0 = None
-            for M in Ln.values():
-                L0 = -M if L0 is None else L0 - M
-            add(Ln, zero(n_modes), L0)
-            Ln = prune(Ln)
-        ex.F[n], ex.Lambda[n] = Fn, Ln
-        U[0][n] = Fn
+        for j in range(1, n):
+            A.setdefault(j, {})[n] = _lin(*[(1.0, _comm(ex.Lambda[k], A[j - 1][n - k]))
+                                            for k in range(1, n) if n - k in A[j - 1]])
+            B.setdefault(j, {})[n] = _lin(*[(1.0, _comm(ex.Lambda[k], B[j - 1][n - k]))
+                                            for k in range(1, n) if n - k in B[j - 1]])
+            Bj = BERNOULLI.get(j, 0.0)
+            if Bj:
+                c = (-1j) ** j * Bj / factorial(j)
+                rhs.append((c, A[j][n]))
+                rhs.append((c * (-1) ** (j + 1), B[j][n]))
+        R = _lin(*rhs)
+        ex.F[n] = R.get(0, zero.copy())                          # (44): m = 0
+        L = {m: M / (1j * m * omega) for m, M in R.items() if m != 0}   # (45): m != 0
+        if gauge == "aht" and L:
+            L[0] = -sum(M * np.exp(1j * m * omega * t0) for m, M in L.items())
+        ex.Lambda[n] = _clean(L)
+        B[0][n] = {0: ex.F[n]}
     return ex
 
 
 # --------------------------------------------------------------------------- closed forms
-# The paper's explicit low orders, written with its [n, m] notation (26) and translated
-# by m w -> -Omega_m. They hold for a strictly periodic secular set (only Omega = 0 is
-# secular) in the FVV gauge. `floquet_magnus` must reproduce them, and the tests check it.
+# The paper's explicit orders in the FVV gauge (Lambda_0 = 0), with [n, m] = [H_n, H_m].
 
-def F1(H: Bins, carrier) -> Bins:
+def F1(H: Coeffs, w: float) -> np.ndarray:
     """(28a), (29a): F^(1) = H_0."""
-    return {s: M for s, M in H.items() if abs(carrier(s)) < 1e-12}
+    return H[0]
 
 
-def Lambda1(H: Bins, carrier) -> Bins:
-    """(28b), (30b): Lambda^(1)_m = H_m / (i m w)  ->  i H_sigma / Omega_sigma."""
-    return {s: (1j / carrier(s)) * M for s, M in H.items() if abs(carrier(s)) >= 1e-12}
+def Lambda1(H: Coeffs, w: float) -> Coeffs:
+    """(28b), (30b): Lambda^(1)_m = H_m / (i m w)."""
+    return {m: M / (1j * m * w) for m, M in H.items() if m != 0}
 
 
-def F2_fvv(H: Bins, carrier) -> Bins:
-    """(29b): F^(2) = sum_{n != 0} [n, -n] / (2 n w)  ->  sum [n, -n] / (-2 Omega_n)."""
-    out: Bins = {}
+def F2(H: Coeffs, w: float) -> np.ndarray:
+    """(29b): F^(2) = sum_{n != 0} [n, -n] / (2 n w)."""
+    return sum((bracket(H, n, -n) / (2 * n * w) for n in H if n != 0 and -n in H),
+               0 * H[0])
+
+
+def Lambda2(H: Coeffs, w: float) -> Coeffs:
+    """(30c): Lambda^(2)_m = sum_{n != 0} [n, m-n] / (2i n m w^2) + [m, 0] / (2i m^2 w^2).
+    The sum includes n = m (so m - n = 0); that literal reading is what (27) gives."""
+    out: Coeffs = {}
     for n in H:
-        if abs(carrier(n)) < 1e-12:
-            continue
-        b = bracket(H, n, conj(n))
-        if b is not None:
-            add(out, (0, (0,) * len(n[1])), b / (-2 * carrier(n)))
-    return prune(out)
-
-
-def Lambda2_fvv(H: Bins, carrier) -> Bins:
-    """(30c): Lambda^(2)_m = sum_{n != 0} [n, m-n] / (2i n m w^2) + [m, 0] / (2i m^2 w^2)
-    -> [n, m-n] / (2i Omega_n Omega_m) + [m, 0] / (2i Omega_m^2).
-
-    The sum runs over every n != 0, n = m (m - n = 0) included, and the separate [m, 0]
-    term comes on top. That literal reading is the one eq. (27) reproduces."""
-    out: Bins = {}
-    z = (0, (0,) * len(next(iter(H))[1]))
-    for n in H:
-        for k in H:                                   # k = m - n, any index
-            m = (n[0] + k[0], tuple(a + b for a, b in zip(n[1], k[1])))
-            om_n, om_m = carrier(n), carrier(m)
-            if abs(om_n) < 1e-12 or abs(om_m) < 1e-12:
+        for k in H:
+            m = n + k
+            if n == 0 or m == 0:
                 continue
-            add(out, m, bracket(H, n, k) / (2j * om_n * om_m))
+            out[m] = out.get(m, 0) + bracket(H, n, k) / (2j * n * m * w ** 2)
     for m in H:
-        om = carrier(m)
-        if abs(om) >= 1e-12 and z in H:
-            add(out, m, bracket(H, m, z) / (2j * om ** 2))
-    return prune(out)
+        if m != 0 and 0 in H:
+            out[m] = out.get(m, 0) + bracket(H, m, 0) / (2j * m ** 2 * w ** 2)
+    return _clean(out)
 
 
-def F3_fvv(H: Bins, carrier) -> Bins:
+def F3(H: Coeffs, w: float) -> np.ndarray:
     """(29c): F^(3) = sum_{n,m != 0} [n, [m, -m-n]] / (3 n m w^2)
                     + sum_{n != 0} [n, [0, -n]] / (6 n^2 w^2)."""
-    out: Bins = {}
-    z = (0, (0,) * len(next(iter(H))[1]))
-    fast = [s for s in H if abs(carrier(s)) >= 1e-12]
-    for n in fast:
-        for m in fast:
-            r = (-m[0] - n[0], tuple(-a - b for a, b in zip(m[1], n[1])))
-            if r not in H:
+    out = 0 * H[0]
+    c = lambda X, Y: X @ Y - Y @ X
+    for n in H:
+        if n == 0:
+            continue
+        for m in H:
+            if m == 0 or -m - n not in H:
                 continue
-            inner = H[m] @ H[r] - H[r] @ H[m]
-            add(out, z, (H[n] @ inner - inner @ H[n]) / (3 * carrier(n) * carrier(m)))
-        if z in H and conj(n) in H:
-            inner = H[z] @ H[conj(n)] - H[conj(n)] @ H[z]
-            add(out, z, (H[n] @ inner - inner @ H[n]) / (6 * carrier(n) ** 2))
-    return prune(out)
+            out = out + c(H[n], bracket(H, m, -m - n)) / (3 * n * m * w ** 2)
+        if -n in H:
+            out = out + c(H[n], bracket(H, 0, -n)) / (6 * n ** 2 * w ** 2)
+    return out
+
+
+def F4(H: Coeffs, w: float) -> np.ndarray:
+    """(47a-e), the fourth-order FVV effective Hamiltonian (App. B.1)."""
+    c = lambda X, Y: X @ Y - Y @ X
+    h = lambda k: H.get(k)
+    out = 0 * H[0]
+    idx = [k for k in H if k != 0]
+    for n in idx:
+        for k in idx:
+            if n + k == 0:
+                continue
+            for l in idx:
+                r = -n - k - l
+                if n + k + l == 0 or h(r) is None:
+                    continue
+                nk = c(H[n], H[k])
+                out = out + c(nk, c(H[l], H[r])) / (24 * (n + k + l) * (n + k) * n * w ** 3)   # (47a)
+                out = out + c(H[n], c(H[k], c(H[l], H[r]))) / (24 * n * k * l * w ** 3)       # (47b)
+                out = out + c(H[r], c(H[l], nk)) / (6 * n * (n + k) * (n + k + l) * w ** 3)    # (47b)
+            r = -n - k
+            if h(r) is not None and 0 in H:
+                nk = c(H[n], H[k])
+                out = out + c(c(H[r], H[0]), nk) / (12 * n * (n + k) ** 2 * w ** 3)         # (47c)
+                out = out + c(H[r], c(H[k], c(H[n], H[0]))) / (3 * n ** 2 * (n + k) * w ** 3)  # (47d)
+                out = out + c(H[r], c(H[0], nk)) / (4 * n * (n + k) ** 2 * w ** 3)          # (47d)
+    for n in idx:
+        if -n not in H:
+            continue
+        for k in idx:
+            if -k in H:
+                out = out + c(H[n], c(H[-n], c(H[-k], H[k]))) / (8 * n ** 2 * k * w ** 3)   # (47e)
+        if 0 in H:
+            out = out + c(H[-n], c(H[0], c(H[n], H[0]))) / (2 * n ** 3 * w ** 3)           # (47e)
+    return out
+
+
+def Lambda3(H: Coeffs, w: float) -> Coeffs:
+    """(48a-c), the third-order FVV kick operator (App. B.1)."""
+    c = lambda X, Y: X @ Y - Y @ X
+    idx = [k for k in H if k != 0]
+    ms = {a + b + d for a in H for b in H for d in H} - {0}
+    out: Coeffs = {}
+    for m in ms:
+        acc = None
+        def add(X):
+            nonlocal acc
+            acc = X if acc is None else acc + X
+        if 0 in H and m in H:
+            add(c(H[0], c(H[0], H[m])) / (1j * m ** 3 * w ** 3))                              # (48a)
+        for n in idx:
+            if m in H and -n in H:
+                add((6 * n + m) / (12j * m ** 2 * n ** 2 * w ** 3) * c(H[n], c(H[m], H[-n])))  # (48a)
+            if n != m and 0 in H and (m - n) in H:
+                add((3 * m ** 2 - m * n - 3 * n ** 2) / (6j * m ** 2 * n ** 2 * (m - n) * w ** 3)
+                    * c(H[m - n], c(H[0], H[n])))                                             # (48b)
+            for k in idx:
+                if n + k != 0 and (m - n - k) in H:
+                    add((2 * k - n) / (6j * n * k * m * (n + k) * w ** 3)
+                        * c(H[n], c(H[k], H[m - n - k])))                                     # (48c)
+        if acc is not None:
+            out[m] = acc
+    return _clean(out)

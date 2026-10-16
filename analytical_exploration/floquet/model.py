@@ -1,15 +1,16 @@
-"""The adiabatic step: the expansion at constant |eta|, fitted in |eta| (not in the paper).
+"""The adiabatic step for a shaped pulse (not in the paper).
 
-The paper treats a strictly periodic H(t). The gate's pump amplitude eta(t) has a sine^3
-envelope, which is slow next to every non-secular carrier (all >= 0.6 GHz away). So the
-expansion runs at a constant amplitude, on a grid of |eta|, and the pulse supplies eta(t)
-afterwards. This neglects terms of order eta'/Omega.
+The paper's expansion assumes a constant drive. The gate's pump amplitude |eta(t)| has a
+sine^3 envelope, which is slow next to the drive frequency w_p. So `floquet_magnus` runs at
+constant |eta| on a grid of |eta|, and the pulse supplies |eta(t)|. Terms of order
+|eta|'/w are neglected.
 
-Only |eta| needs a grid. A coefficient with s pump quanta is c(|eta|) (eta/|eta|)^s, so the
-pump phase (chirp, carrier offset) is a known factor. In the plain frame, c(|eta|) is an exact
-polynomial of degree <= 3n at order n (g3 only): the carriers do not depend on eta, and each
-of the n factors of H_I carries at most eta^3. In the displaced frame the classical response
-b_k(|eta|) is a power series, so the fit is high-degree and its residual is reported.
+In the charge frame (`frame`) the pump phase is absorbed, so F depends on |eta| alone. Each
+F^(n) is a polynomial of degree <= 3n in |eta|, because each of the n factors of H carries
+at most eta^3. The fit on the grid is therefore exact. Each F^(n) is stored split by
+process: the change Delta of the mode occupations between the states it connects. In the
+charge frame Delta fixes the pump number s = -sum_k Delta_k q_k, so Delta names the
+process (e.g. (1, -1, 0) is the exchange eta a b^dag).
 """
 from __future__ import annotations
 
@@ -23,31 +24,51 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import scipy.sparse as sps
 
-from floquet.fourier import Bins, Signature, carrier, coefficients, flux_powers, pump_frequency, term_class
-from floquet.expansion import floquet_magnus
+from floquet import fourier as Fo
+from floquet.expansion import Coeffs, floquet_magnus
+from floquet.frame import CHARGE, TWO_PI, number_diagonal, periodic_coefficients
 
 DEFAULT_ORDER = 4
-DEFAULT_WINDOW_GHZ = 0.6
-X_MAX_PLAIN = 1.6
-#: the displaced frame's fit must stay below the fold of the classical response
-#: (|eta| ~ 1.475 at delta = -140 MHz with 3 w_p = w_s kept quantum)
-X_MAX_DISPLACED = 1.4
+X_MAX = 1.6
+Delta = Tuple[int, ...]
+
+
+def process(delta: Delta, q=CHARGE) -> Fo.Signature:
+    """The signature (s, Delta) of a charge-conserving process: s = -sum_k Delta_k q_k."""
+    return (-int(sum(d * c for d, c in zip(delta, q))), tuple(int(d) for d in delta))
+
+
+def describe(delta: Delta) -> str:
+    return Fo.describe(process(delta))
+
+
+def split_by_process(M: np.ndarray, dims: Sequence[int]) -> Dict[Delta, np.ndarray]:
+    """M = sum_Delta M_Delta, with M_Delta connecting states whose occupations differ by
+    Delta (annihilators count +1, as in `fourier`)."""
+    occ = number_diagonal(dims)
+    rows, cols = np.nonzero(np.abs(M) > 1e-15)
+    out: Dict[Delta, np.ndarray] = {}
+    for r, c in zip(rows, cols):
+        d = tuple(int(x) for x in occ[c] - occ[r])
+        out.setdefault(d, np.zeros_like(M))[r, c] = M[r, c]
+    return out
 
 
 @dataclass
 class Term:
-    """One operator of F: ``matrix * |eta|^power * eta^|s| (eta* for s < 0) * e^{-i 2pi Omega t}``,
-    in GHz, from F^(order) at signature `sig`."""
+    """One piece of F: ``matrix * |eta|^power`` (rad/ns), from F^(order), process `delta`."""
     order: int
-    sig: Signature
-    s: int
+    delta: Delta
     power: int
-    carrier_GHz: float
     matrix: sps.csr_matrix
 
     @property
     def kind(self) -> str:
-        return term_class(self.sig)
+        return Fo.term_class(process(self.delta))
+
+    @property
+    def name(self) -> str:
+        return describe(self.delta)
 
 
 @dataclass
@@ -55,132 +76,93 @@ class EffectiveModel:
     freqs_GHz: Tuple[float, ...]
     dims: Tuple[int, ...]
     order: int
-    window_GHz: float
     gauge: str
+    omega: float                                   # w = 2pi w_nom (rad/ns)
     terms: List[Term] = field(default_factory=list)
-    #: Lambda^(n) at eta = 0, the pulse ends: {n: coefficients}
-    kick: Dict[int, Bins] = field(default_factory=dict)
-    #: displaced frame only: {k: (powers, coefficients)} of b_k(|eta|)
-    displacement: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
-    x_max: float = X_MAX_PLAIN
-    fit_residual_GHz: float = 0.0
-    displacement_fit_residual: float = 0.0
-
-    @property
-    def pump_GHz(self) -> float:
-        return pump_frequency(self.freqs_GHz)
-
-    def b_at(self, k: int, x: float) -> float:
-        powers, coef = self.displacement[k]
-        return float(np.dot(coef, x ** powers))
+    #: the frame's sum_k (2pi f_k - q_k w) n_k, part of F^(1) = H_0 (rad/ns)
+    frame_diagonal: np.ndarray = None
+    #: Lambda^(n)_m at eta = 0 (the pulse ends): {n: {m: dense}}
+    kick: Dict[int, Coeffs] = field(default_factory=dict)
+    x_max: float = X_MAX
+    fit_residual: float = 0.0
 
     def select(self, keep: Optional[Callable[[Term], bool]] = None) -> List[Term]:
         return [t for t in self.terms if keep is None or keep(t)]
 
-    def F_at(self, eta: complex, t: float = 0.0, keep=None) -> np.ndarray:
-        """Dense F(t) in GHz at a constant pump amplitude (diagnostics)."""
+    def F_at(self, x: float, keep=None, frame: bool = True) -> np.ndarray:
+        """F(|eta| = x), dense, rad/ns (with or without the frame diagonal)."""
+        dim = int(np.prod(self.dims))
+        out = np.diag(self.frame_diagonal).astype(complex) if frame else np.zeros((dim, dim), complex)
+        for t in self.select(keep):
+            out = out + t.matrix.toarray() * x ** t.power
+        return out
+
+    def kick_at(self, chi: float, upto: int) -> np.ndarray:
+        """Lambda^[upto] at eta = 0 and pump phase chi: sum_m Lambda_m e^{i m chi} (eq. 5)."""
         dim = int(np.prod(self.dims))
         out = np.zeros((dim, dim), complex)
-        x = abs(eta)
-        for tm in self.select(keep):
-            ph = (eta if tm.s > 0 else np.conj(eta)) ** abs(tm.s)
-            out += tm.matrix.toarray() * x ** tm.power * ph * np.exp(-2j * np.pi * tm.carrier_GHz * t)
+        for n in range(1, upto + 1):
+            for m, M in self.kick.get(n, {}).items():
+                out = out + M * np.exp(1j * m * chi)
         return out
 
 
-def _nodes(n: int, x_max: float) -> np.ndarray:
-    """x = 0 (the pump-free terms and the end kick) plus Chebyshev nodes on [0, x_max]."""
-    return np.concatenate([[0.0], 0.5 * x_max * (1 - np.cos(np.pi * (np.arange(n - 1) + 0.5)
-                                                            / (n - 1)))])
-
-
-def _fit(xs, Y, s, degree):
-    """Least squares in x^|s|, x^(|s|+2), ... <= degree (on x / max x); absolute residual."""
-    Y2 = Y if Y.ndim > 1 else Y[:, None]
-    xm = float(np.max(xs))
-    powers = np.arange(abs(s), degree + 1, 2)
-    Vm = (xs / xm)[:, None] ** powers[None, :]
-    ck, *_ = np.linalg.lstsq(Vm, Y2, rcond=None)
-    resid = float(np.max(np.abs(Vm @ ck - Y2)))
-    ck = ck / (xm ** powers)[:, None]
-    return powers, (ck if Y.ndim > 1 else ck[:, 0]), resid
-
-
-def _node(job):
-    from floquet.classical import harmonic_balance
-    b = None
-    if job["displaced"]:
-        b = harmonic_balance(job["freqs_GHz"], job["lam"][2], job["g"], job["x"],
-                             harmonics=job["harmonics"], window_GHz=job["window_GHz"])
-    H = coefficients(job["freqs_GHz"], job["lam"], job["alpha"], job["g"], job["dims"],
-                     job["x"], displacement=b)
-    ex = floquet_magnus(H, lambda sig: carrier(sig, job["freqs_GHz"]), job["order"],
-                        window_GHz=job["window_GHz"], gauge=job["gauge"])
-    return b or {}, ex.F, (ex.Lambda if job["x"] == 0.0 else None)
+def expansion_at(freqs_GHz, lam, alpha, g, dims, x: float, order: int, gauge: str = "fvv"):
+    """`floquet_magnus` for the device at constant |eta| = x, in the charge frame."""
+    bins = Fo.coefficients(freqs_GHz, lam, alpha, g, dims, x)
+    H, w = periodic_coefficients(bins, freqs_GHz, dims)
+    return floquet_magnus(H, w, order, gauge=gauge), H
 
 
 def build(freqs_GHz: Sequence[float], lam: Sequence[float], alpha: Sequence[float],
           g: Dict[int, float], dims: Sequence[int], *, order: int = DEFAULT_ORDER,
-          window_GHz: float = DEFAULT_WINDOW_GHZ, gauge: str = "fvv", displaced: bool = False,
-          harmonics: int = 6, n_nodes: Optional[int] = None, degree: Optional[int] = None,
-          x_max: Optional[float] = None, workers: int = 0) -> EffectiveModel:
-    """Run `floquet_magnus` at each |eta| node (in parallel) and fit every coefficient."""
-    from concurrent.futures import ProcessPoolExecutor
+          gauge: str = "fvv", x_max: float = X_MAX, n_nodes: Optional[int] = None
+          ) -> EffectiveModel:
+    """Run the expansion on a grid of |eta| and fit each F^(n) exactly in |eta|."""
     dims = tuple(int(d) for d in dims)
-    x_max = x_max or (X_MAX_DISPLACED if displaced else X_MAX_PLAIN)
-    degree = degree or (24 if displaced else 3 * order + (3 * order) % 2)
-    n_nodes = n_nodes or (21 if displaced else 3 * order // 2 + 5)
-    xs = _nodes(n_nodes, x_max)
-    job = dict(freqs_GHz=tuple(float(f) for f in freqs_GHz), lam=tuple(float(v) for v in lam),
-               alpha=tuple(float(v) for v in alpha), g={int(k): float(v) for k, v in g.items()},
-               dims=dims, order=order, window_GHz=window_GHz, gauge=gauge, displaced=displaced,
-               harmonics=harmonics)
-    with ProcessPoolExecutor(max_workers=workers or len(xs)) as pool:
-        results = list(pool.map(_node, [dict(job, x=float(x)) for x in xs]))
-    model = EffectiveModel(job["freqs_GHz"], dims, order, float(window_GHz), gauge,
-                           kick=results[0][2] or {}, x_max=float(x_max))
-    bvals: Dict[int, List] = {}
-    vals: Dict[Tuple[int, Signature], List] = {}
-    for j, (b, F, _) in enumerate(results):
-        for k, v in b.items():
-            bvals.setdefault(k, [0.0] * len(xs))[j] = v
-        for n, coeffs in F.items():
-            for sig, M in coeffs.items():
-                vals.setdefault((n, sig), [None] * len(xs))[j] = M
-    for k, v in bvals.items():
-        powers, ck, r = _fit(xs, np.real(np.asarray(v)), k, degree)
-        model.displacement[k] = (powers, ck)
-        model.displacement_fit_residual = max(model.displacement_fit_residual, r)
+    n_nodes = n_nodes or 3 * order + 4
+    xs = np.concatenate([[0.0], 0.5 * x_max * (1 - np.cos(np.pi * (np.arange(n_nodes - 1) + 0.5)
+                                                          / (n_nodes - 1)))])
+    Fs, kick = [], {}
+    for x in xs:
+        ex, _ = expansion_at(freqs_GHz, lam, alpha, g, dims, float(x), order, gauge)
+        Fs.append(ex.F)
+        if x == 0.0:
+            kick = ex.Lambda
+    occ = number_diagonal(dims)
+    from floquet.frame import detunings_GHz
+    frame_diag = (occ @ (TWO_PI * detunings_GHz(freqs_GHz))).astype(float)
+    model = EffectiveModel(tuple(float(f) for f in freqs_GHz), dims, order, gauge,
+                           TWO_PI * Fo.pump_frequency(freqs_GHz), frame_diagonal=frame_diag,
+                           kick=kick, x_max=float(x_max))
     dim = int(np.prod(dims))
-    for (n, sig), Ms in vals.items():
-        Y = np.stack([np.zeros((dim, dim), complex) if M is None else M.toarray() for M in Ms])
-        Y = Y.reshape(len(xs), -1)
+    for n in range(1, order + 1):
+        Y = np.stack([F[n] - (np.diag(frame_diag) if n == 1 else 0) for F in Fs]).reshape(len(xs), -1)
         mask = np.any(np.abs(Y) > 1e-15, axis=0)
         if not mask.any():
             continue
-        deg = degree if displaced else min(degree, 3 * n + 1)
-        powers, ck, r = _fit(xs, Y[:, mask], sig[0], deg)
-        model.fit_residual_GHz = max(model.fit_residual_GHz, r)
-        for k, row in zip(powers, ck):
-            if np.max(np.abs(row)) < 1e-15:
+        powers = np.arange(0, 3 * n + 1)
+        V = (xs / x_max)[:, None] ** powers[None, :]
+        ck, *_ = np.linalg.lstsq(V, Y[:, mask], rcond=None)
+        model.fit_residual = max(model.fit_residual, float(np.max(np.abs(V @ ck - Y[:, mask]))))
+        ck = ck / (x_max ** powers)[:, None]
+        for p, row in zip(powers, ck):
+            if np.max(np.abs(row)) < 1e-14:
                 continue
             full = np.zeros(dim * dim, complex)
             full[mask] = row
-            M = sps.csr_matrix(full.reshape(dim, dim))
-            M.eliminate_zeros()
-            model.terms.append(Term(n, sig, sig[0], int(k) - abs(sig[0]),
-                                    float(carrier(sig, freqs_GHz)), M))
+            for d, Md in split_by_process(full.reshape(dim, dim), dims).items():
+                model.terms.append(Term(n, d, int(p), sps.csr_matrix(Md)))
     return model
 
 
 def device_of(cpl) -> Tuple:
-    """(freqs, lam, alpha, g, dims) of a ZhouCoupler in the units `build` takes (GHz)."""
+    """(freqs, lam, alpha, g, dims) of a ZhouCoupler in GHz, as `build` takes them."""
     if cpl.n_modes != 3 or cpl.coupler_index != 2:
-        raise ValueError("the FVV models handle the (a, b, coupler) system only")
-    tp = 2 * np.pi
-    return (tuple(float(w) / tp for w in cpl.omega), tuple(float(v) for v in cpl.participation),
-            tuple(float(v) / tp for v in cpl.anharm),
-            {int(n): float(v) / tp for n, v in cpl.g_n.items()}, tuple(cpl.dims))
+        raise ValueError("the (a, b, coupler) system only")
+    return (tuple(float(w) / TWO_PI for w in cpl.omega), tuple(float(v) for v in cpl.participation),
+            tuple(float(v) / TWO_PI for v in cpl.anharm),
+            {int(n): float(v) / TWO_PI for n, v in cpl.g_n.items()}, tuple(cpl.dims))
 
 
 _MEMO: Dict[str, EffectiveModel] = {}
@@ -189,9 +171,8 @@ _MEMO: Dict[str, EffectiveModel] = {}
 def for_coupler(cpl, *, cache_dir: Optional[str] = None, **kw) -> EffectiveModel:
     """`build` for this coupler's device, memoized in-process and (if `cache_dir`) on disk."""
     dev = device_of(cpl)
-    blob = json.dumps({"dev": [list(dev[0]), list(dev[1]), list(dev[2]),
-                               sorted(dev[3].items()), list(dev[4])],
-                       "kw": kw, "v": 1}, sort_keys=True, default=str)
+    blob = json.dumps({"dev": [list(dev[0]), list(dev[1]), list(dev[2]), sorted(dev[3].items()),
+                               list(dev[4])], "kw": kw, "v": 2}, sort_keys=True, default=str)
     key = hashlib.sha1(blob.encode()).hexdigest()[:16]
     if key in _MEMO:
         return _MEMO[key]

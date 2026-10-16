@@ -1,110 +1,136 @@
-"""The FVV expansion (Bock, Ernst & Uhrig, arXiv:2609.17121) as implemented in
-analytical_exploration/floquet: the recursion against the paper's closed forms and a
-numerically exact propagator, the effective model against the full Hamiltonian, the
-displaced frame, and the stored target."""
+"""The FVV expansion of Bock, Ernst & Uhrig (arXiv:2609.17121) as implemented in
+analytical_exploration/floquet:
+
+* the charge frame turns the gate Hamiltonian into the paper's single-frequency series;
+* the recursion (44)-(45) reproduces every closed form of the paper, through App. B;
+* eq. (3) converges on a periodic toy model, with FVV below AHT (the paper's Fig. 2);
+* eq. (3) in closed form reproduces the full model at weak constant drive;
+* the |eta| fit is exact; the stored target loads."""
 import os
 import sys
 
 import numpy as np
 import pytest
-import scipy.sparse as sps
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "analytical_exploration"))
 
-from floquet import expansion as E, fourier as Fo  # noqa: E402
+from floquet import expansion as E, fourier as Fo, frame as Fr  # noqa: E402
 
-DEVICE = ((3.5, 3.5 + 1.61, 4.7), (0.1, 0.1, 1.0), (-0.12, -0.12, 0.0), {3: 0.06})
+F_GHZ = [3.5, 3.5 + 1.61, 4.7]
+LAM, ALPHA, G = (0.1, 0.1, 1.0), (-0.12, -0.12, 0.0), {3: 0.06}
 
 
-def _toy(eps=0.05, seed=1, two_freqs=False):
-    """A random 4x4 H(t) with one frequency (or two incommensurate ones)."""
+def _coupler(dims=(3, 3, 4), eta=0.8, dw=0.0013, t_g=500.0):
+    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone
+    from snail_solver.envelope import ConstantPulse
+    cpl = ZhouCoupler(F_GHZ, 2, {0: 0.1, 1: 0.1}, {3: 0.06}, list(dims),
+                      anharmonicities_GHz={0: -0.12, 1: -0.12})
+    tone = PumpTone(w_p_GHz=1.61 + dw, envelope=ConstantPulse(amp=eta, t_g=t_g), is_eta=True)
+    cpl.set_pump(tone)
+    return cpl, tone
+
+
+def _toy(eps=0.05, seed=1):
     rng = np.random.default_rng(seed)
     m = lambda: rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
     H0 = m()
-    H0 = (H0 + H0.conj().T) / 2
-    H = {(0, (0, 0)): eps * H0}
-    for sig in ((1, (0, 0)), (2, (0, 0))) + (((0, (1, 0)),) if two_freqs else ()):
-        A = eps * m() / sig[0] if sig[0] else eps * m()
-        H[sig] = A
-        H[Fo.conj(sig)] = A.conj().T
-    freqs = (1.0, np.sqrt(2.0))                    # carrier = s * 1 + Delta_0 * sqrt 2
-    car = lambda s: s[0] * freqs[0] + s[1][0] * freqs[1]
-    return {k: sps.csr_matrix(v) for k, v in H.items()}, car
+    H = {0: eps * (H0 + H0.conj().T) / 2}
+    for k in (1, 2):
+        A = eps * m() / k
+        H[k], H[-k] = A, A.conj().T
+    return H, 2 * np.pi
 
 
-def _close(A, B, tol):
-    keys = set(A) | set(B)
-    z = sps.csr_matrix(next(iter(A.values())).shape, dtype=complex)
-    return max(abs((A.get(k, z) - B.get(k, z)).toarray()).max() for k in keys) < tol
+def _dev(dims=(3, 3, 4), eta=0.8):
+    bins = Fo.coefficients(F_GHZ, LAM, ALPHA, G, dims, eta)
+    return Fr.periodic_coefficients(bins, F_GHZ, dims)
 
 
-@pytest.mark.parametrize("two_freqs", [False, True])
-def test_recursion_reproduces_the_closed_forms(two_freqs):
-    """Eq. (27) solved order by order equals (28a), (30b), (29b), (30c) and (29c)."""
-    H, car = _toy(two_freqs=two_freqs)
-    ex = E.floquet_magnus(H, car, 3, window_GHz=1e-9, gauge="fvv")
-    assert _close(ex.F[1], E.F1(H, car), 1e-14)
-    assert _close(ex.Lambda[1], E.Lambda1(H, car), 1e-14)
-    assert _close(ex.F[2], E.F2_fvv(H, car), 1e-14)
-    assert _close(ex.Lambda[2], E.Lambda2_fvv(H, car), 1e-13)
-    assert _close(ex.F[3], E.F3_fvv(H, car), 1e-13)
+def _diff(A, B):
+    if isinstance(A, dict):
+        return max(abs(A.get(k, 0) - B.get(k, 0)).max() for k in set(A) | set(B))
+    return abs(A - B).max()
 
 
-def test_stroboscopic_propagator_converges_like_the_paper():
-    """Eq. (3) over one period: the error falls with order, FVV below AHT (Fig. 2)."""
+def test_charge_frame_is_the_full_hamiltonian():
+    """sum_m H_m e^{i m chi} + q.n theta' = R^dag H_I R + phi'.n, up to the c-number."""
+    dims = (3, 3, 4)
+    cpl, tone = _coupler(dims)
+    H, w = _dev(dims)
+    occ = Fr.number_diagonal(dims)
+    q = np.array(Fr.CHARGE)
+    for t in (3.3, 47.1, 133.0):
+        chi, thd = Fr.pump_phase(cpl, tone, t, w)
+        Hrot = sum(M * np.exp(1j * m * chi) for m, M in H.items()) + np.diag(occ @ (q * thd))
+        r = Fr.rotation(dims, 2 * np.pi * np.array(F_GHZ) * t - q * chi)
+        ref = r.conj()[:, None] * cpl.hamiltonian_matrix(t) * r[None, :] \
+            + np.diag(occ @ (2 * np.pi * np.array(F_GHZ) - q * (w - thd)))
+        d = Hrot - ref
+        assert np.allclose(d - np.eye(len(d)) * d.diagonal().mean(), 0, atol=1e-9)
+
+
+@pytest.mark.parametrize("which", ["toy", "device"])
+def test_recursion_reproduces_every_closed_form(which):
+    """(44)-(45) against (28a-b), (29b-c), (30c), (47) and (48)."""
+    H, w = _toy() if which == "toy" else _dev()
+    ex = E.floquet_magnus(H, w, 4)
+    tol = 1e-12 * max(1.0, max(abs(M).max() for M in H.values()))
+    assert _diff(ex.F[1], E.F1(H, w)) < tol
+    assert _diff(ex.Lambda[1], E.Lambda1(H, w)) < tol
+    assert _diff(ex.F[2], E.F2(H, w)) < tol
+    assert _diff(ex.Lambda[2], E.Lambda2(H, w)) < tol
+    assert _diff(ex.F[3], E.F3(H, w)) < tol
+    assert _diff(ex.F[4], E.F4(H, w)) < tol
+    assert _diff(ex.Lambda[3], E.Lambda3(H, w)) < tol
+
+
+def test_propagator_converges_like_the_paper():
+    """Eq. (3) over one period of the toy: the error falls with order, FVV below AHT."""
     from scipy.linalg import expm
-    H, car = _toy(eps=0.05)
-    N = 4000
+    H, w = _toy()
+    T, N = 2 * np.pi / w, 4000
     U = np.eye(4, dtype=complex)
     for j in range(N):
-        U = expm(-2j * np.pi * Fo.dense(H, (1.0, 0.0), (j + 0.5) / N) / N) @ U
+        t = (j + 0.5) * T / N
+        U = expm(-1j * sum(M * np.exp(1j * m * w * t) for m, M in H.items()) * T / N) @ U
     errs = {}
-    for gauge in ("fvv", "aht"):
-        ex = E.floquet_magnus(H, car, 4, window_GHz=1e-9, gauge=gauge)
-        errs[gauge] = []
-        for n in range(1, 5):
-            F = ex.F_upto(n).get((0, (0, 0)))
-            L = ex.Lambda_upto(n - 1)
-            Lt = lambda t: (Fo.dense(L, (1.0, 0.0), t) if L else np.zeros((4, 4)))
-            Uf = expm(-1j * Lt(1.0)) @ expm(-2j * np.pi * F.toarray()) @ expm(1j * Lt(0.0))
-            errs[gauge].append(np.abs(Uf - U).max())
+    for gauge in E.GAUGES:
+        ex = E.floquet_magnus(H, w, 4, gauge=gauge)
+        errs[gauge] = [np.abs(ex.propagator(T, 0.0, n) - U).max() for n in range(1, 5)]
     for gauge, e in errs.items():
         assert all(b < a for a, b in zip(e, e[1:])), (gauge, e)
     assert errs["fvv"][-1] < 1e-3 and errs["fvv"][-1] < errs["aht"][-1]
 
 
-def test_displacement_cancels_the_classical_coupler_drive():
-    from floquet.classical import harmonic_balance
-    (f, lam, al, g) = DEVICE
-    dims = (3, 3, 9)
-    b = harmonic_balance(f, lam[2], g, 1.3)
-    assert abs(b[2]) > 0.05 and 3 not in b          # subharmonic displaced, 3 w_p = w_s kept
-    H = Fo.coefficients(f, lam, al, g, dims, 1.3, displacement=b)
-    H0 = Fo.coefficients(f, lam, al, g, dims, 0.0)
-    Hb = Fo.coefficients(f, lam, al, g, dims, 1.3)
-    el = lambda C, k: complex(C[(k, (0, 0, -1))][1, 0]) if (k, (0, 0, -1)) in C else 0j
-    for k in b:                                     # <1_s|H'|0_s>: only the pump-free part
-        assert abs(el(H, k) - el(H0, k)) < 1e-9
-    assert abs(el(Hb, 2) - el(H0, 2)) > 0.1
+def test_closed_form_propagator_matches_the_full_model_at_weak_drive():
+    """Eq. (3) in closed form (no time stepping) against sesolve of the full H_I."""
+    from floquet import propagator as P
+    dims = (3, 3, 4)
+    cpl, tone = _coupler(dims, eta=0.1)
+    times = [40.0, 80.0]
+    full = P.propagate_columns(cpl, cpl.to_qutip_hamiltonian(), times)
+    idx = cpl._subspace_indices(0, 1)
+    Us, _ = P.constant_drive(F_GHZ, LAM, ALPHA, G, dims, 0.1, float(tone.w_p_GHz), times, 4)
+    for U, S in zip(Us, full):
+        assert P.gate_distance(U[np.ix_(idx, idx)], S[idx, :]) < 1e-4
 
 
-def test_order_one_model_with_everything_secular_is_the_full_model():
-    """F at order 1 with an infinite window is H_I itself, chirp and offset included."""
-    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone, make_chirp
-    from snail_solver.envelope import ENVELOPE_KINDS
-    from floquet import model as M, propagator as P
-    f = [3.5, 3.5 + 1.61, 4.7]
-    cpl = ZhouCoupler(f, 2, {0: 0.1, 1: 0.1}, {3: 0.06}, [3, 3, 4],
-                      anharmonicities_GHz={0: -0.12, 1: -0.12})
-    env = ENVELOPE_KINDS["sine_power"](amp=1.0, t_g=120.0, m=3, t_rise=60.0)
-    cpl.set_pump(PumpTone(w_p_GHz=1.61 + 0.0013, envelope=env, is_eta=True,
-                          chirp=make_chirp([0.002, -0.001, 0.0005], 120.0)), normalize_iswap=(0, 1))
-    model = M.build(*M.device_of(cpl), order=1, window_GHz=1e3, workers=2)
-    H = P.qobjevo(cpl, model)
-    for t in (7.3, 41.0, 88.8):
-        d = H(t).full() - cpl.hamiltonian_matrix(t)
-        assert np.allclose(d - np.eye(len(d)) * d.diagonal().mean(), 0, atol=1e-9)
+def test_fit_in_eta_is_exact():
+    from floquet import model as M
+    dims = (3, 3, 3)
+    model = M.build(F_GHZ, LAM, ALPHA, G, dims, order=3)
+    assert model.fit_residual < 1e-9
+    ex, _ = M.expansion_at(F_GHZ, LAM, ALPHA, G, dims, 0.77, 3)
+    assert np.allclose(model.F_at(0.77), ex.F_upto(3), atol=1e-9)
+
+
+def test_process_names():
+    from floquet import model as M
+    assert M.describe((1, -1, 0)) == "eta a b†"          # the exchange
+    assert M.describe((1, 0, -1)) == "eta a s†"          # pump-assisted a<->s conversion
+    assert M.describe((0, 0, -1)) == "eta^3 s†"          # 3 w_p = w_s
+    assert Fr.charge((1, (1, -1, 0))) == 0 and Fr.charge((2, (0, 0, -1))) == -1
 
 
 @pytest.mark.skipif(not os.path.exists(os.path.join(
@@ -115,9 +141,21 @@ def test_target_loader_matches_table():
     assert len(target.columns(check_table=True)) == 71
 
 
-def test_term_classes_and_names():
-    assert Fo.term_class((0, (0, 0, 0))) == "diag"
-    assert Fo.term_class((1, (1, -1, 0))) == "exchange"
-    assert Fo.term_class((2, (-1, 0, 0))) == "spectator"
-    assert Fo.describe((1, (1, 0, -1))) == "eta a s†"
-    assert Fo.describe((3, (0, 0, -1))) == "eta^3 s†"
+def test_shaped_pulse_replay_converges_and_ignores_the_signed_zero_at_the_ends():
+    """A sine^3 pulse evaluates to -0 or -1e-18 at its ends, where arg eta flips by pi.
+    The frame phase must not follow that flip: the FVV gate converges to the full one."""
+    from snail_solver.zhou_coupler import ZhouCoupler, PumpTone
+    from snail_solver.envelope import ENVELOPE_KINDS
+    from floquet import model as M, propagator as P
+    dims = (3, 3, 4)
+    cpl = ZhouCoupler(F_GHZ, 2, {0: 0.1, 1: 0.1}, {3: 0.06}, list(dims),
+                      anharmonicities_GHz={0: -0.12, 1: -0.12})
+    env = ENVELOPE_KINDS["sine_power"](amp=0.1, t_g=100.0, m=3, t_rise=50.0)
+    tone = PumpTone(w_p_GHz=1.61, envelope=env, is_eta=True)
+    cpl.set_pump(tone)
+    chi0, _ = Fr.PumpPhase(cpl, tone, 2 * np.pi * 1.61)(0.0)
+    assert abs(chi0) < 1e-9
+    full = P.replay(cpl, 100.0)
+    d = [P.gate_distance(P.replay(cpl, 100.0, M.build(F_GHZ, LAM, ALPHA, G, dims, order=o),
+                                  kicks=False)["U"], full["U"]) for o in (2, 3)]
+    assert d[1] < d[0] < 2e-3

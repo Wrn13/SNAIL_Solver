@@ -10,7 +10,7 @@ builds it, so the coefficients are those of the full model, top-level truncation
 
 Conventions: Delta_k = +1 for an annihilator of mode k, -1 for a creator (so c_k e^{-i w_k t}
 has carrier +w_k), and s counts eta (+1) and eta* (-1). The carrier uses the nominal pump
-|w_b - w_a|; the true pump's offset and chirp enter later as the phase of eta(t).
+|w_b - w_a|; the true pump's offset and chirp enter as the pump phase chi(t) in `frame`.
 """
 from __future__ import annotations
 
@@ -203,25 +203,14 @@ def _cpower(c: Dict[int, complex], m: int) -> Dict[int, complex]:
 
 
 def coefficients(freqs_GHz, lam, alpha, g: Dict[int, float], dims, eta: float, *,
-                 displacement: Optional[Dict[int, complex]] = None, _powers=None) -> Bins:
-    """The Fourier coefficients H_sigma (GHz) of H_I at constant real pump amplitude eta.
-
-    With `displacement` = {k: b_k} (see `classical.harmonic_balance`), they are those of
-    the frame displaced by the coupler's classical response, s -> s + beta(t):
-
-        H' = sum_n g_n (X_q + x_cl(t))^n + H_anh - (Omega_k b_k s^dag + h.c.)
-
-    Here x_cl is the classical flux, and the last term is the adiabatic part of
-    -i D^dag dD/dt. The non-adiabatic remainder is evolved in `propagator`. The
-    c-number x_cl^n is dropped (a global phase).
-    """
-    from floquet.classical import classical_flux
+                 _powers=None) -> Bins:
+    """The interaction-picture coefficients H_sigma (GHz) of H_I at constant real pump
+    amplitude eta, keyed by signature. The c-number eta^n is dropped (a global phase).
+    `frame.periodic_coefficients` turns them into the paper's single-frequency series."""
     dims = tuple(int(d) for d in dims)
     n_modes = len(dims)
-    lam_s = float(lam[COUPLER])
     P = _powers or flux_powers(lam, dims, max(int(n) for n in g))
-    b = displacement or {}
-    c = classical_flux(b, eta, lam_s)
+    c = {1: complex(eta), -1: complex(eta)} if eta else {}
     H: Bins = {}
     for n, gn in g.items():
         n = int(n)
@@ -234,12 +223,4 @@ def coefficients(freqs_GHz, lam, alpha, g: Dict[int, float], dims, eta: float, *
     anh = anharmonicity(alpha, dims)
     if anh is not None:
         add(H, zero(n_modes), anh)
-    if b:
-        wp, fs = pump_frequency(freqs_GHz), float(freqs_GHz[COUPLER])
-        s_lo = tuple(+1 if i == COUPLER else 0 for i in range(n_modes))
-        S = annihilators(dims)[COUPLER]
-        for k, v in b.items():
-            om = k * wp - fs
-            add(H, (k, conj((0, s_lo))[1]), -om * v * S.T.conj().tocsr())
-            add(H, (-k, s_lo), -om * np.conj(v) * S)
     return prune(H)
