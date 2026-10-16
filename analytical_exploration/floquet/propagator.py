@@ -137,12 +137,16 @@ def replay(cpl, H, t_g: float, kicks: Optional[Tuple[np.ndarray, np.ndarray]] = 
 
 
 def gate_distance(U: np.ndarray, U_ref: np.ndarray) -> float:
-    """1 - leakage-aware average fidelity of the 4x4 block U against U_ref, with U_ref
-    replaced by its closest unitary: how differently two models make the same pulse act."""
-    u, _, vh = np.linalg.svd(U_ref)
-    W = u @ vh
-    return 1.0 - float((abs(np.trace(W.conj().T @ U)) ** 2 + np.real(np.trace(U.conj().T @ U)))
-                       / 20.0)
+    """How differently two models make the same pulse act on the 4x4 computational block:
+    ||U - e^{i phi} U_ref||_F^2 / (d + 1), with the global phase phi chosen optimally.
+
+    It is zero only for identical blocks, leakage included. For a small unitary
+    difference it equals the average gate infidelity between them. An earlier version
+    compared U against the closest unitary to U_ref, which penalised U's own leakage.
+    That made models reproducing the full model's leakage (with end kicks) look worse."""
+    ov = np.trace(U_ref.conj().T @ U)
+    ph = ov / abs(ov) if abs(ov) > 0 else 1.0
+    return float(np.linalg.norm(U - ph * U_ref) ** 2 / 5.0)
 
 
 def susceptibility(U_plus: np.ndarray, U_minus: np.ndarray, eps: float) -> float:
@@ -177,3 +181,116 @@ def uninstall() -> None:
     from snail_solver import zhou_coupler as Z
     if "orig" in _STATE:
         Z.ZhouCoupler.to_qutip_hamiltonian = _STATE.pop("orig")
+
+
+# --------------------------------------------------------------------------- closed form
+#: pump "charge" of one quantum of each mode (a, b, s). a^dag ~ 2 pump quanta (the A
+#: subharmonic, 2 w_p ~ w_a); b^dag ~ 3 (w_b = w_a + w_p); s^dag ~ 3 (3 w_p ~ w_s).
+#: The exchange, both conversions, both subharmonics and 3 w_p = w_s conserve
+#: s + sum_k Delta_k q_k = 0. In the frame rotating at nu_k = f_k - q_k f_p, every such
+#: term of F is static.
+PUMP_CHARGE = (2, 3, 3)
+
+
+def charge(sig: Signature, q=PUMP_CHARGE) -> int:
+    return int(sig[0] + sum(d * c for d, c in zip(sig[1], q)))
+
+
+def rotating_frame(F: Dict[Signature, Any], freqs_GHz, w_p_GHz: float, dims, q=PUMP_CHARGE):
+    """F in the frame rotating at nu_k = f_k - q_k w_p (true pump w_p), at constant eta.
+
+    Returns (F_rot dense GHz, nu, dropped), where F_rot = sum_conserving F_sigma +
+    sum_k nu_k n_k is time-independent. `dropped` maps every secular signature that does
+    not conserve the charge to (its largest element in GHz, its residual frequency in GHz)."""
+    dim = int(np.prod(dims))
+    nu = [float(f) - c * float(w_p_GHz) for f, c in zip(freqs_GHz, q)]
+    out = np.zeros((dim, dim), complex)
+    dropped = {}
+    for sig, M in F.items():
+        if charge(sig, q) == 0:
+            out += M.toarray()
+        else:
+            dropped[sig] = (float(abs(M).max()), charge(sig, q) * float(w_p_GHz))
+    occ = np.stack(np.unravel_index(np.arange(dim), tuple(dims)), axis=1)
+    out += np.diag(occ @ np.array(nu))
+    return out, np.array(nu), dropped
+
+
+def lambda_at(L: Dict[Signature, Any], freqs_GHz, dw_GHz: float, t: float) -> Optional[np.ndarray]:
+    """Lambda(t) = sum_sigma Lambda_sigma e^{-i 2pi (Omega_sigma + s dw) t} at constant eta."""
+    out = None
+    for sig, M in L.items():
+        term = M.toarray() * np.exp(-2j * np.pi * (carrier(sig, freqs_GHz) + sig[0] * dw_GHz) * t)
+        out = term if out is None else out + term
+    return out
+
+
+def direct_propagator(ex, freqs_GHz, dims, w_p_GHz: float, times, order: int, *,
+                      kicks: bool = True, q=PUMP_CHARGE):
+    """Eq. (3) in closed form at constant eta, at each time in `times`:
+
+        U(t) = e^{-i Lambda(t)} R(t) e^{-i 2pi F_rot t} e^{+i Lambda(0)},
+        R(t) = exp(+i 2pi sum_k nu_k n_k t)
+
+    F is taken to `order` and Lambda to `order - 1`. No time stepping is needed.
+    Returns ([U(t) dense], dropped)."""
+    from scipy.linalg import expm
+    dw = float(w_p_GHz) - (abs(float(freqs_GHz[1]) - float(freqs_GHz[0])))
+    Frot, nu, dropped = rotating_frame(ex.F_upto(order), freqs_GHz, w_p_GHz, dims, q)
+    w, Vr = np.linalg.eigh(Frot)
+    dim = int(np.prod(dims))
+    occ = np.stack(np.unravel_index(np.arange(dim), tuple(dims)), axis=1)
+    rot = occ @ nu
+    L = ex.Lambda_upto(order - 1) if kicks and order > 1 else {}
+    K0 = expm(1j * lambda_at(L, freqs_GHz, dw, 0.0)) if L else np.eye(dim)
+    out = []
+    for t in times:
+        V = (Vr * np.exp(-2j * np.pi * w * t)) @ Vr.conj().T
+        R = np.diag(np.exp(2j * np.pi * rot * t))
+        K1 = expm(-1j * lambda_at(L, freqs_GHz, dw, t)) if L else np.eye(dim)
+        out.append(K1 @ R @ V @ K0)
+    return out, dropped
+
+
+def qobjevo_bins(F: Dict[Signature, Any], freqs_GHz, w_p_GHz: float, dims,
+                 keep: Optional[Callable[[Signature], bool]] = None):
+    """F(t) = sum_sigma F_sigma e^{-i 2pi (Omega_sigma + s dw) t} at constant eta (rad/ns),
+    for integrating the same F numerically (method C at constant amplitude)."""
+    import qutip as qt
+    dw = float(w_p_GHz) - abs(float(freqs_GHz[1]) - float(freqs_GHz[0]))
+    d = [list(dims), list(dims)]
+    H, static = [], None
+    for sig, M in F.items():
+        if keep is not None and not keep(sig):
+            continue
+        om = TWO_PI * (carrier(sig, freqs_GHz) + sig[0] * dw)
+        Q = qt.Qobj(M * TWO_PI, dims=d)
+        if abs(om) < 1e-12:
+            static = Q if static is None else static + Q
+        else:
+            H.append([Q, (lambda om: lambda t, **kw: np.exp(-1j * om * t))(om)])
+    if static is not None:
+        H.append(static)
+    return qt.QobjEvo(H)
+
+
+def propagate_columns(cpl, H, times, init: Optional[np.ndarray] = None, atol=1e-10,
+                      rtol=1e-8, nsteps=500000):
+    """Full states (dim x 4) at each time, evolved under H from the computational kets
+    (or from the columns of `init`, e.g. e^{+i Lambda(0)} applied to them)."""
+    import qutip as qt
+    options = cpl._qutip_options(atol, rtol, nsteps)
+    idx = cpl._subspace_indices(0, 1)
+    dims = [list(cpl.dims), [1] * cpl.n_modes]
+    tl = np.concatenate([[0.0], np.asarray(times, float)])
+    out = [np.zeros((cpl.dim, 4), complex) for _ in times]
+    for col, start in enumerate(idx):
+        if init is None:
+            v = np.zeros(cpl.dim, complex)
+            v[start] = 1.0
+        else:
+            v = np.asarray(init[:, col], complex)
+        res = qt.sesolve(H, qt.Qobj(v.reshape(-1, 1), dims=dims), tl, options=options)
+        for j, st in enumerate(res.states[1:]):
+            out[j][:, col] = st.full().ravel()
+    return out
