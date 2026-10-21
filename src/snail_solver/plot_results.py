@@ -14,7 +14,7 @@ Render publication-style figures from a sweep result directory (``summary.csv``
            "danger ratio" g_spec / |beat| (works for ``--no-integrate`` sweeps).
 
 A full sweep yields Figs 1-4, an analytic-only sweep Fig 4. The series variable
-is ``lam_spec`` (Zhou driver) or ``eta`` (effective-model driver). Math uses
+is ``lam_spec``, or ``eta`` for a sweep that records it. Math uses
 Computer-Modern mathtext; ``--usetex`` switches to a real TeX install.
 
 Usage

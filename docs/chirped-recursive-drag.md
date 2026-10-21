@@ -1,5 +1,11 @@
 # Chirped recursive DRAG
 
+> **Reading this file.** It is a dated lab notebook: each section is true as of its
+> own date, and later addenda revise earlier ones. The Progress / Remaining / Open
+> items sections below are the 2026-08-31 snapshot; where later work settled an item
+> it is marked inline. The DRAG question moved from Phase 7 (`validate_recursive_drag`)
+> to the subharmonic gate scan (Addenda 3–6) and is still open there.
+
 ## Progress (as of 2026-08-31)
 
 **Suite: 190 passed, 97 subtests — all 125 pre-existing tests still pass unmodified.**
@@ -72,7 +78,7 @@ DRAG or not.
   `channel_detuning_jet` in `envelope.py`. `drag_detuning_floor` now minimises over all
   channels; `drag_detuning_floors()` added for the per-channel breakdown.
 
-**Phase 3 — wiring.** Mirrors 1 and 2 done; see Remaining for 3 and 4.
+**Phase 3 — wiring.** Mirrors 1 and 2 here; 3 and 4 in the next block.
 - `zhou_coupler._eta_at`: `is_legacy_drag` fast path (bit-identical) + general
   `apply_drag` branch.
 - `jax_engine`: `_hann_derivs`, `_iq_mod_derivs`, `_shape_jet_at` with a genuine
@@ -86,7 +92,8 @@ DRAG or not.
 - `grape`: `_tone_drag_channels` (third companion to `_tone_chirp`/`_tone_n_pump`),
   `_raised_cosine_eta(..., channels=None)` routed through `apply_drag` when channels
   are present and byte-identical otherwise, threaded into the three BASELINE call
-  sites (`:462`, `:765`, `:1207`) but deliberately NOT the warmstart seed.
+  sites (since condensed into `grape._baseline_eta`) but deliberately NOT the
+  warmstart seed.
   `_optimize_crab` now clears and restores `tone.drag_channels` — `drag=False` alone
   does not disable an explicit list, so the recursion would otherwise have fired on
   top of the CRAB ansatz.
@@ -114,7 +121,8 @@ DRAG or not.
   falling through to the plateau branch, zeroing a derivative that is genuinely
   nonzero when there is no plateau.
 
-**Phase 6 — `tune_up` calibration.** Complete except `stark_chirp` (see Remaining).
+**Phase 6 — `tune_up` calibration.** Complete (the `stark_chirp` seed is the
+"Shape-aware chirp seed" item below).
 - `chirp_from_measured_shift` now builds the pulse with the same `apply_drag` the
   solver uses, and takes `|.|` of it rather than `sqrt(amp^2 + q^2)` — which is the
   same number only while the correction is purely imaginary, i.e. only at one channel.
@@ -491,16 +499,21 @@ Ordered by what actually blocks a result.
    It was the `2 w_p` SNAIL subharmonic, and the model converges once `w_s` is placed
    away from it.
 
-1. **A working operating point — needs a device decision first.** `evan_device`'s
+1. ~~**A working operating point.**~~ **Done** — §6 (`1Gate4.2SNAIL` at 308.8 ns) and
+   Addendum 1 (`4Gate4.5SNAIL`, `eta = 0.6`, `Delta_sub = 0.538 GHz`, F = 0.997). The
+   original note: `evan_device`'s
    `w_s = 4.7` is 304 MHz from `2 w_p = 4.396`, which costs more fidelity than
    anything DRAG can recover. Either move `w_s` (e.g. ~6.5 GHz, where 5 coupler levels
    converge to 2e-3) and re-run `tune_up` there, or accept `w_s = 4.7` and run at
    `eta` low enough that `|alpha| = 3 g3 eta²/0.304 << 1` — which means eta ≲ 0.4 and a
    correspondingly long gate. **This is a physics question about the device, not a code
    defect** — it is visible with DRAG entirely absent.
-2. **Re-run Phase 7** at that point. No code changes expected. Note the reference-gate
-   guard will (correctly) refuse a verdict until (0) and (1) are settled.
-3. **A completed `tune_up --drag-channel` run.** The one I attempted aborted for two
+2. **Re-run Phase 7** at that point. (0) and (1) are now settled, but Phase 7 was never
+   re-run: the DRAG verdict is being sought through the subharmonic scan instead
+   (Addenda 3–6), where it is still open.
+3. ~~**A completed `tune_up --drag-channel` run.**~~ **Done** — the subharmonic scan runs a
+   recursive-DRAG `run_tune_up` per column (Addenda 3–6). The original note: the one I
+   attempted aborted for two
    reasons unrelated to the recursion: I was editing modules while it ran (Windows
    `ProcessPoolExecutor` workers re-import from disk, hence the traceback whose line
    numbers landed on docstrings), and at `target_eta=1.8` two of five Rabi rows drop
@@ -572,7 +585,8 @@ and ends in zero", m-times differentiable with **m vanishing derivatives at both
 > remark that *"for m = 1 and with zero holding time, the pulse is the same as the Hann
 > window"*: `∫₀ᵗ sin(pi t'/t_r) → ½(1 − cos(pi t/t_r))`, which at `t_r = t_g/2` is exactly
 > `RaisedCosine`. Paper uses **m = 3**, and warns against larger m (high-frequency content
-> → non-adiabatic error). **Re-confirm against the PDF before Phase 5.**
+> → non-adiabatic error). **Confirmed** (see Progress: the corrected form reproduces
+> the Hann window to 5.6e-16).
 
 The paper's "chirp" is the time-dependent detuning cancelling the residual IZ term; they
 approximate it by a constant ramp. This repo's `envelope.Chirp` is already the *general*
@@ -970,10 +984,11 @@ python -m snail_solver.validate_recursive_drag        # P7
 
 ## Open items
 
-1. **Re-confirm the Eq. 13 transcription** against the PDF before Phase 5 (see the note in
-   Context). The whole `SinePowerRamp` design assumes the `pi·t'/t_r` reading.
-2. `--max-drag-iters` default may need raising once the K-dependence of the chirp↔length
-   convergence is measured (Phase 6).
+Both resolved — see "Open items — both resolved" under Progress.
+
+1. ~~**Re-confirm the Eq. 13 transcription**~~ — confirmed: the `pi·t'/t_r` reading
+   reproduces the Hann window to 5.6e-16; the printed form does not.
+2. ~~`--max-drag-iters` default~~ — `n_outer = max(max_drag_iters, 2 * n_channels)`.
 
 ---
 
@@ -1251,8 +1266,13 @@ It is a runaway, not slow convergence: `eta_tot` grows, the Stark shift built fr
 the chirp grows, `Delta(t) = beat - k delta(t)` shrinks, and the `1/Delta` correction grows
 again. The chirp itself is only ~1 MHz against 100 MHz beats here, so the loop is NOT the
 chirp sweeping a channel onto its collision — it is the composition depth.
+**Revised by Addendum 6:** the inner pass cap was hardcoded at 12, and the channel that
+destabilised the loop was the fixed `-120 MHz` `|1>->|2>` leakage beat; depth alone was
+not the cause.
 
-Two guards came out of this, both in `spectator_audit.select_drag_channels`:
+Two guards came out of this (`max_ratio` in `spectator_audit.select_drag_channels`; the
+depth cap is the scan's `--max-drag-channels`, while `select_drag_channels`' own
+`max_channels` defaults to 4):
 
 - **`max_ratio = 0.3`** — a channel with `g/|det| >= 0.3` is reported and left
   UNCORRECTED. It is the same threshold `device_utils.drag_correction_ratio` already warns
@@ -1475,9 +1495,12 @@ the quartic term is only 6.4% of the shift at the top row, the design matrix has
 condition number 7, and `k2`/`k4` come out 96% anticorrelated, so a few-percent
 systematic in `k2` is absorbed as a large apparent error in `k4`. **A short ladder
 cannot pin `M4`**; the derivation supplies it, and the two-level integration confirms it
-in isolation. The residual ~4% on `k2` against the real device is 3-mode physics
-(coupler occupation, the `|2>` ladders) rather than the weight, since the weight is
-exact in the two-level model the derivation covers.
+in isolation. The residual ~4% on `k2` against the real device was attributed to 3-mode
+physics (coupler occupation, the `|2>` ladders), since the weight is exact in the
+two-level model the derivation covers. **Not established (2026-10-20):** the two-level
+confirmation scored `P(|10>)` at `t_g`, but `find_stark_resonance.scan(shape="gate")` —
+the shaped rung — scores max-over-time, and a two-level sketch of the `m = 3` envelope
+puts that estimator's own bias on `M2` at 2–3%, comparable to the gap.
 
 ### Using it
 
@@ -1496,7 +1519,9 @@ bracket it from below and because the cross-check reports all three. The setting
 of a scan column's cache key, so switching it invalidates stale columns rather than
 mixing conventions within one grid.
 
-**Not yet done:** the band scan of Addendum 4 was run with the constant probe, so its
+**Since done (Addendum 6):** the shaped-probe band was run, and it did not rescue
+`eta = 1.2`; the cause was the chirp<->DRAG fixed point, not the measurement. The
+original note: the band scan of Addendum 4 was run with the constant probe, so its
 `eta = 1.2` column is still the one the leaky fit produced. Re-running the band with
 `--probe-shape gate` is what would show whether the interior optimum at `eta ~ 1.0` is
 real or an artefact of the measurement — that is the open question, and it is the reason

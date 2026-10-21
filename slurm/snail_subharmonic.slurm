@@ -38,7 +38,8 @@
 # |alpha| ~ 3 g3 eta^2 / Delta_sub, and a coherent state has weight on every Fock
 # level, so close in, the truncation IS the regularizer (docs/chirped-recursive-drag.md,
 # section 4: the 5-vs-9-level spread collapses 0.232 -> 0.0002 as the subharmonic is
-# detuned).
+# detuned). This holds on the 2 w_p < w_s branch only: with 2 w_p > w_s the coupler
+# stays cold and 7 levels converge even at |alpha| ~ 1 (Addendum 2).
 #
 # RUN --dry-run FIRST, ALWAYS. Moving the pump also walks the gate past every other
 # pump-activated resonance, and a column sitting on one measures that collision
@@ -67,7 +68,7 @@
 #   TARGET_ETA  (required) peak |eta| held fixed in every column. The effect scales
 #               as eta^2, so this is the number the map is ABOUT; there is no
 #               default. |alpha| ~ 1 is where truncation is in question, i.e.
-#               Delta_sub ~ 3 g3 eta^2.
+#               Delta_sub ~ 3 g3 eta^2 (positive branch only; Addendum 2).
 #   DETUNINGS   Delta_sub grid in GHz, lo:hi:n[:log] or a comma list
 #                                                          [0.1:2.2:8:log]
 #   LEVELS      coupler truncations to score               [3,5,7,9,11]

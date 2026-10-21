@@ -285,6 +285,12 @@ def drag_verdict(g_MHz: float, det_MHz: float, t_g_ns: float) -> Dict[str, Any]:
     perturbative: reallocate) or :math:`|\delta| \lesssim 1/t_g` (inside the pulse
     bandwidth: not adiabatic).
 
+    CAUTION: the bandwidth labels run opposite to what this repo MEASURED (docs
+    section 5): DRAG cut leakage ~10x at |det| * t_g <~ 2 and did nothing at >~ 7, so
+    the "inside pulse bandwidth" / "barely adiabatic" rows -- excluded from
+    selection by ``_fails`` -- are where DRAG helps, and "DRAG effective" is where it
+    does not. The ``suppression ~ g/|det|`` estimate is ours, not Motzoi's.
+
     Returns ratio (g/|det|), bandwidth_MHz, adiabaticity (|det| * t_g), suppression
     (post/pre amplitude, <1 is good), suppression_dB, verdict, colour.
     """
@@ -484,7 +490,9 @@ def _audit_beat_key(beat_GHz: float, dedupe_MHz: float = 0.5) -> int:
 
 #: The fixed DRAG set of the subharmonic scan's ``--drag-set subharm-leak``: the A
 #: |0>-|1> subharmonic (its emission row, the one the ranked selector played), the A
-#: |1>->|2> subharmonic, and the |2> leakage (either enumeration: same beat, same pump).
+#: |1>->|2> subharmonic, and the |2> leakage (either enumeration: the two rows share
+#: ``det`` and pump count, but one carries eta and the other eta*, so as DRAG beats
+#: they want OPPOSITE signs; see the sign note in :func:`select_drag_channels`).
 FORCED_SUBHARM_LEAK: Tuple[Tuple[str, ...], ...] = (
     ("a1->0 (2 pump)",),
     ("a1->2 (2 pump)",),
@@ -514,7 +522,8 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
     Mandatory channels come first, then the strongest correctable parasites by
     ``g/|det|``, up to `max_channels` (each channel costs a unit of ``envelope_m``,
     hence pulse area and ``t_g``). Channels at ``g/|det| >= max_ratio`` are left
-    uncorrected (the chirp<->DRAG fixed point diverges); below `min_ratio` a channel
+    uncorrected (the perturbative substitution is not small there; fixed-point
+    stability is a separate matter, set by ``1/(|Delta| t_g)``); below `min_ratio` a channel
     is negligible and not mandatory. Channels a chirp would sweep through their
     collision are dropped by ``sweep_common._drag_channels_filtered``; every drop is
     reported with a reason.
@@ -565,6 +574,14 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
     req = tuple(str(c) for c in require)
     by_beat: Dict[int, Dict[str, Any]] = {}
     for r in rows:
+        # KNOWN SIGN DEFECT (verified 2026-10-20, not yet fixed): ``detuning_MHz`` is
+        # pump - transition, while a DRAG beat is transition - k w_p (the
+        # ``sweep_common`` convention). The two agree only for rows whose pump factor
+        # is eta* (emission); an eta (absorption) row is played as ANTI-DRAG, and
+        # the chirp then moves its beat the wrong way too. Measured on 6Gate,
+        # delta = +150 MHz, eta = 0.6, t_g = 3 ns: P(a=2) 1.7e-3 bare, 6.9e-3 at this
+        # sign, 3.0e-5 at the opposite one. Subharmonic rows matched to
+        # ``sub_by_beat`` below take the correct beat from ``sweep_common``.
         r["beat_GHz"] = float(r["detuning_MHz"]) / 1e3
         r["n_photon"] = max(int(r.get("n_pump", 1) or 1), 1)
         # same P_exc as spectator_channels, for total_error_estimate / print_table

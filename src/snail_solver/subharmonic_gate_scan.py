@@ -39,9 +39,10 @@ fidelity at its operating point. eta 0.5 -> 2.5 in 0.05 steps is::
 DRAG channels
 -------------
 DERIVED per column by ``spectator_audit.select_drag_channels`` (leakage, coupler and
-mode-subharmonic categories always; remaining slots to the strongest correctable
-parasite; everything unselected is reported). ``--dry-run`` prints that audit for every
-column and solves nothing. ``envelope_m`` is pinned to ``--max-drag-channels`` grid-wide,
+mode-subharmonic categories first, though ``--max-drag-channels`` can cap them out;
+remaining slots to the strongest correctable parasite; everything unselected is
+reported). ``--drag-set`` replaces the ranking with a fixed set. ``--dry-run`` prints
+that audit for every column and solves nothing. ``envelope_m`` is pinned to ``--max-drag-channels`` grid-wide,
 so the envelope vanishes to enough order for every column and ``t_g`` stays comparable.
 
 Usage
@@ -168,7 +169,7 @@ def shard_columns(cols: Sequence[Dict[str, Any]], shard: int,
                   n_shards: int) -> list:
     """Every ``n_shards``-th column starting at `shard` -- one machine's share.
 
-    STRIDED, not blocked: column cost varies from milliseconds (refused) to ~40 min,
+    STRIDED, not blocked: column cost varies from milliseconds (failed early) to ~40 min,
     so a stride interleaves cheap and expensive columns into every shard. Shards are
     disjoint and cover the grid, so caches never race and the HDF5 files concatenate
     (rows are keyed on ``(delta, target_eta)``).
@@ -301,8 +302,10 @@ def _stale_chirp_free(got: Dict[str, Any], max_frac: float) -> bool:
     turn a ``no_measurable_shift`` fallback into a failure, and that can be re-checked
     from the stored law. Other chirp-free reasons (``stark_crossing``,
     ``chirp_not_converged``) have no trustworthy law at eta* and are never stale; a row
-    with no reason predates them and can only be ``no_measurable_shift``. A railed ridge
-    stores no k2/k4, so its excursion is unknown and it is always stale.
+    with no reason predates them and can only be ``no_measurable_shift``. A
+    ``no_measurable_shift`` row storing no k2/k4 (a pre-``chirp_not_converged`` railed
+    ridge, or a ``--chirp-source ridge`` column) has an unknown excursion and so is
+    stale on every resume.
     """
     op = got.get("operating_point") or {}
     if not op.get("chirp_free"):
@@ -326,7 +329,8 @@ def _column_expect(col: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, A
     Grid RESOLUTION is deliberately absent, so refining the offset grid reuses the
     columns it has. Everything that changes the pulse, the device, or the stored
     number is present. ``.get`` defaults mirror the CLI so a synthetic settings dict
-    still keys.
+    still keys, except ``span_growth`` / ``max_compound_growths``, which default to
+    the behaviour before they were keys (``both`` / 3) so older caches key correctly.
     """
     return {"w_p_GHz": float(col["w_p_GHz"]),
             "target_eta": float(col["target_eta"]),

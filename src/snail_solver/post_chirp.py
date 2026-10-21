@@ -5,8 +5,9 @@ post_chirp.py
 
 Does the calibrated chirp help on the REAL shaped gate, and up to what drive?
 
-``tune_up.py`` derives the chirp from a constant-probe diagnostic (a device
-property). This module re-runs the actual raised-cosine gate with that chirp as a
+``tune_up.py`` derives the chirp from a Rabi-ladder diagnostic (constant or shaped
+probe; a device property). This module re-runs the actual gate (the configured
+envelope) with that chirp as a
 chevron sweep across drive strength and pump offset, and by default the same gate
 with the chirp off (``run_tune_up``'s one-point ``chirp_ablation``, generalised).
 Each row's length is rescaled to stay a full swap at its own drive (see

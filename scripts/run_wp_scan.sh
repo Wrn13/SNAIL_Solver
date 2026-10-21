@@ -11,11 +11,12 @@
 # channel audit -- which channels will be corrected, which will not, and why:
 #
 #   uv run python -m snail_solver.subharmonic_gate_scan \
-#       --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 --target-eta 2.5 --dry-run
+#       --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
+#       --target-etas 0.6,0.8,1.0,1.2 --dry-run
 #
-# QUICK START
+# QUICK START (eta 2.5 is past the drive ceiling for a +-100 MHz scan; docs Addendum 4)
 #   scripts/run_wp_scan.sh --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
-#       --target-eta 2.5 --amp-points 41 --coupler-levels 9 \
+#       --target-etas 0.6,0.8,1.0,1.2 --amp-points 41 --coupler-levels 9 \
 #       --column-workers 8 --jobs 8 \
 #       --out wpscan_full.h5 --plot figs/wpscan_full.png
 #

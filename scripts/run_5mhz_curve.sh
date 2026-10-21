@@ -23,9 +23,11 @@
 #   A |1>-><2> subharmonic g = 43.0 MHz   det = 2(delta + 60 MHz)  zero at delta = -60
 #
 # DRAG is perturbative in g/Delta, so it cannot be valid at either. Columns OUTSIDE
-# +-10 MHz of those two points are solved with --force; the nine inside run unforced
-# so they record an explicit NonPerturbativeChannel row and the plot marks the
-# exclusion instead of silently missing the points.
+# +-10 MHz of those two points are solved with --force; the nine inside run unforced.
+# (Historical: that made them record an explicit NonPerturbativeChannel row. Since
+# a94f2ee every column is calibrated and flagged `audit_nonperturbative`, and --force
+# is a no-op without --refuse-nonperturbative, so the split now only routes them to
+# their own output file.)
 #
 # Order is eta=1.3 A, eta=1.3 B, eta=1.5 A, eta=1.5 B, so a complete three-series
 # comparison at 1.3 lands first and the job stays useful if it is stopped early.

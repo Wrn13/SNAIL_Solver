@@ -110,6 +110,7 @@
 #                     onto the DRAG-on resonance); needs STARK=1
 #   STARK_JOBS=n      processes for the chevron's offset scan [cpus-per-task]
 #   DRAG_SUBHARM=1    include w_i/2 = w_p subharmonic channels in the DRAG target
+#                     (already the default; --no-drag-subharmonic turns it off)
 #   SUBHARM_MODES=a,b restrict which modes' subharmonics are considered
 #
 #   GRAPE=1           per-point optimal control; adds grape_baseline_F / F_grape /
@@ -118,7 +119,7 @@
 #   GRAPE_BACKEND     qutip (qutip-qoc JOPT, exact propagation, SLOW) |
 #                     reduced (in-house scipy over the rotating-frame model, fast)
 #                                                        [qutip]
-#   GRAPE_ALG         JOPT | CRAB   (qutip backend)                            [JOPT]
+#   GRAPE_ALG         JOPT | CRAB   (qutip backend)                            [CRAB]
 #                     JOPT is the qutip-qoc JAX GRADIENT method (needs
 #                       qutip-jax + jax); both need `pip install qutip-qoc`.
 #                     CRAB is GRADIENT-FREE over a randomized Fourier basis and

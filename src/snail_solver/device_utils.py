@@ -61,7 +61,9 @@ def auto_t_g(g3_GHz: float, lam_a: float, lam_b: float, target_eta: float) -> fl
 
 
 #: Smallest |Delta(t)| (GHz) a DRAG quadrature may reach before it is judged singular;
-#: mirrors ``sweep_common._drag_skip_GHz`` so explicit and swept paths agree.
+#: equals ``sweep_common._DELTA_EPS_GHz``, the floor under ``_drag_skip_GHz``. The
+#: sweeps skip DRAG at the larger ``drag_skip_below_MHz`` (default 5 MHz), so an
+#: explicit build accepts beats a sweep would skip.
 DRAG_FLOOR_GHz: float = 5e-4
 
 

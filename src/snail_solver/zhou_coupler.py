@@ -430,7 +430,8 @@ class ZhouCoupler:
 
     def _eta_at(self, tone: PumpTone, t: Any, xp: Any = np) -> Any:
         """Displaced pump amplitude eta_p(t) for scalar OR array `t`, built from
-        `xp` primitives (Eq. 50; Motzoi PRL 103, 110501 (2009)).
+        `xp` primitives (Zhou Eq. 50; the DRAG quadrature is Motzoi PRL 103, 110501
+        (2009), composed per :mod:`snail_solver.drag`).
 
         The SINGLE definition of the pump amplitude: the QuTiP callback (`_eta`) and
         the batched engine both route through it.

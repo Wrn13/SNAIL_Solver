@@ -59,7 +59,9 @@ class TestForcedDragSet(unittest.TestCase):
             self.assertIn("skip window", row["reason"])
 
     def test_a_coincident_beat_is_covered_not_missing(self):
-        """At delta = -30 MHz both A subharmonics beat at +60 MHz: one substitution."""
+        """At delta = -30 MHz both A subharmonics sit 60 MHz off: the audit keys them as
+        one substitution. (Their beats, transition - 2 w_p, have OPPOSITE signs, so one
+        quadrature cannot correct both; this pins current behaviour, not the physics.)"""
         from snail_solver import subharmonic_gate_scan as GS
         base, col, settings = _column(-0.03)
         chans, audit = GS.audit_column(base, col, settings)

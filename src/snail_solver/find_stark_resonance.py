@@ -19,6 +19,9 @@ as ``wp_offset_GHz``.
 
 The constant pump is deliberate: on resonance the exchange reaches full contrast
 whatever the amplitude calibration, so the vertex locates the frequency cleanly.
+``shape="gate"`` / ``"raised_cosine"`` play the configured gate envelope instead
+(the shaped probe, and the assembled gate's residual); only ``"raised_cosine"`` is
+scored on ``P(|10>)`` at ``t_g``, the others on the max over time.
 Anharmonicity and qutrit levels are included (they shift the resonance too).
 
 Usage

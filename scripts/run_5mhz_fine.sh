@@ -47,7 +47,8 @@ OFFSETS=${OFFSETS:-'-0.19:0.16:71'}
 RESIDUAL_CAP=${RESIDUAL_CAP:-1}
 TAG=${TAG:-fine}
 
-# Same physics as scripts/run_5mhz_ridge.sh except the offset grid.
+# The physics of scripts/run_5mhz_ridge.sh, except the offset grid (--wp-points),
+# the step-3 residual cap, and replaying pass A's FINE chevrons, not the 15-point ones.
 COMMON=(--device "$DEVICE" --branch above --probe-shape gate
         --coupler-levels "$LEVELS" --amp-points "$AMP"
         --wp-points "$WP_POINTS" --tg-points 9

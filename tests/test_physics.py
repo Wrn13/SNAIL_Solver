@@ -5974,7 +5974,7 @@ class TestTheScannedGateActuallyPlaysItsDrag(unittest.TestCase):
         self.assertEqual(row["flat"]["n_drag_channels"], 0)
 
     def test_no_drag_is_none_never_an_empty_list(self):
-        """`[]` is FALSY at device_utils.py:317, so an empty list is indistinguishable
+        """`[]` is FALSY in `device_utils.build_coupler`, so an empty list is indistinguishable
         from None THERE -- unlike chirp_coeffs_GHz, where the distinction is enforced
         by a raise. Passing `[]` here would work by accident; assert the intent."""
         from unittest import mock
@@ -7199,7 +7199,7 @@ class TestTheStoredChevronsAreEnoughToRefitTheLaw(unittest.TestCase):
         self.assertEqual(set(rejects), {"low_contrast"})
 
     def test_the_ridge_is_reported_relative_to_the_probe_offset(self):
-        """`ridge[i] = (center - wp_offset) * 1e3` (tune_up.py:1103)."""
+        """`ridge[i] = (center - wp_offset) * 1e3` (`tune_up.rabi_shift_table`)."""
         from snail_solver.ridge_refit import gate_rows
         _, rows = self._chevrons()
         base, _, _ = gate_rows(rows, wp_offset_GHz=0.0)
@@ -7211,7 +7211,7 @@ class TestANarrowSliceIsTheRowBeforeItWasWidened(unittest.TestCase):
     """The "what if this row had not been widened" counterfactual is exact.
 
     A span growth re-samples at the SAME step -- `rabi_shift_table` grows
-    ``n_off`` by the same factor as the span (tune_up.py:1056-1059) -- so a
+    ``n_off`` by the same factor as the span -- so a
     3x-widened 43-point row is the original 15-point grid with 14 points added
     on each side, at identical offsets. That is why the widening policy could
     be settled from stored data instead of re-solved: over the 2026-09-25 grid,
@@ -7274,7 +7274,7 @@ class TestTheShiftLawCanCarryMoreThanTwoTerms(unittest.TestCase):
         self.assertAlmostEqual(got["coeffs"]["k0"], ref["delta0"], places=9)
         self.assertEqual(got["n_used"], ref["n_used"])
         # `fit_shift_curve` solves WEIGHTED and scores r2 UNWEIGHTED
-        # (tune_up.py:572). That inconsistency is the pipeline's; the harness
+        # (`tune_up.fit_shift_curve`). That inconsistency is the pipeline's; the harness
         # reports both so the two can be compared without inheriting it.
         self.assertAlmostEqual(got["r2_unweighted"], ref["r2"], places=9)
 
@@ -7332,7 +7332,7 @@ class TestALawMustReportItsOwnTruncation(unittest.TestCase):
                 "eta_max_fitted": eta_max_fitted}
 
     def test_the_last_term_fraction_is_the_production_quartic_fraction(self):
-        """For (0, 2, 4) it must BE `quartic_fraction` (tune_up.py:1808).
+        """For (0, 2, 4) it must BE `quartic_fraction` (`tune_up.chirp_from_measured_shift`).
 
         Checked against the real grid as well as here: over the 87 columns of
         the 2026-09-25 pass A that stored both, the largest relative difference
@@ -7422,7 +7422,7 @@ class TestTheProbeMomentsGeneralizeToAnyEvenOrder(unittest.TestCase):
 class TestAStoredLawIsNeverRefinedOnlyReplaced(unittest.TestCase):
     """The stored ``k2`` is already ``K2_measured / M2``; dividing again is a bug.
 
-    The shaped-probe de-convolution at tune_up.py:1272-1283 runs ONCE, on the
+    The shaped-probe de-convolution in `tune_up.rabi_shift_table` runs ONCE, on the
     way out. A re-fit that took the stored ``fit`` as its starting point would
     apply the envelope moments a second time and report a law inflated by
     ``1/M2`` -- about 20% on this device at second order, more at fourth. So

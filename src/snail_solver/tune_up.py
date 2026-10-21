@@ -26,8 +26,9 @@ the latter has a shape along the pulse and belongs in the chirp (:func:`fit_shif
 
 Why fix the amplitude
 ---------------------
-At fixed peak |eta| the envelope in normalized time u = 2t/t_g - 1 is
-``|eta(u)| = eta* cos^2(pi u / 2)`` -- independent of t_g. So the Stark shift and the
+At fixed peak |eta| the envelope in normalized time u = 2t/t_g - 1 is a fixed shape
+(``eta* cos^2(pi u / 2)`` on a Hann) -- independent of t_g, for any envelope whose
+rise is a fraction of t_g (``envelope_rise_frac``). So the Stark shift and the
 chirp coefficients are t_g-independent too, decoupling frequency from length
 calibration. Fixed t_g with scanned amp_scale lacks this: amp_scale changes |eta|,
 hence the Stark shift, hence the required offset (why ``calibration_map`` 1-D scans rail).
@@ -35,7 +36,8 @@ hence the Stark shift, hence the required offset (why ``calibration_map`` 1-D sc
 The amplitude/length algebra
 ----------------------------
 ``set_pump(normalize_iswap=...)`` holds the pulse AREA at A = (pi/2)/(6 g3 la lb),
-independent of t_g, so a Hann pulse has ``peak_eta = 2A/t_g``. Hence::
+independent of t_g, so ``peak_eta = A/(f t_g)`` with ``f = area_factor`` (1/2 on a
+Hann or a plateau-free sine_power bell; the formulas below are that case). Hence::
 
     amp_scale(t_g) = eta* t_g / (2A)      # holds |eta| fixed as t_g varies
     t_g0           = 2A / eta*            # = device_utils.auto_t_g; amp_scale == 1 here
@@ -768,8 +770,9 @@ def rabi_shift_table(config: Dict[str, Any], target_eta: float, *,
     shaped = str(probe_shape) != "constant"
     for i, e in enumerate(eta):
         # window_tg x nominal_t_g(e) per constant row. A SHAPED rung is a full iSWAP
-        # over nominal_t_g(e) (amp_scale = 1.0 makes the peak exactly e only on a
-        # Hann: 2 * area_factor in general), so its window is the pulse.
+        # over nominal_t_g(e) (amp_scale = 1.0 makes the peak exactly e only when
+        # area_factor = 1/2, as on a Hann or a sine_power bell; 2 * area_factor in
+        # general), so its window is the pulse.
         t_g_rung = nominal_t_g(config, float(e))
         window_ns = t_g_rung if shaped else float(window_tg) * t_g_rung
         span = (float(wp_span_MHz) if wp_span_MHz is not None
@@ -1797,7 +1800,8 @@ def post_chirp_table(config: Dict[str, Any], record: Dict[str, Any], *,
     """Re-run the chevron with the SHAPED, CHIRPED gate across drive strengths.
 
     :func:`rabi_shift_table` characterises the device; this measures the pulse. One
-    chevron per ``|eta|`` with the real raised-cosine gate and calibrated chirp, and
+    chevron per ``|eta|`` with the real gate (the configured envelope) and calibrated
+    chirp, and
     (with `compare_flat`) the same gate unchirped -- ``chirp_ablation`` generalised
     across drive and pump offset.
 
@@ -2272,7 +2276,7 @@ def calibrate_drag_offset(config: Dict[str, Any], t_g: float, target_eta: float,
 
     The empirical counterpart to the quadrature model in
     :func:`chirp_from_measured_shift`, which ASSUMES the shift follows the total drive
-    through the constant-probe law; any other DRAG mechanism shows up only here.
+    through the DRAG-off Rabi law; any other DRAG mechanism shows up only here.
     Both legs use the SHAPED chevron (a constant probe has no quadrature). Pass
     `predicted_GHz` to get ``excess_GHz``; both are pulse-averaged, so comparable.
     """
@@ -2442,7 +2446,9 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     Order, and what is held fixed at each step::
 
         0.  t_g0 = auto_t_g(eta*);  amp_scale := fixed_eta_amp_scale(t_g)  [never free]
-        1.  Rabi, constant probe, chirp OFF, DRAG OFF   -> the shift LAW k2, k4
+        1.  Rabi (constant or shaped probe), chirp OFF, DRAG OFF  -> chevron ridge
+        1b. the shift LAW from it: k2, k4 (``chirp_source="law"``) or the tracked
+            ridge itself (``"ridge"``, :mod:`ridge_chirp`)
         2.  chirp by projecting that law along the pulse -> c_k, wp_offset
         3.  residual offset from a SHAPED chevron with the chirp on
         4.  length via the shaped scan                  -> t_g_ns
@@ -2649,7 +2655,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
     def shaped_residual(t_g: float, chirp, wp_offset: float) -> float:
         """Residual offset of the ASSEMBLED gate: shaped pulse, chirp and DRAG on.
 
-        The one place the real pulse can disagree with the constant-probe law. The
+        The one place the real pulse can disagree with the step-1 law. The
         span is sized in linewidths, like the Rabi rows.
         """
         from snail_solver import find_stark_resonance as FSR
@@ -2907,7 +2913,7 @@ def run_tune_up(config: Dict[str, Any], target_eta: float, *,
             log.info("  WARNING: the measured DRAG shift disagrees with the "
                      "quadrature model by more than 50%. DRAG is moving this "
                      "resonance by some route other than simply adding drive, so the "
-                     "chirp -- which is built from the DRAG-blind constant probe -- "
+                     "chirp -- which is built from the DRAG-off Rabi ladder -- "
                      "does not account for it. Run drag_shift_table to get the "
                      "scaling with |eta|; an exponent far from 4 identifies it.")
         if drag_shift_points:

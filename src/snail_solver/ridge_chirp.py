@@ -259,8 +259,11 @@ def track_ridge(chevrons: Sequence[Dict[str, Any]], *, n_seed: int = 3,
     competing peak elsewhere in the row cannot capture it.
 
     A row the gate ACCEPTED is kept as measured. A rejected row is recovered when its
-    windowed peak clears :data:`TRACK_CONTRAST_MIN` and the windowed Lorentzian lands
-    inside the window; it then carries :data:`TRACK_WEIGHT` of its quality weight.
+    windowed peak clears :data:`TRACK_CONTRAST_MIN`, the windowed fit passes the quality
+    gate (a ``high_leakage`` reject still counts as a pass), and its centre lands within
+    :data:`TRACK_ACCEPT_HWHM` half-widths (or :data:`TRACK_ACCEPT_STEPS` grid steps) of
+    the prediction and off the row's edge; it then carries :data:`TRACK_WEIGHT` of its
+    quality weight.
     Tracking stops after `max_misses` consecutive unrecoverable rows: a peak that has
     genuinely faded (low contrast all the way) is NOT followed.
 

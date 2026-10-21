@@ -7,8 +7,9 @@ Pump envelopes, frequency chirps, and the pump-tone container.
 The single source of truth for these classes; `zhou_coupler` re-exports them.
 
 * :class:`Envelope` carries the pulse SHAPE and its peak scale ``amp``. ``value`` may
-  be complex (DRAG, CRAB I/Q), but ``|value|`` is what the iSWAP normalization
-  integrates.
+  be complex (CRAB I/Q); the iSWAP normalization divides by :meth:`Envelope.area`,
+  which integrates ``value`` itself (its real part for I/Q). DRAG is applied on the
+  PumpTone afterwards and is not counted.
 * :class:`Chirp` carries a FREQUENCY offset delta(t) about the tone's fixed carrier
   ``w_p_GHz``, as the accumulated phase Phi(t) = int_0^t delta.
 * :class:`PumpTone` binds the two to a carrier.
@@ -735,7 +736,11 @@ class DragChannel:
         Measured: ``|2>``-involving channels shift 6-10x harder than the target, with
         opposite signs (~ +10 for ``a|1>->|2>``, ~ -8 for ``b|1>->|2>``) -- a 15-30%
         error in the DRAG denominator if ignored. Subharmonic channels barely move
-        (~ -0.2). 0.0 means a static beat.
+        (~ -0.2). 0.0 means a static beat. CAUTION: ``channel_detuning`` /
+        ``channel_detuning_jet`` (calibration, guards, GRAPE) apply it but the solver
+        paths (``channel_detuning_jets``, ``jax_engine``) do not, and nothing in the
+        pipeline calls ``stark_scales`` -- so it is always 0 today, and must stay 0
+        until both paths agree.
     """
 
     beat_GHz: float
@@ -749,7 +754,9 @@ class DragChannel:
     @classmethod
     def from_collision(cls, beat_GHz: float, kind: str, **kw: Any) -> "DragChannel":
         """Channel for a collision labelled by ``sweep_common._nearest_collision``: the
-        paper's scheme verbatim (`n_pump` = `n_photon` = pump quanta, quotient rule on)."""
+        paper's scheme (`n_pump` = `n_photon` = pump quanta, quotient rule on). The
+        ``static`` kind (k = 0: F^(1) against a pump-independent beat) is an extension
+        of ours, not in the paper."""
         from snail_solver.sweep_common import _PUMP_QUANTA
         k = int(_PUMP_QUANTA.get(str(kind), 1))
         kw.setdefault("quotient_rule", True)

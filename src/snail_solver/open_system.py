@@ -1,6 +1,6 @@
 r"""Open-system scoring: what the gate achieves once T1 and T2 are switched on.
 
-The rest of the package solves a CLOSED system (``qt.sesolve``), isolating the
+The scans and tune-ups solve a CLOSED system (``qt.sesolve``), isolating the
 coherent error pulse shaping can fix -- but then gate LENGTH is free, and since
 ``t_g = 2A/eta`` that biases comparisons toward weak drive.
 :func:`subharmonic_gate_scan.coherence_penalty` gives a first-order estimate for

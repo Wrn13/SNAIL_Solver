@@ -20,7 +20,7 @@ calibrations, FREQUENCY FIRST:
 
 A couple of rounds converge (wp_offset, amp_scale); a final leakage-aware test then
 reports F_avg, leakage, transfer and the residual conditional (ZZ) phase. The full
-per-iteration record is written for calibration_plots.py.
+per-iteration record is written beside the JSON (``.npz``).
 
 Usage
 -----
@@ -192,8 +192,7 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
 # ---------------------------------------------------------------------------
 def save_record(record: Dict[str, Any], json_path: str) -> str:
     """Write the scalar results of `run_calibration` to `json_path` and the
-    per-iteration arrays to the sibling .npz (for calibration_plots.py); return the
-    .npz path."""
+    per-iteration arrays to the sibling .npz; return the .npz path."""
     scalars = {"t_g_ns": record["t_g_ns"], "final": record["final"],
                "iterations": [{k: v for k, v in it.items()
                                if k not in ("amp_curve", "chevron")}

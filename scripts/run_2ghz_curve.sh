@@ -18,8 +18,10 @@
 #   SNAIL subharmonic      g = 304.2 MHz   zero at delta = +600     <-- new
 #   A-SNAIL spectator                      zero at delta = -550     <-- new
 #
-# Columns within +-10 MHz of any of them run UNFORCED so they record an explicit
-# NonPerturbativeChannel row; everything else is forced.
+# Columns within +-10 MHz of any of them run UNFORCED; everything else is forced.
+# (Historical: unforced columns used to record a NonPerturbativeChannel row. Since
+# a94f2ee every column is calibrated and flagged `audit_nonperturbative`, so the
+# split now only routes them to their own output file.)
 #
 # A fifth, 3 w_p = w_s at -183 MHz, is SECOND ORDER in g3 and invisible to the
 # first-order audit, so it is deliberately left forced -- it is a feature we want

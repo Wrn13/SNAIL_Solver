@@ -3,7 +3,10 @@
 #
 # One run per target eta, sequential so the box is never oversubscribed (8 column
 # workers x 6 jobs = 48 of 72 cores; someone else is on this machine). All runs share
-# one --outdir so the per-column cache is reused and a kill/relaunch resumes free.
+# one --outdir so the per-column cache is reused and a kill/relaunch resumes free --
+# EXCEPT that an eta whose .h5 exists is skipped, and the scan creates its .h5 up
+# front, so delete an interrupted eta's .h5 before relaunching (the 5 MHz drivers
+# use a .done sentinel instead).
 #
 # Deliberately NOT passed: --open-system (it hung a previous run for 2 days confirming
 # a 1% correction to a 37% error; the analytic coherence penalty is free) and

@@ -35,11 +35,14 @@ root (useful for putting batch output on scratch storage).
 ## Layout
 
 ```
+analytical_exploration/  time-dependent Schrieffer-Wolff expansion and term-spectrum page
 devices/                 device JSONs (the tracked inputs)
+docs/                    design notes and dated findings
 results/                 sweep + calibration output (gitignored)
+scripts/                 single-box drivers, finalize passes and analysis scripts
 slurm/                   SLURM batch drivers
 src/snail_solver/        the package
-tests/                   QuTiP-free regression suite
+tests/                   regression suite (almost all QuTiP-free)
 ```
 
 ## Quick start
@@ -157,7 +160,7 @@ Which average is **derived, not chosen**: a chevron's centre weights the shift b
 `sin θ(t)`, the accumulated Rabi angle, which vanishes at both pulse ends (a `z`
 rotation does nothing at a pole of the Bloch sphere) and peaks mid-gate. That is
 `--moment-weighting rabi`, the default; `coupling` and `uniform` are the earlier guesses
-and both underestimate `k2`, by 19% and 2.1×. Re-pin it against ground truth whenever an
+and both underestimate `M2`, so they overestimate `k2`, by 19% and 2.1×. Re-pin it against ground truth whenever an
 envelope changes — `tune_up --cross-check-moments` runs a clean constant leg at weak
 drive and reports which convention reproduces it:
 
@@ -260,7 +263,8 @@ scripts/run_wp_scan.sh --device 4Gate4.5SNAIL.json --offsets=-0.1:0.1:21 \
 coupling is a two-pump process, so `g ∝ η²` while its detuning is set by `δ` —
 past `η ≈ 1` a ±100 MHz scan goes *non-perturbative* (`g/|det| ≥ 1`) and
 recursive DRAG has no leading term to cancel. The dry run prints the feasibility
-table; columns carrying such a channel are refused unless `--force`.
+table; columns carrying such a channel are still calibrated but flagged
+`audit_nonperturbative` (`--refuse-nonperturbative` restores the old refusal).
 
 **The solve is closed-system, so gate length is otherwise free.** Without
 `--t1-us` / `--t2-us` the ranking always prefers the weakest drive and ignores
@@ -272,7 +276,8 @@ infidelity; `--open-system TOP` then re-scores the best few points with a real
 **Spend the cores across columns, not only inside them.** `tune_up` step 4
 (`length_rabi`) takes no `jobs` — it is an optimizer over gate length and runs
 single-threaded, for minutes per column once the pulse carries a multi-channel
-recursion, and `run_tune_up` repeats it `2 × n_channels` times. A `--jobs 72` run
+recursion, and `run_tune_up` repeats it up to `max(--max-drag-iters, 2 × n_channels)`
+times. A `--jobs 72` run
 leaves ~70 cores idle throughout, so pair a moderate `--jobs` with
 `--column-workers`.
 
@@ -289,8 +294,8 @@ forces `--jobs 1`.
 uv run pytest -q
 ```
 
-366 tests, deliberately QuTiP-free and ~1 min, so they can gate a cluster
-submission. Each one encodes an invariant that a real bug once violated (beat
+514 tests, deliberately QuTiP-free apart from `test_piecewise_pulse`, so they can
+gate a cluster submission (a few minutes: several tests run the chirp-free path). Each one encodes an invariant that a real bug once violated (beat
 sign conventions, collision labelling, the subharmonic factor of 2, blank
 spectator plumbing) — a failure means a specific known-bad behaviour is back.
 
@@ -299,10 +304,14 @@ spectator plumbing) — a failure means a specific known-bad behaviour is back.
 - The pump sits at `w_p = |w_b - w_a|`, amplitude-normalized to a full iSWAP at
   `t_g`. With `--target-eta`, `t_g` follows from the gate area
   (`t_g = 2 * eta_area / eta`) — don't also pass `--t-g-ns`.
-- DRAG is the first-order Motzoi quadrature (PRL **103**, 110501 (2009)) tuned to
-  the spectator's beat detuning. It is *skipped* within 0.5 MHz of a collision:
-  on resonance the answer is frequency allocation, not DRAG. It helps in the
-  off-resonant-but-close window, roughly the inner 100 MHz.
+- The sweeps apply first-order Motzoi DRAG (PRL **103**, 110501 (2009)) tuned to
+  the spectator's beat detuning; `tune_up` and `subharmonic_gate_scan` compose one
+  correction per channel, the recursive multi-derivative DRAG of Li, Calarco &
+  Motzoi, npj QI **10**, 66 (2024) ([drag.py](src/snail_solver/drag.py)). A channel
+  is *skipped* within `drag_skip_below_MHz` (default 5 MHz) of its collision: on
+  resonance the answer is frequency allocation, not DRAG. DRAG only removes the
+  residual excitation while `|beat| * t_g` is below ~3 beat cycles, so its useful
+  window is roughly `5 MHz <~ |beat| <~ 3/t_g` (5–30 MHz at `t_g = 100 ns`).
 - `g3 X^3` necessarily contains `3 g3 eta^2 s^dag` at the **subharmonic
   detuning** `Delta_sub = w_s - 2 w_p` — a linear drive on the SNAIL with no
   participation suppression, where the gate itself is down by `lam^2 ~ 0.01`. It

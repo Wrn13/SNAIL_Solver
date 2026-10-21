@@ -106,11 +106,12 @@
 #   WINDOW_TG   chevron time window in SWAPS (window scales as 1/|eta|)   [2.0]
 #   N_TIME      chevron readout times (one solve covers all)          [161]
 #   TG_POINTS   length-scan grid points                              [13]
-#   CHIRP_DEGREE  Legendre truncation (even terms only matter). delta(u) is an
-#               EXACT degree-8 polynomial in cos(pi u/2), so the default of 8
-#               reconstructs it exactly for free (algebra on the already-fit
-#               k2/k4, not a new fit); below that, PLOT_RIDGE will show the
-#               chirp overshoot the ridge near |eta| -> 0                  [8]
+#   CHIRP_DEGREE  Legendre truncation (even terms only matter). delta(u) is a
+#               polynomial in cos(pi u/2), NOT in u, so every degree truncates;
+#               8 leaves ~0.7% peak error on a Hann (more on sine_power m=3).
+#               Raising it is free (algebra on the already-fit k2/k4, not a
+#               new fit); below 8, PLOT_RIDGE will show the chirp overshoot
+#               the ridge near |eta| -> 0                                  [8]
 #   QUARTIC_WARN  warn (never raise) when the fitted quartic term exceeds this
 #               fraction of the quadratic term at TARGET_ETA               [0.25]
 #   DRAG_BEAT   beat of the process DRAG suppresses, in GHz; enables the
@@ -160,8 +161,9 @@
 # READING THE OUTPUT: the result is a complete operating point -- t_g_ns, amp_scale,
 # wp_offset_GHz, chirp_coeffs_GHz -- ready for `--operating-point` in the sweeps or
 # as the starting point for snail_grape.slurm. Check three things before trusting
-# it: the Rabi fit's r2 (the run HARD-FAILS below 0.9 rather than emitting a
-# confident wrong chirp), `railed` on the length scan (a maximum on the grid edge is
+# it: the Rabi fit's r2 (below 0.9 the run raises rather than emitting a confident
+# wrong chirp -- unless the chirp's excursion is <= 10% of a half-linewidth, when
+# it zeroes the chirp and records fit.chirp_zeroed, or --chirp-free-fallback), `railed` on the length scan (a maximum on the grid edge is
 # not a maximum), and, when DRAG is on, that the loop CONVERGED -- it raises rather
 # than returning the last iterate.
 # =============================================================================

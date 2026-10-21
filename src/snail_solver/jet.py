@@ -9,7 +9,7 @@ Recursive DRAG (:mod:`snail_solver.drag`, after Li, Calarco & Motzoi, npj QI 10,
 several times, so a K-fold composition needs the envelope and the (chirp-swept) beat
 Delta(t) to K-th order through products, quotients and a fractional power. A jet
 carries ``(f, f', f'', ...)`` as one object with arithmetic, so the composition in
-``drag.drag_apply`` is written once and shared by every solve path.
+``drag.apply_drag`` is written once and shared by every solve path.
 
 The stored coefficients are ``a_k = f^(k)(t) / k!`` (Taylor coefficients, not
 derivatives): multiplication is then a plain convolution, division and the fractional

@@ -14,6 +14,19 @@ Physics core
 Calibration and optimal control
     :mod:`~snail_solver.calibrate_gate`, :mod:`~snail_solver.calibration_map`,
     :mod:`~snail_solver.find_stark_resonance`, :mod:`~snail_solver.grape`.
+Tune-up, chirp and DRAG
+    :mod:`~snail_solver.tune_up`, :mod:`~snail_solver.tune_up_sweep`,
+    :mod:`~snail_solver.stark_chirp`, :mod:`~snail_solver.ridge_chirp`,
+    :mod:`~snail_solver.ridge_refit`, :mod:`~snail_solver.post_chirp`,
+    :mod:`~snail_solver.drag`, :mod:`~snail_solver.jet`,
+    :mod:`~snail_solver.piecewise_pulse`.
+Subharmonic studies
+    :mod:`~snail_solver.subharmonic_convergence`,
+    :mod:`~snail_solver.subharmonic_gate_scan`, :mod:`~snail_solver.open_system`,
+    :mod:`~snail_solver.validate_recursive_drag`.
+I/O
+    :mod:`~snail_solver.h5_io`, :mod:`~snail_solver.paths`,
+    :mod:`~snail_solver.log_utils`.
 Sweeps
     :mod:`~snail_solver.run_sweep_zhou` (``prepare`` / ``point`` / ``local`` /
     ``collect``), with :mod:`~snail_solver.sweep_common`,

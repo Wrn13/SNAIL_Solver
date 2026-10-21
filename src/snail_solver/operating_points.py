@@ -1,7 +1,7 @@
 """Named operating points stored in a device JSON.
 
-A calibration scan (``calibration_map.py``) finds a good (pump amplitude, pump
-frequency offset) for a given gate context. Rather than re-deriving that tune-up
+A calibration scan (``calibration_map.py``, or ``tune_up --save-point``) finds a good
+(pump amplitude, pump frequency offset) for a given gate context. Rather than re-deriving that tune-up
 inside every sweep -- which is what rails when the AC-Stark shift and the Rabi
 amplitude feed back on each other -- the point is saved once under a name and
 reused across experiments:
@@ -18,7 +18,9 @@ reused across experiments:
 The context keys (wa/wb/t_g/spectator/DRAG) are recorded so a point can be
 checked against the run that is about to use it -- an operating point calibrated
 for a different pair or gate length is not valid, and ``check_context`` reports
-the mismatch rather than silently applying it.
+the mismatch rather than silently applying it. It checks wa/wb/t_g/spectator and
+the chirp; ``drag_beat_GHz`` is recorded but not checked, and a recursive DRAG
+channel list is not recorded at all.
 """
 from __future__ import annotations
 

@@ -12,7 +12,7 @@
 # takes a comma-separated list and keys rows on (delta, eta), so merging is just
 # passing all of them:
 #
-#   scripts/finalize_drag_curve.sh          # globs eta*.h5 in $OUT
+#   OUT=results/drag_curve_shards scripts/finalize_drag_curve.sh   # globs eta*.h5 in $OUT
 #
 # If the boxes do NOT share a filesystem, collect the .h5 files into one directory
 # first -- that is all the merge needs.
@@ -30,7 +30,8 @@ DEVICE=${DEVICE:-6Gate4.7SNAIL.json}
 # --max-drag-channels 0 gives the independently calibrated NO-DRAG baseline: the
 # chirp is then derived without assuming a correction will be played, which the
 # `bare` trace of a DRAG run is not (its length and carrier come from a DRAG-aware
-# fixed point).
+# fixed point). It is only the SAME pulse shape with --envelope-m 3, which this
+# script does not pass: CHANNELS=0 alone derives m = max(0, 2) = 2.
 CHANNELS=${CHANNELS:-3}
 WORKERS=${WORKERS:-8}
 JOBS=${JOBS:-6}

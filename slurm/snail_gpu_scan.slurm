@@ -47,8 +47,8 @@
 #   # calibration map on GPU
 #   DEVICE=2Gate4.9SNAIL.json T_G=77.2 sbatch slurm/snail_gpu_scan.slurm
 #
-#   # exact (no pruning) -- much slower, use to spot-check the cutoff choice
-#   DEVICE=2Gate4.9SNAIL.json T_G=77.2 ENGINE_CUTOFF=inf CARRIER_RES=0.05 \
+#   # finite cutoff -- only after a cutoff-scan on this operating point justifies it
+#   DEVICE=2Gate4.9SNAIL.json T_G=77.2 ENGINE_CUTOFF=3.0 CARRIER_RES=0.05 \
 #       sbatch slurm/snail_gpu_scan.slurm
 #
 #   # CPU fallback: identical code path, just no device. Drop --gres when
@@ -60,7 +60,7 @@
 # -----------------------------------------------------------------------------
 #   DEVICE          (required) device JSON (bare name resolves under devices/)
 #   T_G             (required) gate duration in ns
-#   ENGINE_CUTOFF   carrier cutoff in GHz; 'inf' is exact             [3.0]
+#   ENGINE_CUTOFF   carrier cutoff in GHz; 'inf' is exact             [inf]
 #   CARRIER_RES     max |Omega|*dt for the CF4 propagator; 4th order,
 #                   so halving it cuts the error ~16x                 [0.1]
 #   BATCH           grid points per vmapped call; raise until the GPU

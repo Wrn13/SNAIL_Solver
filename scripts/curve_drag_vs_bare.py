@@ -48,7 +48,9 @@ def _chirp_quality(row, quartic_warn=0.25):
 
     `chirp_excluded` separates a chirp-free column's 1.00x as a RESULT (nothing to
     chirp) from an ARTEFACT (`stark_crossing`: the ridge changed transition inside the
-    drive sweep, so no chirp could be measured at eta*). Rows predating the reason
+    drive sweep, so no chirp could be measured at eta*; and the ridge path's
+    `railed_ridge` / `no_usable_ridge`). `chirp_not_converged` is NOT excluded here,
+    though tune_up calls it an exclusion -- run backfill_chirp_exclusions.py for that. Rows predating the reason
     carry None, which the gain table counts separately.
     """
     ch = row.get("chirp")
@@ -94,7 +96,7 @@ def _one(job):
                          quotient_rule=True)
              for c in (r.get("drag_channels") or [])]
     # `[]` for no chirp (None would inherit the config's); None for no DRAG (`[]` is
-    # falsy at device_utils.py:317 and so indistinguishable from None there).
+    # falsy in device_utils.build_coupler and so indistinguishable from None there).
     cfg = config_at_wp(base, r["w_p_GHz"], branch=r["branch"],
                        levels=int(r["coupler_levels"]), chirp_coeffs_GHz=chirp)
     t0 = time.perf_counter()

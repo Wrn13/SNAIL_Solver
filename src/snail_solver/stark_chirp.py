@@ -28,15 +28,16 @@ only even Legendre terms appear:
   ``test_constant_chirp_equals_offset_rad``), so the first new degree of freedom is
   ``c_2``; a linear (odd) chirp is the wrong first guess.
 
-Since ``0.375 s`` is the pulse-averaged shift a calibration map measures as its
-optimum ``wp_offset_GHz``, the seed is a single scalar::
+``0.375 s`` is the TIME-averaged shift. A calibrated offset reports the
+``sin theta``-weighted average instead (Hann ``M2 = 0.7115``, see
+:func:`stark_moments`), so the seed below is only a seed. It is a single scalar::
 
     c_k = (delta_stark_GHz / 0.375) * a_k   for k >= 2,      c_0 := 0
 
 i.e. ``c_2 = -1.900 * delta_stark``, ``c_4 = +1.334 * delta_stark``.
 
-Relative L2 truncation error (pinned by
-``test_hann_stark_legendre_reconstructs_the_shape``):
+Relative L2 truncation error (computed from the table, which
+``test_table_matches_an_independent_projection`` pins):
 
     degree 2: 33.8%   degree 4: 11.3%   degree 6: 2.4%   degree 8: 0.32%
 

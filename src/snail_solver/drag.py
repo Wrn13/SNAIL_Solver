@@ -17,7 +17,8 @@ At ``n = 1`` this is Motzoi's single-derivative DRAG, ``eta - i (d eta/dt)/Delta
 A single coefficient can only trade one off-resonant transition's error against
 another's; composing one substitution per transition suppresses all of them with no
 free parameters (their Eq. 8), e.g. ``F^(1)_{D21} o F^(1)_{D10} o F^(2)_{D20} (Omega)``.
-Here the channels are the collisions labelled by ``sweep_common._nearest_collision``.
+Here the channels come from ``spectator_audit.select_drag_channels`` (tune-up and
+subharmonic scan) or ``sweep_common.collision_drag_channels`` (the sweeps).
 
 Two rules, both enforced below:
 
