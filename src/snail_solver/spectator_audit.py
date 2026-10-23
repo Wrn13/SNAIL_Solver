@@ -323,8 +323,18 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
     ``leakage``    drives a or b into |2>
     ``other``      remaining off-diagonal processes in the low-lying manifold
 
-    ``f_p_res_GHz = f_p + det/n`` is the pump frequency at which an ``n``-pump
-    channel becomes resonant (``nan`` for static channels).
+    ``detuning_MHz`` is in the Hamiltonian's own convention (the ``e^{-i Omega t}``
+    carrier less the anharmonic gap) and its sign depends on which branch the row was
+    read from. ``beat_MHz`` is the DRAG beat of the same process, the ``Delta`` in
+    ``eta^n e^{i Delta t}``: the drive DRAG corrects is eta, and a term carrying
+    ``eta*^n`` is the h.c. of an eta-process, so
+
+        beat = -det  (term carries eta^n,  n = pump_quanta > 0)
+        beat = +det  (term carries eta*^n, pump_quanta < 0, or static)
+
+    i.e. ``beat = (E_f - E_i) - n w_p`` for the eta branch. ``f_p_res_GHz = f_p +
+    beat/|n|`` is the pump frequency at which the channel becomes resonant (``nan``
+    for static channels).
     """
     eta = float(cpl.peak_eta())
     f_p = float(cpl._pump_tones[0].w_p_GHz)
@@ -348,6 +358,8 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
     best: Dict[Tuple, Dict[str, Any]] = {}
     for Omega, pump_sig, O in cpl.expand_terms(cutoff_GHz=window_GHz + 0.5):
         n_pump = len(pump_sig)
+        # net eta quanta: +1 per eta, -1 per eta* (pump key (tone, is_conjugate))
+        n_net = sum(-1 if conj else 1 for _tone, conj in pump_sig)
         scale = eta ** n_pump
         Oa = np.asarray(O)
         for i in starts:
@@ -382,7 +394,9 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                     cat = "other"
                 spec_id = (spec_indices.index(victim) + 1
                            if victim is not None and victim in spec_indices else 0)
+                beat = -det if n_net > 0 else det                # DRAG convention
                 rec = dict(g_MHz=g * 1e3, detuning_MHz=det * 1e3, n_pump=n_pump,
+                           beat_MHz=beat * 1e3, pump_quanta=int(n_net),
                            # Fock indices, for level-resolved use (see `stark_scales`)
                            i_index=int(i), f_index=int(f),
                            category=cat, transition=_label(cpl, i, f, n_pump, info),
@@ -394,7 +408,8 @@ def interaction_channels(cpl, *, window_GHz: float = 1.0, t_g_ns: float = 100.0,
                            victim_freq_GHz=(np.nan if victim is None
                                             else info[victim]["freq"]),
                            spectator_id=int(spec_id),
-                           f_p_res_GHz=(f_p + det / n_pump if n_pump else np.nan))
+                           f_p_res_GHz=(f_p + beat / abs(n_net) if n_net
+                                        else np.nan))
                 rec.update(drag_verdict(rec["g_MHz"], rec["detuning_MHz"], t_g_ns))
                 if cat == "target":
                     rec.update(verdict="resonant by design (the gate)",
@@ -417,7 +432,14 @@ def level_stark_shifts(cpl, eta: float, window_GHz: float = 2.0) -> np.ndarray:
     The diagonal piece :func:`interaction_channels` skips: every level is pushed by
     the couplings that leave it, summed over pump sidebands with ``eta**n_pump``::
 
-        dE_i = - sum_{k != i} |g_ik|^2 / Delta_ik ,   Delta_ik = Omega + E_k - E_i
+        dE_i = - sum_{k != i} |g_ik|^2 / Delta_ik ,   Delta_ik = (E_k - E_i) - Omega
+
+``Delta_ik`` is the detuning of k from i in the frame where the term
+``e^{-i Omega t} |k><i|`` is static: ``Omega`` carries the HARMONIC carriers and the
+pumps, ``E`` the anharmonic part only, so ``Delta_ik = E_k^full - E_i^full - n w_p``
+(:func:`interaction_channels`' ``det`` is ``-Delta_ik``). E.g. two pumps on
+qubit a, |1> -> |2>: ``Omega = 2 w_p - w_a``, ``E_k - E_i = alpha`` (< 0), so
+``Delta = w_a + alpha - 2 w_p``, the |1>-|2> line's detuning from 2 w_p.
 
     Same ``eta^2`` leading order as the target's Stark law, which is why
     :func:`stark_scales` can express it as a multiple of the chirp. Returns the shift
@@ -433,7 +455,7 @@ def level_stark_shifts(cpl, eta: float, window_GHz: float = 2.0) -> np.ndarray:
             for k in np.nonzero(np.abs(col) > 1e-12)[0]:
                 if k == i:
                     continue
-                det = Omega + (E_anh[k] - E_anh[i])          # rad/ns
+                det = (E_anh[k] - E_anh[i]) - Omega          # rad/ns
                 if abs(det) < 1e-9:
                     continue                                  # resonant: not a shift
                 dE[i] -= (abs(col[k]) ** 2) / det
@@ -472,8 +494,10 @@ def stark_scales(config: Dict[str, Any], t_g_ns: float, rows: Sequence[Dict[str,
         i, f = r.get("i_index"), r.get("f_index")
         if i is None or f is None:
             continue
-        d_MHz = (dE[int(f)] - dE[int(i)]) * 1e3
-        out[_audit_beat_key(float(r["detuning_MHz"]) / 1e3)] = float(d_MHz / ref_MHz)
+        # the beat is (E_f - E_i) - n w_p on the eta branch, its negative otherwise
+        sign = 1.0 if int(r.get("pump_quanta", 1)) > 0 else -1.0
+        d_MHz = sign * (dE[int(f)] - dE[int(i)]) * 1e3
+        out[_audit_beat_key(float(r["beat_MHz"]) / 1e3)] = float(d_MHz / ref_MHz)
     return out
 
 
@@ -484,7 +508,9 @@ def _audit_beat_key(beat_GHz: float, dedupe_MHz: float = 0.5) -> int:
 
 #: The fixed DRAG set of the subharmonic scan's ``--drag-set subharm-leak``: the A
 #: |0>-|1> subharmonic (its emission row, the one the ranked selector played), the A
-#: |1>->|2> subharmonic, and the |2> leakage (either enumeration: same beat, same pump).
+#: |1>->|2> subharmonic, and the |2> leakage out of |11>. The two leakage rows are
+#: DIFFERENT processes (|11>->|02> at beat alpha_b, |11>->|20> at -alpha_a, opposite
+#: sides of the carrier), not two enumerations of one; first match wins.
 FORCED_SUBHARM_LEAK: Tuple[Tuple[str, ...], ...] = (
     ("a1->0 (2 pump)",),
     ("a1->2 (2 pump)",),
@@ -565,7 +591,8 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
     req = tuple(str(c) for c in require)
     by_beat: Dict[int, Dict[str, Any]] = {}
     for r in rows:
-        r["beat_GHz"] = float(r["detuning_MHz"]) / 1e3
+        # the DRAG beat, NOT detuning_MHz: the two differ in sign on the eta branch
+        r["beat_GHz"] = float(r["beat_MHz"]) / 1e3
         r["n_photon"] = max(int(r.get("n_pump", 1) or 1), 1)
         # same P_exc as spectator_channels, for total_error_estimate / print_table
         _ratio = float(r.get("ratio", 0.0) or 0.0)
@@ -586,6 +613,8 @@ def select_drag_channels(config: Dict[str, Any], t_g_ns: float, *,
         rows.append(dict(category="subharm", name="mode subharmonic (2 w_p)",
                          transition="--", process="--", g_MHz=0.0,
                          detuning_MHz=float(ch.beat_GHz) * 1e3,
+                         beat_MHz=float(ch.beat_GHz) * 1e3,
+                         pump_quanta=int(ch.n_pump),
                          beat_GHz=float(ch.beat_GHz), n_pump=int(ch.n_pump),
                          n_photon=int(ch.n_photon), ratio=0.0, suppression=1.0,
                          P_exc=0.0,

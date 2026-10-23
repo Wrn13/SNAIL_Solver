@@ -58,15 +58,40 @@ class TestForcedDragSet(unittest.TestCase):
             self.assertFalse(row["selected"])
             self.assertIn("skip window", row["reason"])
 
-    def test_a_coincident_beat_is_covered_not_missing(self):
-        """At delta = -30 MHz both A subharmonics beat at +60 MHz: one substitution."""
+    def test_the_two_a_subharmonics_are_distinct_at_minus_30(self):
+        """At delta = -30 MHz the A |0>->|1> subharmonic beats at +60 MHz and the A
+        |1>->|2> one at -60 MHz: mirror images about 2 w_p, two substitutions. (The
+        audit used to read the |1>->|2> row's carrier as its beat and merge them.)"""
         from snail_solver import subharmonic_gate_scan as GS
         base, col, settings = _column(-0.03)
         chans, audit = GS.audit_column(base, col, settings)
-        self.assertEqual(len(chans), 2)
+        self.assertEqual(len(chans), 3)
         self.assertFalse(audit["forced_missing"])
-        row = next(r for r in audit["rows"] if r["transition"] == "a1->2 (2 pump)")
-        self.assertIn("same substitution", row["reason"])
+        beat = {r["transition"]: r["beat_GHz"] for r in _selected(audit)}
+        self.assertAlmostEqual(beat["a1->0 (2 pump)"], +0.06, places=9)
+        self.assertAlmostEqual(beat["a1->2 (2 pump)"], -0.06, places=9)
+
+    def test_beats_are_the_drag_sign_on_both_branches(self):
+        """``beat = (E_f - E_i) - n w_p`` for the eta-process, whichever branch
+        (eta^n or eta*^n) the audit row came from: DRAG's 1/Delta notch must sit on
+        the process in the spectrum of eta^n."""
+        from snail_solver import subharmonic_gate_scan as GS
+        base, col, settings = _column(-0.17)
+        _chans, audit = GS.audit_column(base, col, settings)
+        wa = float(base["qubit_freqs_GHz"][0])
+        alpha = float(base["anharm_qubit_GHz"])
+        w_p = float(audit["w_p_GHz"])
+        rows = {r["transition"]: r for r in audit["rows"]}
+        want = {"a1->0 (2 pump)": wa - 2 * w_p,               # eta*^2 branch
+                "a1->2 (2 pump)": wa + alpha - 2 * w_p,       # eta^2 branch
+                "a1->0 b1->2 (1 pump)": alpha,                # eta branch, |11>->|02>
+                "a1->2 b1->0 (1 pump)": -alpha}               # eta* branch, |11>->|20>
+        for t, b in want.items():
+            self.assertIn(t, rows)
+            self.assertAlmostEqual(rows[t]["beat_GHz"], b, places=9, msg=t)
+            self.assertAlmostEqual(rows[t]["f_p_res_GHz"],
+                                   w_p + b / abs(rows[t]["pump_quanta"]),
+                                   places=9, msg=t)
 
     def test_ranked_is_still_the_default(self):
         from snail_solver import subharmonic_gate_scan as GS

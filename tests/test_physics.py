@@ -5590,6 +5590,52 @@ class TestScanDocumentRoundTrips(unittest.TestCase):
         self.assertAlmostEqual(etas[-1], 2.5, places=12)
 
 
+class TestLevelStarkShifts(unittest.TestCase):
+    """``level_stark_shifts`` against the MEASURED ridge of the 5 MHz curve.
+
+    The denominator is the detuning in the frame where ``e^{-i Omega t}|k><i|`` is
+    static, ``(E_k - E_i)_anh - Omega``. Written as ``Omega + (E_k - E_i)`` it put the
+    target's shift at +4.3 MHz (|eta| = 1.0) where the ridge measured -2.4 MHz.
+    """
+
+    #: ridge-law target shift at delta = -170 MHz (drag_curve_5MHz_2026-09-22,
+    #: passA_ridge Rabi table), MHz, drive part only
+    RIDGE_MHz = {1.0: -2.38, 1.3: -3.70}
+
+    @classmethod
+    def setUpClass(cls):
+        from snail_solver import subharmonic_gate_scan as GS
+        from snail_solver.device_utils import build_coupler, load_device
+        from snail_solver.paths import resolve_device
+        from snail_solver.spectator_audit import level_stark_shifts
+        from snail_solver.subharmonic_convergence import config_at_wp
+        from snail_solver.tune_up import nominal_t_g
+        base = GS.scan_config(load_device(resolve_device("6Gate4.7SNAIL.json")),
+                              max_drag_channels=3, envelope_m=3)
+        col = GS.columns_for(base, [-0.17], drop_origin=False)[0]
+        cfg = config_at_wp(base, col["w_p_GHz"], branch="above", levels=5)
+        cpl, _w, _p = build_coupler(cfg, nominal_t_g(cfg, 1.3), 1.0, 0.0, None, None,
+                                    chirp_coeffs_GHz=[])
+        idx = lambda o: cpl.fock_index(list(o))                 # noqa: E731
+        d0 = level_stark_shifts(cpl, 0.0) * 1e3
+        cls.shift = {}
+        for eta in (1.0, 1.3):
+            d = level_stark_shifts(cpl, eta) * 1e3 - d0         # drive part, MHz
+            cls.shift[eta] = {"target": d[idx((0, 1, 0))] - d[idx((1, 0, 0))],
+                              "coupler": d[idx((0, 0, 1))] - d[idx((0, 0, 0))]}
+
+    def test_target_shift_matches_the_measured_ridge(self):
+        for eta, ridge in self.RIDGE_MHz.items():
+            got = self.shift[eta]["target"]
+            self.assertLess(got, 0.0, eta)
+            self.assertLess(abs(got - ridge), 0.3 * abs(ridge), (eta, got, ridge))
+
+    def test_coupler_is_red_shifted_as_eta_squared(self):
+        a, b = self.shift[1.0]["coupler"], self.shift[1.3]["coupler"]
+        self.assertLess(a, 0.0)
+        self.assertAlmostEqual(b / a, 1.3 ** 2, delta=0.1)
+
+
 class TestChannelPolicy(unittest.TestCase):
     """Recursive DRAG must target the leakage and subharmonic channels at least.
 
@@ -5613,11 +5659,15 @@ class TestChannelPolicy(unittest.TestCase):
 
     def test_the_qubit_subharmonic_is_selected_although_it_is_category_other(self):
         chans, audit = self._audit(delta=0.05, max_channels=4)
-        sub = [r for r in audit["rows"] if r["is_subharmonic"] and r["g_MHz"] > 0]
+        # the SNAIL subharmonic (s0->1, w_s = 2 w_p) matches too, now that the audit
+        # beat has the collision enumeration's sign: pick qubit A's row
+        sub = [r for r in audit["rows"] if r["is_subharmonic"] and r["g_MHz"] > 0
+               and r["victim_tag"] == "--" and r["transition"].startswith("a")]
         self.assertTrue(sub, "the A subharmonic was not even enumerated")
         self.assertEqual(sub[0]["category"], "other")     # not "leakage"
         self.assertTrue(sub[0]["selected"])
         self.assertAlmostEqual(sub[0]["detuning_MHz"], -100.0, places=6)
+        self.assertAlmostEqual(sub[0]["beat_MHz"], -100.0, places=6)   # w_a - 2 w_p
 
     def test_leakage_and_coupler_are_mandatory_when_they_matter(self):
         _chans, audit = self._audit(delta=0.05, max_channels=8)

@@ -732,10 +732,12 @@ class DragChannel:
 
             Delta_j(t) = 2 pi beat + (stark_scale - n_pump) delta(t)
 
-        Measured: ``|2>``-involving channels shift 6-10x harder than the target, with
-        opposite signs (~ +10 for ``a|1>->|2>``, ~ -8 for ``b|1>->|2>``) -- a 15-30%
-        error in the DRAG denominator if ignored. Subharmonic channels barely move
-        (~ -0.2). 0.0 means a static beat.
+        Example (6Gate4.7SNAIL, delta = -170 MHz, against the measured ridge law;
+        recomputed after the ``level_stark_shifts`` sign fix of 2026-10-22, which
+        invalidated the earlier "+10 / -8"): ``|2>``-involving channels shift ~5x
+        harder than the target (-4.7 for the A |1>->|2> subharmonic, +4.7 for
+        |11>->|20>), the A-SNAIL exchange +2.3, the A |0>-|1> subharmonic -1.0.
+        0.0 means a static beat.
     """
 
     beat_GHz: float
