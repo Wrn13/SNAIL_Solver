@@ -40,7 +40,7 @@ ts() { date +%H:%M:%S; }
 
 finalize() {
     echo "[$(ts)] Phase B + figures -> $OUT/figs_fine"
-    OUT=$OUT WORKERS=${FINAL_WORKERS:-$(nproc)} scripts/finalize_5mhz_fine.sh \
+    OUT=$OUT WORKERS=${FINAL_WORKERS:-$(nproc --all)} scripts/finalize_5mhz_fine.sh \
         > "$OUT/finalize.log" 2>&1
     tail -5 "$OUT/finalize.log"
 }
