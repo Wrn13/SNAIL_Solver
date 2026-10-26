@@ -31,7 +31,6 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-from scipy.linalg import expm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 TWO_PI = 2.0 * np.pi
@@ -56,25 +55,10 @@ def operators(delta_MHz, levels=None):
 
 
 def period_propagator(H0, Xs, g_n, w_p, eta, n_steps):
-    """U(T) by exponential midpoint steps; H(t) = A_0 + sum_k c(t)^k A_k, c = 2 eta cos."""
-    from math import comb
-    dim = H0.shape[0]
-    P = [np.eye(dim, dtype=complex)]
-    for _ in range(max(g_n)):
-        P.append(P[-1] @ Xs)
-    A = [np.zeros((dim, dim), dtype=complex) for _ in range(max(g_n) + 1)]
-    for n, g in g_n.items():
-        for k in range(n + 1):
-            A[k] = A[k] + g * comb(n, k) * P[n - k]
-    A[0] = A[0] + H0
-    T = TWO_PI / w_p
-    dt = T / n_steps
-    U = np.eye(dim, dtype=complex)
-    for j in range(n_steps):
-        c = 2.0 * eta * np.cos(w_p * (j + 0.5) * dt)
-        H = A[0] + sum(c ** k * A[k] for k in range(1, len(A)))
-        U = expm(-1j * H * dt) @ U
-    return U, T
+    """U(T) and T; `snail_solver.floquet.period_propagator` on these operators."""
+    from snail_solver.floquet import FloquetModel, period_propagator as prop
+    m = FloquetModel(H0=H0, Xs=Xs, g_n=g_n, w_p=w_p, dims=(), fock_index=None)
+    return prop(m, eta, n_steps), m.period
 
 
 def floquet(U, T):

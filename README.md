@@ -316,3 +316,9 @@ spectator plumbing) — a failure means a specific known-bad behaviour is back.
   resonance, and the two couple because the shift grows as `|eta|^2`. Calibrate
   **frequency first**, then amplitude, and iterate — that is what
   `calibrate_gate` does.
+- At `|eta| ~ 1.3` the gate's large errors are multiphoton leakage, each band one
+  process. The coupler's Stark shift (~ -100 `|eta|^2` MHz per photon) sweeps
+  coupler processes across 100–170 MHz of pump detuning; qubit-level ones stay
+  pinned. `snail_solver.floquet` tracks the constant-pump Floquet branches that
+  locate them. The analysis of the 1 MHz-wide scan is in
+  [docs/floquet-analysis.md](docs/floquet-analysis.md).
