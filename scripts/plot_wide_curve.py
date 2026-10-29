@@ -7,7 +7,9 @@ a gap in the Chirp series (chirp == bare there is a calibration artefact, not a
 measurement), as do pass C's failed columns. Grey bands: the coupler holds more than its
 9-level cutoff represents, so the values there read too good.
 
-Usage:  plot_wide_curve.py SCAN_DIR OUT_STEM   -> OUT_STEM.pdf / OUT_STEM.png
+Usage:  plot_wide_curve.py SCAN_DIR OUT_STEM [SERIES]   -> OUT_STEM.pdf / OUT_STEM.png
+        SERIES: comma-separated subset of bare,chirp,drag (default all three); the
+        "best" marker goes on the last one listed
 """
 import json
 import os
@@ -43,8 +45,10 @@ def series(scan):
     trunc = np.array([bool(C[k].get("coupler_truncated") or A[k].get("coupler_truncated"))
                       for k in d])
     f_p0 = float(np.median([A[k]["w_p_GHz"] - A[k]["delta_GHz"] for k in d]))   # w_a/4pi
+    etas = {round(float(x["target_eta"]), 3) for x in (*A.values(), *C.values())}
+    assert len(etas) == 1, f"expected one target eta, got {sorted(etas)}"
     return d, {"bare": get(A, "bare"), "chirp": get(A, "chirp+DRAG", "chirp_excluded"),
-               "drag": get(C, "chirp+DRAG")}, trunc, f_p0
+               "drag": get(C, "chirp+DRAG")}, trunc, f_p0, etas.pop()
 
 
 def runs(mask):
@@ -64,7 +68,8 @@ def runs(mask):
 
 def main():
     scan, stem = sys.argv[1], sys.argv[2]
-    d, ys, trunc, f_p0 = series(scan)
+    keys = sys.argv[3].split(",") if len(sys.argv) > 3 else [k for k, _, _ in SERIES]
+    d, ys, trunc, f_p0, eta = series(scan)
     plt.rcParams.update({"font.size": 8, "axes.edgecolor": INK2, "axes.labelcolor": INK,
                          "xtick.color": INK2, "ytick.color": INK2, "text.color": INK,
                          "mathtext.fontset": "dejavusans", "axes.linewidth": 0.6,
@@ -74,6 +79,8 @@ def main():
     for i, j in runs(trunc):
         ax.axvspan(d[i] - 0.5, d[j] + 0.5, color=BAND, lw=0, zorder=0)
     for key, label, col in SERIES:
+        if key not in keys:
+            continue
         ax.plot(d, ys[key], color=col, lw=1.0, label=label, zorder=2 + (key == "drag"),
                 solid_joinstyle="round")
     ax.set_yscale("log")
@@ -93,14 +100,24 @@ def main():
     top.set_xlabel(r"Pump frequency $\omega_p/2\pi$ (GHz)")
     top.tick_params(colors=INK2, width=0.6)
 
-    best = int(np.nanargmin(ys["drag"]))
-    ax.annotate(f"best: {ys['drag'][best]:.1e}\nat {d[best]:+.0f} MHz",
-                (d[best], ys["drag"][best]), (d[best] + 14, 2.2e-3), fontsize=7,
+    yb = ys[keys[-1]]
+    best = int(np.nanargmin(yb))
+    ax.annotate(f"best: {yb[best]:.1e}\nat {d[best]:+.0f} MHz",
+                (d[best], yb[best]), (d[best] + 14, 2.2e-3), fontsize=7,
                 color=INK2, va="center", arrowprops=dict(arrowstyle="-", color=INK2, lw=0.5))
     handles, _ = ax.get_legend_handles_labels()
     handles.append(Patch(color=BAND, label="Coupler beyond 9-level cutoff"))
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=4,
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=len(handles),
               frameon=False, handlelength=1.8, fontsize=7.5)
+    leg = ax.get_legend()
+    lab = ax.annotate(f"$\\eta^*$ = {eta:g}", (0, 0.5), xycoords=leg, xytext=(-6, 0),
+                      textcoords="offset points", ha="right", va="center", fontsize=7.5,
+                      color=INK)
+    # recentre label + legend as one block under the axes
+    r = fig.canvas.get_renderer()
+    shift = (leg.get_window_extent(r).x0 - lab.get_window_extent(r).x0) / 2
+    leg.set_bbox_to_anchor((0.5 + shift / ax.get_window_extent(r).width, -0.2),
+                           transform=ax.transAxes)
     fig.savefig(stem + ".pdf", bbox_inches="tight")
     fig.savefig(stem + ".png", dpi=300, bbox_inches="tight")
     print("wrote", stem + ".pdf/.png")

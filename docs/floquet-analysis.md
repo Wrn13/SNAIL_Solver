@@ -59,13 +59,16 @@ lab frame, with no rotating-wave approximation:
     X_s  = Σ_i λ_i (a_i + a_i†)
 
 It is built from the same `ZhouCoupler` operators the gate solver uses
-(`floquet.model_at_detuning`).
+(`floquet.model_at_detuning`), i.e. the dressed-mode model of the charge-pumped SNAIL
+coupler [1, 2]. Dropping the RWA matters here: counter-rotating pump terms are what
+make several of the multiphoton processes below possible [11, 12].
 
-- **Quasienergies.** H(t) has period T = 2π/ω_p. The one-period propagator U(T) uses
-  exponential-midpoint steps, 1000 per period (converged).
+- **Quasienergies.** H(t) has period T = 2π/ω_p, so Floquet's theorem applies
+  [3, 4, 5]. The one-period propagator U(T) uses exponential-midpoint steps (the
+  second-order Magnus integrator [7]), 1000 per period (converged).
 - **Floquet modes.** U(T)'s eigenphases give the quasienergies ε = −arg λ / T, defined
   modulo ω_p. Its Schur vectors give the Floquet modes, and they stay orthonormal where
-  eigenvalues coincide.
+  eigenvalues coincide [9].
 - **Validation.** The module reproduces the stored DRAG-sign-study coupler shift,
   −16.56 MHz at |η| = 0.4 for δ = −170, to 0.01 MHz.
 
@@ -91,7 +94,8 @@ failures are informative.
    between modes, and the beat jumps by hundreds of MHz.
 3. **All branches at once, labelled by continuity** (`floquet.track`). Every mode is
    labelled by its |η| = 0 Fock state. Between steps the labels are carried by the
-   assignment that maximises the total overlap (Hungarian algorithm), so no two
+   assignment that maximises the total overlap (Hungarian algorithm [8], via SciPy
+   [10]), so no two
    branches claim one mode. On a fine grid (201 points to |η| = 1.5):
    - a narrow avoided crossing is passed straight through;
    - a broad one is followed round, and its two labels swap character.
@@ -159,7 +163,8 @@ The |002⟩-carrying branch reaches the doublet (|η|*) at:
 From about +35 up to +167 the calibrated pulse (peak 1.3) therefore passes the resonance
 twice (Figures 3 and 4).
 
-Each passage transfers some amplitude into |002⟩. The two amplitudes interfere with a
+Each passage transfers some amplitude into |002⟩. This is Landau–Zener–Stückelberg
+interference [13–17]: the two amplitudes interfere with a
 phase that grows as 3 (t₂ − t₁) per MHz of δ, because the beat carries −3δ. So the
 infidelity ripples in δ with period **1 / (3T)**, where T is the time the pulse spends
 above |η|*.
@@ -212,6 +217,26 @@ coupler's two-pump subharmonic, with g ≈ 304 MHz.
 *Figures 6–7. The |201⟩ branch reaching the doublet: at +200 MHz (4 pumps) a broad
 anticrossing around |η| ≈ 1.2–1.3; at −170 MHz (5 pumps) a crossing at |η| ≈ 1.1.*
 
+*Reading Figure 6 (+200 MHz). The two orange curves are one state, |201⟩, handed
+between branches. They are not two leak processes.*
+- *|η| = 0 … 0.95: the upper dark curve is the |201⟩ branch (98% |201⟩ at zero drive),
+  starting 230 MHz above the doublet. The coupler Stark shift pulls it down to about
+  +125 MHz.*
+- *|η| ≈ 0.96: a steep coupler-ladder level crosses it in a narrow avoided crossing,
+  and the two branches swap character. The faint line turning upward is the original
+  |201⟩-labelled branch, now mostly |001⟩/|002⟩. The orange line continuing downward
+  has taken over the |201⟩ weight (0.37 at |η| = 1.0).*
+- *|η| ≈ 1.0 … 1.3: the descending line pales as |201⟩ spreads over several branches
+  (10–30% each) and mixes with |200⟩, one coupler photon away. It comes within about
+  25–35 MHz of the doublet at the peak drive (dotted) without crossing.*
+- *|η| > 1.3: the doublet is pushed apart to about ±55 MHz, and faint |201⟩ weight
+  reappears below it: the doublet has hybridised with the |201⟩/|200⟩ cluster.*
+
+*So the resonance is reached only at the pulse peak, as a strong, broad anticrossing.
+Population moves during the flat top, not in a fast passage (Figure 11, middle). Breaks
+in the lines are drawing artefacts: segments where a branch folds by ω_p are dropped,
+and segments with little |201⟩ weight fade to grey.*
+
 ### −250 … −205 MHz: the coupler is driven up its ladder
 
 This band is 3ω_p = ω_s, where three pump photons make one coupler photon
@@ -221,9 +246,10 @@ within ~53 MHz of the |000⟩ branch at |η| ≈ 0.66 and are repelled, a broad,
 coupled anticrossing (Figure 8).
 
 Past that point the coupler is driven resonantly and climbs, to ⟨n⟩ ≈ 2–4 in the
-replay (Figure 11, right). The population spreads over |101⟩, |103⟩, |006⟩, |204⟩ and
-more, and 1 − F saturates near 0.7. Nine coupler levels cannot represent this, so the
-band locates the resonance but gives no reliable fidelity.
+replay (Figure 11, right). A pump-driven climb up a Josephson
+mode's ladder of this kind is described in [11, 12]. The population spreads over
+|101⟩, |103⟩, |006⟩, |204⟩ and more, and 1 − F saturates near 0.7. Nine coupler
+levels cannot represent this, so the band locates the resonance but gives no reliable fidelity.
 
 ![Branches at -240 MHz](floquet-analysis/floquet_branches_d-240.png)
 
@@ -253,7 +279,7 @@ The cause is **which kind of process lies beyond each edge** (Figures 9 and 10).
 
   Past −80 the ratio drops below 1. Because the process does not Stark-shift, the pulse
   never brings it back into resonance. With a smooth envelope the off-resonant dressing
-  returns adiabatically, so the leak collapses rather than tailing off. The next
+  returns adiabatically, so the leak collapses rather than tailing off [6]. The next
   crossed process on this side is the 5-pump |201⟩ band, which starts at −144.
 
   Figure 9 shows the pinning. At −70 the |200⟩ branch starts 20 MHz above the doublet
@@ -369,3 +395,69 @@ scripts/plot_wide_curve.py results/drag_curve_1MHz_2026-10-23 docs/floquet-analy
 ```
 
 Run each with `.venv/bin/python` and `OMP_NUM_THREADS=1`.
+
+## References
+
+The methods are standard; these are the background sources for them. The device
+model, operators and frame come from [1]; the rest supports the Floquet and
+interference arguments.
+
+**Device and model**
+
+1. C. Zhou, *Quantum Operations with Charge-pumped Parametric Interactions*, PhD
+   thesis, University of Pittsburgh (2023), Ch. 2. The dressed-mode SNAIL coupler
+   model implemented in `zhou_coupler.py`.
+2. N. E. Frattini, U. Vool, S. Shankar, A. Narla, K. M. Sliwa and M. H. Devoret,
+   "3-wave mixing Josephson dipole element," Appl. Phys. Lett. **110**, 222603 (2017).
+   The SNAIL and its g₃ nonlinearity.
+
+**Floquet theory**
+
+3. J. H. Shirley, "Solution of the Schrödinger equation with a Hamiltonian periodic in
+   time," Phys. Rev. **138**, B979 (1965). Quasienergies and the Floquet picture.
+4. H. Sambe, "Steady states and quasienergies of a quantum-mechanical system in an
+   oscillating field," Phys. Rev. A **7**, 2203 (1973). The extended (Sambe) space in
+   which multiphoton resonances are level crossings.
+5. M. Grifoni and P. Hänggi, "Driven quantum tunneling," Phys. Rep. **304**, 229
+   (1998). Review of Floquet methods, quasienergy crossings and avoided crossings.
+6. D. W. Hone, R. Ketzmerick and W. Kohn, "Time-dependent Floquet theory and
+   absence of an adiabatic limit," Phys. Rev. A **56**, 4045 (1997). Adiabatic
+   following of Floquet states under a slowly varying drive, and where it fails.
+
+**Numerics**
+
+7. S. Blanes, F. Casas, J. A. Oteo and J. Ros, "The Magnus expansion and some of its
+   applications," Phys. Rep. **470**, 151 (2009). The exponential-midpoint step used
+   for U(T).
+8. H. W. Kuhn, "The Hungarian method for the assignment problem," Naval Res. Logist.
+   Q. **2**, 83 (1955); J. Munkres, "Algorithms for the assignment and transportation
+   problems," J. Soc. Ind. Appl. Math. **5**, 32 (1957). Branch labelling by
+   maximum-overlap assignment.
+9. G. H. Golub and C. F. Van Loan, *Matrix Computations*, 4th ed. (Johns Hopkins
+   University Press, 2013). The Schur decomposition of U(T).
+10. P. Virtanen *et al.*, "SciPy 1.0: fundamental algorithms for scientific computing
+    in Python," Nat. Methods **17**, 261 (2020). `scipy.linalg.schur` and
+    `scipy.optimize.linear_sum_assignment`.
+
+**Driven Josephson circuits beyond the RWA**
+
+11. R. Lescanne, L. Verney, Q. Ficheux, M. H. Devoret, B. Huard, M. Mirrahimi and
+    Z. Leghtas, "Escape of a driven quantum Josephson circuit into unconfined states,"
+    Phys. Rev. Applied **11**, 014030 (2019).
+12. L. Verney, R. Lescanne, M. H. Devoret, Z. Leghtas and M. Mirrahimi, "Structural
+    instability of driven Josephson circuits prompted by counter-rotating terms,"
+    Phys. Rev. Applied **11**, 024003 (2019).
+
+**Landau–Zener–Stückelberg interference**
+
+13. L. D. Landau, "Zur Theorie der Energieübertragung. II," Phys. Z. Sowjetunion **2**,
+    46 (1932).
+14. C. Zener, "Non-adiabatic crossing of energy levels," Proc. R. Soc. Lond. A **137**,
+    696 (1932).
+15. E. C. G. Stückelberg, "Theorie der unelastischen Stösse zwischen Atomen," Helv.
+    Phys. Acta **5**, 369 (1932).
+16. E. Majorana, "Atomi orientati in campo magnetico variabile," Nuovo Cimento **9**,
+    43 (1932).
+17. S. N. Shevchenko, S. Ashhab and F. Nori, "Landau–Zener–Stückelberg
+    interferometry," Phys. Rep. **492**, 1 (2010). Two-passage interference and its
+    phase, the basis of the 1/(3T) period.

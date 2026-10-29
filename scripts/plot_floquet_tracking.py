@@ -140,7 +140,7 @@ def branches_figure(fdir, delta, proc, outdir, window=320.0):
     ax.set_xlabel(r"Constant pump $|\eta|$")
     ax.set_ylabel(r"Quasienergy $-$ computational branch (MHz)")
     ini_lab = r"$|100\rangle,|010\rangle$" if ini == "doublet" else rf"$|{ini}\rangle$"
-    ax.set_title(rf"$\delta = {delta:+.0f}$ MHz: {label}", fontsize=7.2)
+    ax.set_title(rf"$\omega_p/2\pi = {tr['w_p_GHz']:.3f}$ GHz: {label}", fontsize=7.2)
     ax.text(0.02, 0.97, f"black: {ini_lab} branch" + ("es" if ini == "doublet" else ""),
             transform=ax.transAxes, fontsize=6.5, va="top", color=INK)
     cb = fig.colorbar(lc, ax=ax, pad=0.02, shrink=0.9)
